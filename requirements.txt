@@ -1,0 +1,15 @@
+numpy
+torch
+PennyLane
+torchvision
+matplotlib
+qiskit
+requests
+tqdm
+einops
+Pillow
+transformers
+diffusers[torch]
+huggingface_hub
+taming-transformers
+scikit-image
