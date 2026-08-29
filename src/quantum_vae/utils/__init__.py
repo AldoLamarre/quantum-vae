@@ -14,7 +14,6 @@ from .imagenet_family import build_imagenet_data_bundle
 from .mnist_3v5_family import build_mnist_3v5_dataset_bundle, load_mnist_3v5_dataset_bundle
 from .mnist_dataset_utils import build_label_mapped_splits
 from .mnist_family import build_mnist_data_bundle
-from .phase_shadow_family import build_phase_shadow_data_bundle
 from .runtime_utils import (
     configure_cuda_visible_devices,
     create_run_path,
