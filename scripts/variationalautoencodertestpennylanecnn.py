@@ -5,9 +5,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
+from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
 from typing import Any
 from torchvision.transforms import functional
 import torchvision.transforms as transforms
@@ -49,14 +49,12 @@ test_data = datasets.CIFAR10(
 )
 
 batch_size = 128
-
-train_set, val_set = torch.utils.data.random_split(training_data, [40000, 10000])
-#train_set, val_set = torch.utils.data.random_split(training_data, [10000, 40000])
-
-# Create data loaders.
-train_dataloader = DataLoader(train_set, batch_size=batch_size)
-val_dataloader = DataLoader(val_set, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
+cifar_bundle = build_cifar10_data_bundle(training_data, test_data, batch_size=batch_size)
+train_set = cifar_bundle["train_set"]
+val_set = cifar_bundle["val_set"]
+train_dataloader = cifar_bundle["train_dataloader"]
+val_dataloader = cifar_bundle["val_dataloader"]
+test_dataloader = cifar_bundle["test_dataloader"]
 
 
 

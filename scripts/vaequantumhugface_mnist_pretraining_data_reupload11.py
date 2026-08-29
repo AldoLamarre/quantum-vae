@@ -13,7 +13,6 @@ from diffusers import AutoencoderKL
 from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 from torch.nn.modules.module import T
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 import pennylane as qml
@@ -28,17 +27,14 @@ import os
 from functools import partial
 
 import datetime
+from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
+from src.quantum_vae.utils.runtime_utils import create_run_path, resolve_device
+
 date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
-path = "paperlog/pretrained/vae kl  mnist datareupload11/"+date
+path = create_run_path("paperlog/pretrained/vae kl  mnist datareupload11", timestamp=date)
 #os.makedirs(path)
 torch.autograd.set_detect_anomaly(True)
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
+device = resolve_device()
 print("device =", device, " device count ", torch.cuda.device_count())
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -61,12 +57,12 @@ test_data = datasets.MNIST(
 import ssl
 ssl._create_default_https_context = ssl._create_unverified_context
 batch_size = 32 # 128
-train_set, val_set = torch.utils.data.random_split(training_data, [50000, 10000])
-
-# Create data loaders.
-train_dataloader = DataLoader(train_set, batch_size=batch_size)
-val_dataloader = DataLoader(val_set, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
+mnist_bundle = build_mnist_data_bundle(training_data, test_data, batch_size=batch_size)
+train_set = mnist_bundle["train_set"]
+val_set = mnist_bundle["val_set"]
+train_dataloader = mnist_bundle["train_dataloader"]
+val_dataloader = mnist_bundle["val_dataloader"]
+test_dataloader = mnist_bundle["test_dataloader"]
 class quantumAutoencoder(AutoencoderKL):
 
     def __init__(self, n_quantum_layers=10, n_qubits=10, Tomography=False, *args, **kwargs):

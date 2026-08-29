@@ -11,9 +11,9 @@ from diffusers import AutoencoderKL
 from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 from torch.nn.modules.module import T
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
+from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
 import pennylane as qml
 from pennylane.templates import QuantumPhaseEstimation
 from pennylane import numpy as np
@@ -58,14 +58,12 @@ ssl._create_default_https_context = ssl._create_unverified_context
 
 
 batch_size = 128
-
-train_set, val_set = torch.utils.data.random_split(training_data, [40000, 10000])
-
-
-# Create data loaders.
-train_dataloader = DataLoader(train_set, batch_size=batch_size)
-val_dataloader = DataLoader(val_set, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
+cifar_bundle = build_cifar10_data_bundle(training_data, test_data, batch_size=batch_size)
+train_set = cifar_bundle["train_set"]
+val_set = cifar_bundle["val_set"]
+train_dataloader = cifar_bundle["train_dataloader"]
+val_dataloader = cifar_bundle["val_dataloader"]
+test_dataloader = cifar_bundle["test_dataloader"]
 class quantumautoencoder(AutoencoderKL):
 
     def __init__(self, n_quantum_layers=10, n_qubits=8, Tomography=False, *args, **kwargs):

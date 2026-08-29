@@ -11,7 +11,6 @@ from diffusers import AutoencoderKL
 from diffusers.models.autoencoders.vae import DecoderOutput
 from torch import nn
 from torch.nn.modules.module import T
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
 from torchvision import transforms
@@ -22,27 +21,20 @@ from pennylane import numpy as np
 from datasets import load_dataset
 
 
-# Get cpu, gpu or mps device for training.
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from model_paths import registered_model_path
+from runtime_utils import create_run_path, resolve_device
+from src.quantum_vae.utils.imagenet_family import build_imagenet_data_bundle
 import networkblocks as nb
 torch.autograd.set_detect_anomaly(True)
 import os
-import datetime
-date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
-path = "log/hugging face vae/vae kl imagenet/"  #+date+"/"
-#os.makedirs(path)
+
 torch.autograd.set_detect_anomaly(True)
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
+device = resolve_device()
+path = create_run_path("log/hugging_face_vae/imagenet", include_timestamp=False)
 # Load the ImageNet dataset
-dataset = load_dataset("imagenet-1k",trust_remote_code=True)
+dataset = load_dataset("imagenet-1k", trust_remote_code=True)
 # Accessing the train and test splits
 train_dataset = dataset["train"]
 val_dataset = dataset["validation"]
@@ -65,11 +57,13 @@ ssl._create_default_https_context = ssl._create_unverified_context
 batch_size = 128
 
 
-
-# Create data loaders.
-train_dataloader = DataLoader(train_dataset, batch_size=batch_size)
-val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
-test_dataloader = DataLoader(test_dataset, batch_size=batch_size)
+# Create data loaders via centralized helper.
+imagenet_bundle = build_imagenet_data_bundle(
+    train_dataset, val_dataset, test_dataset, batch_size=batch_size
+)
+train_dataloader = imagenet_bundle["train_dataloader"]
+val_dataloader = imagenet_bundle["val_dataloader"]
+test_dataloader = imagenet_bundle["test_dataloader"]
 class quantumautoencoder(AutoencoderKL):
 
 

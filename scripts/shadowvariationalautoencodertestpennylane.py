@@ -5,9 +5,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
 from torchvision import datasets
 from torchvision.transforms import ToTensor
+from src.quantum_vae.utils.phase_shadow_family import build_phase_shadow_data_bundle
+from src.quantum_vae.utils.runtime_utils import resolve_device
 import pennylane as qml
 from pennylane.templates import QuantumPhaseEstimation
 from pennylane import numpy as np
@@ -15,13 +16,7 @@ from pennylane import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 torch.autograd.set_detect_anomaly(True)
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
+device = resolve_device()
 
 # Download training data from open datasets.
 training_data = datasets.MNIST(
@@ -40,12 +35,12 @@ test_data = datasets.MNIST(
 )
 
 batch_size = 128
-train_set, val_set = torch.utils.data.random_split(training_data, [50000, 10000])
-
-# Create data loaders.
-train_dataloader = DataLoader(train_set, batch_size=batch_size)
-val_dataloader = DataLoader(val_set, batch_size=batch_size)
-test_dataloader = DataLoader(test_data, batch_size=batch_size)
+mnist_bundle = build_phase_shadow_data_bundle(training_data, test_data, batch_size=batch_size)
+train_set = mnist_bundle["train_set"]
+val_set = mnist_bundle["val_set"]
+train_dataloader = mnist_bundle["train_dataloader"]
+val_dataloader = mnist_bundle["val_dataloader"]
+test_dataloader = mnist_bundle["test_dataloader"]
 
 for X, y in test_dataloader:
     print(f"Shape of X [N, C, H, W]: {X.shape}")

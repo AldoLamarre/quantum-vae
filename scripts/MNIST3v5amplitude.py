@@ -11,18 +11,14 @@ from torchvision import datasets
 from torchvision.transforms import ToTensor
 from model_paths import registered_model_path
 from src.quantum_vae.utils.mnist_3v5_family import build_mnist_3v5_dataset_bundle
+from src.quantum_vae.utils.runtime_utils import create_run_path, resolve_device
 import numpy as np
 import math
 torch.autograd.set_detect_anomaly(True)
 
 import os
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
+path = create_run_path("paperlogs/3v5/amplitude")
+device = resolve_device()
 
 # Download training data from open datasets.
 training_data = datasets.MNIST(

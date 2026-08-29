@@ -8,18 +8,15 @@ from torchvision import datasets
 from torchvision.transforms import ToTensor
 import datetime
 import os
+from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
+from src.quantum_vae.utils.runtime_utils import create_run_path, resolve_device
+
 date = datetime.datetime.now().strftime("%y-%m-%d-%H-%M-%S")
-path = "log/classicalddpm/cifar10/hugfaceddpm/"+date+"/"
-os.makedirs(path)
+path = create_run_path("log/classicalddpm/cifar10/hugfaceddpm", timestamp=date)
+os.makedirs(path, exist_ok=True)
 
 torch.autograd.set_detect_anomaly(True)
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps"
-    if torch.backends.mps.is_available()
-    else "cpu"
-)
+device = resolve_device()
 
 # Download training data from open datasets.
 training_data = datasets.CIFAR10(
