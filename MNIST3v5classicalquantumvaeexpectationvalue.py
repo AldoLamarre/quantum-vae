@@ -1,7 +1,7 @@
 from pathlib import Path
 import runpy
 
-from scripts.MNIST3v5classicalquantumvaeexpectationvalue import *  # noqa: F401,F403
+from scripts.mnist_legacy_ablation.MNIST3v5classicalquantumvaeexpectationvalue import *  # noqa: F401,F403
 
 
 if __name__ == "__main__":
@@ -9,6 +9,7 @@ if __name__ == "__main__":
         str(
             Path(__file__).resolve().parent
             / "scripts"
+            / "mnist_legacy_ablation"
             / "MNIST3v5classicalquantumvaeexpectationvalue.py"
         ),
         run_name="__main__",

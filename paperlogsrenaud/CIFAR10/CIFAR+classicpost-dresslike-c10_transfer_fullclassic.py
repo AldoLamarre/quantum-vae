@@ -126,7 +126,7 @@ class quantumautoencoder(AutoencoderKL):
         kl_div = -0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.var)
         if sample_posterior:
             z = posterior.sample(generator=generator)
-        else:
+        else:sample lletn does the same thing
             z = posterior.mode()
         # Flatten z into batch, data
         old_shape = z.shape

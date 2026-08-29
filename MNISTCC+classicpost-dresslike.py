@@ -4,6 +4,11 @@ import runpy
 
 if __name__ == "__main__":
     runpy.run_path(
-        str(Path(__file__).resolve().parent / "scripts" / "MNISTCC+classicpost-dresslike.py"),
+        str(
+            Path(__file__).resolve().parent
+            / "scripts"
+            / "mnist_legacy_ablation"
+            / "MNISTCC+classicpost-dresslike.py"
+        ),
         run_name="__main__",
     )
