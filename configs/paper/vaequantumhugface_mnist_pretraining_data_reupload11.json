@@ -1,0 +1,41 @@
+{
+  "family": "vaequantumhugface_mnist_pretraining_data_reupload11",
+  "dataset": "mnist",
+  "model_name": "datareupload",
+  "data": {
+    "root": "data",
+    "batch_size": 32
+  },
+  "n_qubits": 10,
+  "n_quantum_layers": 10,
+  "model": {
+    "in_channels": 1,
+    "out_channels": 1,
+    "sample_size": 28,
+    "block_out_channels": [32, 32, 64],
+    "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+  },
+  "training": {
+    "loss_type": "lpips",
+    "kl_weight": 1e-8,
+    "noise_after_epoch": 6,
+    "noise_std": 0.1,
+    "num_train_epochs": 1000,
+    "learning_rate": 1e-4
+  },
+  "trainer": {
+    "output_dir": "paperlogs/vaequantumhugface_mnist_pretraining_data_reupload11",
+    "logging_dir": "paperlogs/vaequantumhugface_mnist_pretraining_data_reupload11/logs",
+    "overwrite_output_dir": false,
+    "logging_strategy": "steps",
+    "logging_steps": 25,
+    "save_strategy": "epoch",
+    "save_total_limit": 2,
+    "evaluation_strategy": "epoch",
+    "load_best_model_at_end": true,
+    "per_device_train_batch_size": 32,
+    "per_device_eval_batch_size": 32,
+    "report_to": ["tensorboard"]
+  }
+}
