@@ -1,4 +1,6 @@
 legacy/
+__pycache__/
+*.pyc
 /paperlogsrenaud/
 /checkpoints/
 /results/
