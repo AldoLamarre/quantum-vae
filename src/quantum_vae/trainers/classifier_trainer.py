@@ -1,4 +1,4 @@
-"""Hugging Face Trainer specialized for Quantum and Hybrid Classifier models."""
+"""Hugging Face Trainer specialized for amplitude quantum/hybrid classifier models."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from .metrics import compute_classification_metrics
 
 
 class QuantumClassifierTrainer(BaseHFQuantumTrainer):
-    """Hugging Face Trainer for Quantum Classifiers (CifarQuantumClassifier, Hybrid models, etc.).
+    """Hugging Face Trainer for amplitude quantum classifiers and hybrid variants.
 
     Handles:
     - Classifier forward pass:

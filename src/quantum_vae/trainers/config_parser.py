@@ -29,6 +29,8 @@ from .vae_trainer import QuantumVAETrainer
 from .classifier_trainer import QuantumClassifierTrainer
 from .data_collators import VAEDataCollator, ClassifierDataCollator
 from .metrics import compute_classification_metrics, compute_vae_metrics
+from src.quantum_vae.utils.hf_classifier_config import build_model_config as build_classifier_model_config
+from src.quantum_vae.utils.model_paths import registered_model_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -103,36 +105,29 @@ class TrainerConfigParser:
             # Training
             if isinstance(cfg.get("training"), dict):
                 training_kwargs.update(cfg["training"])
-            elif isinstance(cfg.get("trainer"), dict):
+            if isinstance(cfg.get("trainer"), dict):
                 training_kwargs.update(cfg["trainer"])
 
             if "output" in cfg and isinstance(cfg["output"], dict):
                 training_kwargs["output_dir"] = cfg["output"].get("root", "checkpoints/vae_output")
 
         else:
-            model_name = cfg.get("classifier", "cifar_quantum_classifier")
-            # Classifier settings
-            measurement_cfg = cfg.get("measurement", {})
-            post_cfg = cfg.get("postprocessing_mlp", {})
-            n_qubits = int(cfg.get("n_qubits", 7))
-            n_layers = int(cfg.get("n_layers", 20))
-            dataset_name = str(cfg.get("dataset", "cifar10")).lower()
-            num_labels = 100 if dataset_name == "cifar100" else (2 if "3v5" in dataset_name else 10)
-            if "num_labels" in cfg:
-                num_labels = int(cfg["num_labels"])
-
+            classifier_cfg = build_classifier_model_config(cfg)
+            model_name = str(classifier_cfg.classifier_mode)
             model_kwargs.update({
-                "n_qubits": n_qubits,
-                "n_layers": n_layers,
-                "num_labels": num_labels,
-                "measurement_kind": str(measurement_cfg.get("kind", "probability")),
-                "measurement_pauli": measurement_cfg.get("pauli", "Z"),
-                "postprocessing_mlp_enabled": bool(post_cfg.get("enabled", False)),
-                "postprocessing_mlp_hidden_dim": int(post_cfg.get("hidden_dim", 128)),
-                "softmax_enabled": bool(cfg.get("softmax", True)),
+                "classifier_mode": classifier_cfg.classifier_mode,
+                "n_qubits": classifier_cfg.n_qubits,
+                "n_layers": classifier_cfg.n_layers,
+                "num_labels": classifier_cfg.num_labels,
+                "measurement_kind": classifier_cfg.measurement_kind,
+                "measurement_pauli": classifier_cfg.measurement_pauli,
+                "postprocessing_mlp_enabled": classifier_cfg.postprocessing_mlp_enabled,
+                "postprocessing_mlp_hidden_dim": classifier_cfg.postprocessing_mlp_hidden_dim,
+                "softmax_enabled": classifier_cfg.softmax_enabled,
+                "vae_backbone": cfg.get("vae_backbone", {}),
             })
 
-            data_kwargs["dataset"] = dataset_name
+            data_kwargs["dataset"] = classifier_cfg.dataset
             if isinstance(cfg.get("data"), dict):
                 data_kwargs.update(cfg["data"])
 
@@ -171,7 +166,7 @@ class TrainerConfigParser:
             # Filter kwargs
             kwargs = dict(parsed.model_kwargs)
             try:
-                return model_cls(**kwargs)
+                model = model_cls(**kwargs)
             except Exception:
                 # Fallback to default small kwargs if needed
                 fallback_kwargs = dict(
@@ -182,12 +177,40 @@ class TrainerConfigParser:
                     down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
                     up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
                 )
-                return model_cls(**fallback_kwargs)
+                model = model_cls(**fallback_kwargs)
+
+            checkpoint = parsed.raw_config.get("base_checkpoint", parsed.raw_config.get("checkpoint"))
+            if isinstance(checkpoint, str) and checkpoint.strip():
+                checkpoint_value = checkpoint.strip()
+                checkpoint_path = Path(checkpoint_value)
+                if not checkpoint_path.is_absolute():
+                    candidate = self.project_root / checkpoint_path
+                    if candidate.exists():
+                        checkpoint_path = candidate
+                    else:
+                        try:
+                            checkpoint_path = Path(registered_model_path(checkpoint_value, project_root=self.project_root))
+                        except Exception:
+                            checkpoint_path = candidate
+                if checkpoint_path.exists():
+                    state = torch.load(checkpoint_path, map_location="cpu")
+                    if isinstance(state, dict):
+                        if isinstance(state.get("state_dict"), dict):
+                            state = state["state_dict"]
+                        elif isinstance(state.get("model_state_dict"), dict):
+                            state = state["model_state_dict"]
+                    model.load_state_dict(state, strict=False)
+            return model
 
         else:
-            from src.quantum_vae.models import CifarClassifierConfig, CifarQuantumClassifier
+            from src.quantum_vae.models import (
+                AmplitudeClassifierPipeline,
+                ClassifierPipelineConfig,
+                PretrainedAnsatzClassifierPipeline,
+            )
 
-            cifar_cfg = CifarClassifierConfig(
+            classifier_cfg = ClassifierPipelineConfig(
+                classifier_mode=parsed.model_kwargs.get("classifier_mode", "ansatz"),
                 n_qubits=parsed.model_kwargs.get("n_qubits", 7),
                 n_layers=parsed.model_kwargs.get("n_layers", 20),
                 num_labels=parsed.model_kwargs.get("num_labels", 10),
@@ -195,10 +218,12 @@ class TrainerConfigParser:
                 measurement_pauli=parsed.model_kwargs.get("measurement_pauli", "Z"),
                 postprocessing_mlp_enabled=parsed.model_kwargs.get("postprocessing_mlp_enabled", False),
                 postprocessing_mlp_hidden_dim=parsed.model_kwargs.get("postprocessing_mlp_hidden_dim", 128),
-                classifier_enabled=parsed.model_kwargs.get("classifier_enabled", True),
                 softmax_enabled=parsed.model_kwargs.get("softmax_enabled", True),
             )
-            return CifarQuantumClassifier(cifar_cfg)
+            mode = str(classifier_cfg.classifier_mode).lower()
+            if mode == "amplitude":
+                return AmplitudeClassifierPipeline(classifier_cfg)
+            return PretrainedAnsatzClassifierPipeline(classifier_cfg)
 
     def build_training_args(
         self,
@@ -295,6 +320,8 @@ class TrainerConfigParser:
         if parsed.task_type == "vae":
             kl_weight = float(parsed.training_kwargs.get("kl_weight", 1e-4))
             loss_type = str(parsed.training_kwargs.get("loss_type", "mse"))
+            noise_after_epoch = parsed.training_kwargs.get("noise_after_epoch")
+            noise_std = float(parsed.training_kwargs.get("noise_std", 0.1))
             return QuantumVAETrainer(
                 model=model,
                 args=training_args,
@@ -302,6 +329,8 @@ class TrainerConfigParser:
                 eval_dataset=eval_dataset,
                 kl_weight=kl_weight,
                 loss_type=loss_type,
+                noise_after_epoch=int(noise_after_epoch) if noise_after_epoch is not None else None,
+                noise_std=noise_std,
                 **trainer_kwargs,
             )
         else:

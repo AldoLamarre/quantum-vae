@@ -1,0 +1,31 @@
+{
+  "seed": 42,
+  "tomography": false,
+  "data": {
+    "root": "data",
+    "resolution": 256,
+    "batch_size": 16,
+    "train_size": 40000,
+    "val_size": 10000
+  },
+  "model": {
+    "in_channels": 3,
+    "out_channels": 3,
+    "sample_size": 32,
+    "block_out_channels": [32, 32, 64],
+    "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
+    "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+  },
+  "base_checkpoint": "results/autoencoderklimagenet3_ref.pt",
+  "training": {
+    "learning_rate": 3e-5,
+    "epochs": 10000,
+    "noise_after_epoch": 100,
+    "kl_weight": 1e-8,
+    "resolution": 256
+  },
+  "output": {
+    "root": "paperlogs/hugging face qvae/qvae kl cifar10_transfer",
+    "best_checkpoint_name": "autoencoderklcifar10_transfer.pt"
+  }
+}

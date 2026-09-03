@@ -25,10 +25,10 @@ except ImportError:
     DecoderOutput = object  # type: ignore
     has_quantum_deps = False
 
-from .base import QuantumVAEBase
+from .ansatz_vae_base import AnsatzVAEBase
 
 
-class QuantumVAEDataReupload(QuantumVAEBase):
+class QuantumVAEDataReupload(AnsatzVAEBase):
     """Quantum VAE using data re-uploading quantum circuit.
     
     Strategy:

@@ -1,0 +1,199 @@
+{
+  "family": "mnist_legacy_mlp_vae_ablation",
+  "dataset": "mnist",
+  "root": "data",
+  "batch_size": 128,
+  "ablation_groups": {
+    "three_vs_five": {
+      "labels": [3, 5],
+      "experiments": [
+        "mnist_3v5_amplitude_mlp_classifier",
+        "mnist_3v5_quantum_circuit_classifier",
+        "mnist_3v5_pixel_mlp_classifier",
+        "mnist_3v5_expectation_value_classifier",
+        "mnist_3v5_classical_latent_mlp_classifier",
+        "mnist_3v5_quantum_feature_plus_classical_classifier"
+      ]
+    },
+    "full_mnist": {
+      "labels": "all",
+      "experiments": [
+        "mnist_backbone_train",
+        "mnist_autoencoder_recon",
+        "mnist_autoencoder_hot_recon",
+        "mnist_full_quantum_feature_plus_classical_classifier"
+      ]
+    }
+  },
+  "experiments": [
+    {
+      "name": "mnist_backbone_train",
+      "script": "scripts/mnist_legacy_ablation/variationalautoencodertestpennylane.py",
+      "task": "backbone_train",
+      "label_mode": "all",
+      "labels": null,
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "train"
+      },
+      "feature_transform": "latent",
+      "classifier_model": "decoder",
+      "loss": "bce",
+      "notes": "Legacy MNIST VAE backbone used by the ablation family."
+    },
+    {
+      "name": "mnist_autoencoder_recon",
+      "script": "scripts/mnist_legacy_ablation/autoencodertestpennylane.py",
+      "task": "reconstruction",
+      "label_mode": "all",
+      "labels": null,
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": null,
+        "usage": "latent"
+      },
+      "feature_transform": "amplitude",
+      "classifier_model": "decoder",
+      "loss": "bce",
+      "noise": false,
+      "notes": "Legacy reconstruction baseline using complex latent amplitudes."
+    },
+    {
+      "name": "mnist_autoencoder_hot_recon",
+      "script": "scripts/mnist_legacy_ablation/autoencoderstesthotspennylane.py",
+      "task": "reconstruction",
+      "label_mode": "all",
+      "labels": null,
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": null,
+        "usage": "latent"
+      },
+      "feature_transform": "amplitude",
+      "classifier_model": "decoder",
+      "loss": "mse",
+      "noise": true,
+      "notes": "Legacy reconstruction baseline with input noise."
+    },
+    {
+      "name": "mnist_3v5_amplitude_mlp_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNIST3v5amplitude.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "amplitude_concat",
+      "classifier_model": "mlp_classifier",
+      "output_dim": 2,
+      "loss": "cross_entropy",
+      "notes": "3-vs-5 classifier trained on amplitude-style latent features using a classical MLP."
+    },
+    {
+      "name": "mnist_3v5_quantum_circuit_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNIST3v5Circuitcentrict.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "latent_outer_product",
+      "classifier_model": "quantum_circuit_classifier",
+      "output_dim": 1,
+      "loss": "mse",
+      "notes": "Pure quantum circuit classifier applied to the 3-vs-5 latent representation."
+    },
+    {
+      "name": "mnist_3v5_pixel_mlp_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNIST3v5classicalquantumvae.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "unused"
+      },
+      "feature_transform": "direct_pixels",
+      "classifier_model": "mlp_classifier",
+      "output_dim": 2,
+      "loss": "cross_entropy",
+      "notes": "Classical pixel baseline for 3-vs-5. The VAE is loaded but not used as the main classifier input."
+    },
+    {
+      "name": "mnist_3v5_expectation_value_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNIST3v5classicalquantumvaeexpectationvalue.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "latent_outer_product",
+      "classifier_model": "quantum_expectation_mlp_classifier",
+      "output_dim": 2,
+      "loss": "cross_entropy",
+      "notes": "Quantum expectation-value feature extraction followed by a classical MLP classifier."
+    },
+    {
+      "name": "mnist_3v5_classical_latent_mlp_classifier",
+      "script": "scripts/mnist_legacy_ablation/_MNIST3v5classical.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "amplitude_concat",
+      "classifier_model": "mlp_classifier",
+      "output_dim": 2,
+      "loss": "cross_entropy",
+      "notes": "Plain classical 3-vs-5 classifier on the latent amplitude concatenation."
+    },
+    {
+      "name": "mnist_3v5_quantum_feature_plus_classical_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNIST3v5CC+classicpost-dresslike.py",
+      "task": "classification",
+      "label_mode": "subset",
+      "labels": [3, 5],
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "latent_outer_product",
+      "classifier_model": "quantum_feature_plus_classical_classifier",
+      "output_dim": 2,
+      "loss": "bce_with_logits",
+      "notes": "Hybrid model: quantum feature extractor followed by a classical post-processing classifier."
+    },
+    {
+      "name": "mnist_full_quantum_feature_plus_classical_classifier",
+      "script": "scripts/mnist_legacy_ablation/MNISTCC+classicpost-dresslike.py",
+      "task": "classification",
+      "label_mode": "all",
+      "labels": "all",
+      "backbone": {
+        "kind": "legacy_mlp_vae",
+        "checkpoint": "mnist_pennylane_vae_five",
+        "usage": "latent"
+      },
+      "feature_transform": "latent_outer_product",
+      "classifier_model": "quantum_feature_plus_classical_classifier",
+      "output_dim": 10,
+      "loss": "cross_entropy",
+      "notes": "Full-MNIST hybrid classifier using a quantum feature extractor and a classical final classifier."
+    }
+  ]
+}

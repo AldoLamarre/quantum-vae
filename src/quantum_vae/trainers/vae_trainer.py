@@ -19,6 +19,14 @@ from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
 from .data_collators import VAEDataCollator
 from .metrics import compute_vae_metrics
 
+try:
+    from taming.modules.losses.lpips import LPIPS
+
+    has_lpips = True
+except ImportError:
+    LPIPS = None  # type: ignore
+    has_lpips = False
+
 
 class QuantumVAETrainer(BaseHFQuantumTrainer):
     """Hugging Face Trainer for Quantum VAE variants (Amplitude, DataReupload, etc.).
@@ -43,6 +51,8 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         optimizers: Tuple[Optional[Any], Optional[Any]] = (None, None),
         kl_weight: float = 1e-4,
         loss_type: str = "mse",
+        noise_after_epoch: Optional[int] = None,
+        noise_std: float = 0.1,
         **kwargs,
     ):
         if data_collator is None:
@@ -52,6 +62,13 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
 
         self.kl_weight = float(kl_weight)
         self.loss_type = str(loss_type).lower()
+        self.noise_after_epoch = noise_after_epoch
+        self.noise_std = float(noise_std)
+        self.lpips_loss = None
+        if self.loss_type == "lpips":
+            if not has_lpips:
+                raise ImportError("LPIPS loss requested but taming.modules.losses.lpips is unavailable.")
+            self.lpips_loss = LPIPS().eval()
 
         super().__init__(
             model=model,
@@ -85,6 +102,17 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
     ) -> Any:
         """Compute VAE loss: reconstruction_loss + kl_weight * kl_div."""
         sample = self._extract_sample(inputs)
+        noisy_sample = sample
+
+        if (
+            has_torch
+            and isinstance(sample, torch.Tensor)
+            and getattr(model, "training", False)
+            and self.noise_after_epoch is not None
+        ):
+            current_epoch = getattr(self.state, "epoch", None)
+            if current_epoch is not None and float(current_epoch) >= float(self.noise_after_epoch):
+                noisy_sample = sample + torch.randn_like(sample) * self.noise_std
 
         # Initialize projections if required (e.g. DataReupload)
         if hasattr(model, "project_to_quantum") and model.project_to_quantum is None:
@@ -93,7 +121,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
 
         # Forward pass through VAE
         if hasattr(model, "forward"):
-            forward_out = model(sample, sample_posterior=True, return_dict=False)
+            forward_out = model(noisy_sample, sample_posterior=True, return_dict=False)
             if isinstance(forward_out, (tuple, list)):
                 reconstruction, kl_div, z_quantum = forward_out[0], forward_out[1], forward_out[2]
             else:
@@ -113,6 +141,11 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 recon_loss = F.l1_loss(reconstruction, sample)
             elif self.loss_type == "bce":
                 recon_loss = F.binary_cross_entropy(torch.clamp(reconstruction, 0.0, 1.0), sample)
+            elif self.loss_type == "lpips":
+                if self.lpips_loss is None:
+                    raise RuntimeError("LPIPS loss is not initialized.")
+                self.lpips_loss = self.lpips_loss.to(sample.device)
+                recon_loss = self.lpips_loss(reconstruction, sample).mean()
             else:
                 recon_loss = F.mse_loss(reconstruction, sample)
 

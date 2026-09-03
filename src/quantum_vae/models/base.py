@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Base class for Quantum VAE variants.
 
 All quantum VAE experiments in this paper inherit from QuantumVAEBase,
@@ -19,7 +21,7 @@ except ImportError:
     has_torch_diffusers = False
 
 
-class QuantumVAEBase(AutoencoderKL, ABC):
+class QuantumVAEBase(ABC, AutoencoderKL):
     """Abstract base class for Quantum VAE variants.
     
     Uses HuggingFace AutoencoderKL as backbone. All variants share:

@@ -6,19 +6,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from src.quantum_vae.models import CifarClassifierConfig
+from src.quantum_vae.models.amplitude_classifier import ClassifierPipelineConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "hf_cifar_classifier_family.json"
+DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "hf_amplitude_classifier_family.json"
 
 
 @dataclass(frozen=True)
-class HFCifarModelConfig:
+class VAEBackboneConfig:
+    strategy: str  # ansatz_vae | amplitude_vae
+    checkpoint: Optional[str]
+    vae_class: str
+    freeze_classical_parts: bool
+    train_quantum_parts: bool
+    train_projection_layers: bool
+    ansatz_name: Optional[str]
+    n_qubits: Optional[int]
+    n_quantum_layers: Optional[int]
+
+
+@dataclass(frozen=True)
+class HFAmplitudeClassifierModelConfig:
     dataset: str
-    classifier: str
+    classifier_mode: str  # ansatz | amplitude
+    vae_backbone: VAEBackboneConfig
     measurement_kind: str
     measurement_pauli: Optional[str]
     softmax_enabled: bool
+    num_labels: int
+    n_qubits: int
+    n_layers: int
     postprocessing_mlp_enabled: bool
     postprocessing_mlp_hidden_dim: int
 
@@ -48,11 +65,52 @@ def load_config(path: Optional[str | Path] = None) -> Dict[str, Any]:
 
 
 def _dataset_name(config: Dict[str, Any]) -> str:
-    dataset_name = str(config.get("dataset", "cifar10")).lower()
-    return "cifar100" if dataset_name == "cifar100" else "cifar10"
+    return str(config.get("dataset", "cifar10")).lower()
 
 
-def build_model_config(config: Dict[str, Any]) -> HFCifarModelConfig:
+def _resolve_softmax_enabled(config: Dict[str, Any]) -> bool:
+    classifier_cfg = config.get("classifier")
+    if isinstance(classifier_cfg, dict) and "softmax" in classifier_cfg:
+        return bool(classifier_cfg.get("softmax", True))
+    return bool(config.get("softmax", True))
+
+
+def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
+    vae_cfg = config.get("vae_backbone")
+    if not isinstance(vae_cfg, dict):
+        vae_cfg = config.get("base_vae", {})
+
+    strategy = str(vae_cfg.get("strategy", "ansatz_vae")).lower()
+    if strategy not in {"ansatz_vae", "amplitude_vae"}:
+        raise ValueError("vae_backbone.strategy must be 'ansatz_vae' or 'amplitude_vae'.")
+
+    strategy_cfg = vae_cfg.get(strategy, {})
+    if not isinstance(strategy_cfg, dict):
+        strategy_cfg = {}
+
+    checkpoint = strategy_cfg.get("checkpoint", vae_cfg.get("checkpoint"))
+    default_vae_class = "QuantumVAEDataReupload" if strategy == "ansatz_vae" else "QuantumVAEAmplitude"
+    vae_class = str(strategy_cfg.get("vae_class", vae_cfg.get("vae_class", default_vae_class)))
+    freeze_classical_parts = bool(strategy_cfg.get("freeze_classical_parts", True))
+    train_quantum_parts = bool(strategy_cfg.get("train_quantum_parts", True))
+    train_projection_layers = bool(strategy_cfg.get("train_projection_layers", True))
+    ansatz_name = strategy_cfg.get("name")
+    n_qubits = strategy_cfg.get("n_qubits", vae_cfg.get("n_qubits"))
+    n_quantum_layers = strategy_cfg.get("n_quantum_layers", vae_cfg.get("n_quantum_layers"))
+    return VAEBackboneConfig(
+        strategy=strategy,
+        checkpoint=str(checkpoint) if checkpoint is not None else None,
+        vae_class=vae_class,
+        freeze_classical_parts=freeze_classical_parts,
+        train_quantum_parts=train_quantum_parts,
+        train_projection_layers=train_projection_layers,
+        ansatz_name=str(ansatz_name) if ansatz_name is not None else None,
+        n_qubits=int(n_qubits) if n_qubits is not None else None,
+        n_quantum_layers=int(n_quantum_layers) if n_quantum_layers is not None else None,
+    )
+
+
+def build_model_config(config: Dict[str, Any]) -> HFAmplitudeClassifierModelConfig:
     measurement_cfg = config.get("measurement", {})
     measurement_kind = str(measurement_cfg.get("kind", "probability")).lower()
     measurement_pauli: Optional[str] = None
@@ -60,26 +118,45 @@ def build_model_config(config: Dict[str, Any]) -> HFCifarModelConfig:
         measurement_pauli = str(measurement_cfg.get("pauli", "Z")).upper()
 
     post_cfg = config.get("postprocessing_mlp", {})
-    return HFCifarModelConfig(
+    classifier_mode = str(config.get("classifier_mode", "ansatz")).lower()
+    if classifier_mode not in {"ansatz", "amplitude"}:
+        raise ValueError("classifier_mode must be 'ansatz' or 'amplitude'.")
+
+    softmax_enabled = _resolve_softmax_enabled(config)
+    if not softmax_enabled:
+        raise ValueError("classifier.softmax=false is not implemented yet; set classifier.softmax=true.")
+    num_labels_cfg = config.get("classifier", {})
+    if isinstance(num_labels_cfg, dict) and "num_labels" in num_labels_cfg:
+        num_labels = int(num_labels_cfg["num_labels"])
+    else:
+        num_labels = int(config.get("num_labels", 100 if _dataset_name(config) == "cifar100" else 10))
+
+    vae_backbone = _parse_vae_backbone(config)
+    n_qubits = int(config.get("n_qubits", vae_backbone.n_qubits or 7))
+    n_layers = int(config.get("n_layers", vae_backbone.n_quantum_layers or 20))
+
+    return HFAmplitudeClassifierModelConfig(
         dataset=_dataset_name(config),
-        classifier=str(config.get("classifier", "pretrained")).lower(),
+        classifier_mode=classifier_mode,
+        vae_backbone=vae_backbone,
         measurement_kind=measurement_kind,
         measurement_pauli=measurement_pauli,
-        softmax_enabled=bool(config.get("softmax", True)),
+        softmax_enabled=softmax_enabled,
+        num_labels=num_labels,
+        n_qubits=n_qubits,
+        n_layers=n_layers,
         postprocessing_mlp_enabled=bool(post_cfg.get("enabled", False)),
         postprocessing_mlp_hidden_dim=int(post_cfg.get("hidden_dim", 128)),
     )
 
 
-def build_classifier_config(config: Dict[str, Any]) -> CifarClassifierConfig:
+def build_classifier_config(config: Dict[str, Any]) -> ClassifierPipelineConfig:
     model_cfg = build_model_config(config)
-    n_qubits = int(config.get("n_qubits", 7))
-    n_layers = int(config.get("n_layers", 20))
-    num_labels = 100 if model_cfg.dataset == "cifar100" else 10
-    return CifarClassifierConfig(
-        n_qubits=n_qubits,
-        n_layers=n_layers,
-        num_labels=num_labels,
+    return ClassifierPipelineConfig(
+        classifier_mode=model_cfg.classifier_mode,
+        n_qubits=model_cfg.n_qubits,
+        n_layers=model_cfg.n_layers,
+        num_labels=model_cfg.num_labels,
         measurement_kind=model_cfg.measurement_kind,
         measurement_pauli=model_cfg.measurement_pauli,
         postprocessing_mlp_enabled=model_cfg.postprocessing_mlp_enabled,
@@ -91,7 +168,7 @@ def build_classifier_config(config: Dict[str, Any]) -> CifarClassifierConfig:
 def resolve_output_dir(config: Dict[str, Any], project_root: Optional[str | Path] = None) -> Path:
     project_root_path = Path(project_root) if project_root is not None else PROJECT_ROOT
     trainer_cfg = config.get("trainer", {})
-    output_dir = project_root_path / trainer_cfg.get("output_dir", "checkpoints/hf_cifar_classifier")
+    output_dir = project_root_path / trainer_cfg.get("output_dir", "checkpoints/hf_amplitude_classifier")
 
     if bool(config.get("checkpoint", False)) and output_dir.exists() and not bool(
         trainer_cfg.get("overwrite_output_dir", False)
@@ -154,3 +231,17 @@ def main(config_path: Optional[str | Path] = None) -> None:
 
     trainer = build_trainer_from_config(target_config)
     print(f"Trainer constructed: {type(trainer).__name__}")
+
+
+__all__ = [
+    "DEFAULT_CONFIG_PATH",
+    "VAEBackboneConfig",
+    "HFAmplitudeClassifierModelConfig",
+    "HFTrainingConfig",
+    "load_config",
+    "build_model_config",
+    "build_classifier_config",
+    "resolve_output_dir",
+    "build_training_args",
+    "main",
+]
