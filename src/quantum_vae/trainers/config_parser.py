@@ -178,6 +178,19 @@ class TrainerConfigParser:
                     up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
                 )
                 model = model_cls(**fallback_kwargs)
+                
+            # IMPORTANT: force any lazily-created layers (e.g. project_to_quantum /
+            # project_from_quantum) to exist NOW, before checkpoint loading and before
+            # the trainer builds an optimizer from model.parameters(). Without this,
+            # those layers are created on the first forward() call inside the training
+            # loop -- which happens *after* the optimizer has already snapshotted the
+            # parameter list -- so they silently never get trained (stay at random init).
+            if has_torch and hasattr(model, "initialize_projections") and getattr(model, "project_to_quantum", "sentinel") is None:
+                dummy_channels = kwargs.get("in_channels", 3)
+                dummy_size = kwargs.get("sample_size", 32)
+                dummy_input = torch.zeros(1, dummy_channels, dummy_size, dummy_size)
+                with torch.no_grad():
+                    model.initialize_projections(dummy_input)
 
             checkpoint = parsed.raw_config.get("base_checkpoint", parsed.raw_config.get("checkpoint"))
             if isinstance(checkpoint, str) and checkpoint.strip():
