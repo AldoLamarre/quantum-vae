@@ -2,10 +2,9 @@
 
 This variant uses a parameterized quantum circuit with data re-uploading
 to encode the latent space. The VAE encoder produces latent z, which is
-then projected to quantum circuit input size, processed through entangling
-layers, and projected back to latent space for decoding.
-
-Paper reference: [your paper figure/table here]
+then projected to quantum circuit input size, re-uploaded through repeated
+embed/rotate/entangle layers, and projected back to latent space for
+decoding.
 """
 
 from typing import Optional, Union, Tuple, Any, Callable
@@ -34,7 +33,7 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
     Strategy:
         1. Encode input → latent z via HF AutoencoderKL encoder
         2. Project z to quantum circuit input dimension
-        3. Re-upload z through parameterized entangling circuit
+        3. Re-upload z through the parameterized circuit, once per layer
         4. Measure quantum observables (e.g., Pauli-Z)
         5. Project quantum output back to latent dimension
         6. Decode from latent via HF decoder
@@ -45,8 +44,10 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
     
     Args:
         n_qubits: Number of qubits in quantum circuit
-        n_quantum_layers: Depth of entangling layers
-        Tomography: Whether to use full tomography (not implemented here)
+        n_quantum_layers: Number of data re-uploading layer repetitions
+            (each layer re-embeds the input and applies a learned Rot +
+            CZ entangling step; one additional final reupload is applied
+            after the last layer, with no entangling gates)
         *args, **kwargs: Passed to AutoencoderKL parent class
     """
     
@@ -54,7 +55,6 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
         self,
         n_qubits: int = 10,
         n_quantum_layers: int = 10,
-        Tomography: bool = False,
         *args,
         **kwargs
     ):
@@ -62,8 +62,7 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
         
         Args:
             n_qubits: Number of qubits for quantum circuit
-            n_quantum_layers: Depth of StronglyEntanglingLayers
-            Tomography: Flag for tomography mode (reserved for future)
+            n_quantum_layers: Number of data re-uploading layer repetitions
             *args, **kwargs: AutoencoderKL initialization arguments
         """
         super().__init__(*args, **kwargs)
@@ -71,15 +70,13 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
         self.encoding_strategy = "data_reupload"
         self.n_qubits = n_qubits
         self.n_quantum_layers = n_quantum_layers
-        self.Tomography = Tomography
         
         # Quantum setup
         self.wires = np.arange(n_qubits)
         self.dev = qml.device('default.qubit', wires=self.wires)
         
-        # Quantum circuit weight shape follows StronglyEntanglingLayers:
-        # (n_layers, n_wires, 3)
-        self.shapeweight = (self.n_quantum_layers + 1, self.n_qubits, 3)
+        # weights[qubit_index, layer_index, :]
+        self.shapeweight = (self.n_qubits, self.n_quantum_layers + 1, 3)
         
         # Quantum circuit will accept flattened input of size n_qubits * 3
         self.shapeinput = (self.n_quantum_layers + 1, self.n_qubits * 3)
@@ -125,45 +122,66 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
         ).to(dummy.device)
     
     def construct_circuit(self) -> Callable:
-        """Construct the parameterized quantum circuit.
-        
-        Circuit flow:
-            1. Amplitude embedding: encode inputs as quantum state
-            2. StronglyEntanglingLayers: parameterized entangling gates
-            3. Pauli-Z measurement: extract expectation values
-        
+        """Construct the parameterized data re-uploading quantum circuit.
+
+        Each layer re-embeds a slice of the projected classical input as
+        X/Y/Z rotation angles, applies a learned Rot gate per qubit, then
+        entangles with alternating CZ patterns. A final reupload (input plus
+        a learned offset) is applied without entangling gates.
+
+        Circuit flow (repeated n_quantum_layers times):
+            1. AngleEmbedding of inputs as X, Y, Z rotations
+            2. Per-qubit learned Rot(alpha, beta, gamma) gate
+            3. CZ entangling layer (alternating "double"/"double_odd" pattern)
+        Followed by one final reupload (X/Y/Z AngleEmbedding, input + learned
+        offset) with no entangling gates, then Pauli-Z expectation readout.
+
         Returns:
             Quantum circuit function compatible with qml.qnn.TorchLayer
         """
-        @qml.qnode(
-            self.dev,
-            interface='torch',
-            diff_method="backprop",
-        )
+        @qml.qnode(self.dev, interface="torch", diff_method="backprop")
         def circuit(inputs, weights):
-            """Quantum circuit with data re-uploading.
-            
+            """Data re-uploading circuit.
+
             Args:
-                inputs: Flattened angle parameters [n_qubits * 3]
-                weights: Learnable entangling layer parameters
-                
+                inputs: [batch, n_qubits * 3] angle parameters, re-used every layer
+                weights: [n_qubits, n_quantum_layers + 1, 3] learned Rot angles
+                    (weights[:, -1, :] is used for the final, non-entangled reupload)
+
             Returns:
                 List of Pauli-Z expectation values, one per qubit
             """
-            # Encode input angles as quantum state via amplitude embedding
-            qml.AmplitudeEmbedding(
-                inputs,
-                pad_with=0.0,
-                wires=self.wires,
-                normalize=True
-            )
-            
-            # Apply parameterized entangling layers
-            qml.StronglyEntanglingLayers(weights, wires=self.wires)
-            
-            # Measure Pauli-Z expectation value for each qubit
-            return [qml.expval(qml.PauliZ(i)) for i in self.wires]
-        
+            for layer in range(self.n_quantum_layers):
+                x_idx = 0
+                qml.AngleEmbedding(inputs[:, x_idx: x_idx + self.n_qubits], wires=self.wires, rotation="X")
+                qml.AngleEmbedding(inputs[:, x_idx + self.n_qubits: x_idx + 2 * self.n_qubits], wires=self.wires, rotation="Y")
+                qml.AngleEmbedding(inputs[:, x_idx + 2 * self.n_qubits: x_idx + 3 * self.n_qubits], wires=self.wires, rotation="Z")
+
+                for i, wire in enumerate(self.wires):
+                    angles = weights[i, layer, :]
+                    qml.Rot(*angles, wires=wire)
+
+                # Alternating CZ entanglement: pairs (0,1),(2,3),... on even
+                # layers, pairs (1,2),(3,4),... on odd layers.
+                if layer % 2 == 0:
+                    for i in range(0, len(self.wires) - 1, 2):
+                        qml.CZ(wires=[self.wires[i], self.wires[i + 1]])
+                else:
+                    for i in range(1, len(self.wires) - 1, 2):
+                        qml.CZ(wires=[self.wires[i], self.wires[i + 1]])
+
+            # Final reupload: input + learned offset, no entangling gates
+            x_idx = 0
+            w = weights[:, self.n_quantum_layers]
+            angles_x = torch.add(inputs[:, x_idx: x_idx + self.n_qubits], w[:, 0])
+            angles_y = torch.add(inputs[:, x_idx + self.n_qubits: x_idx + 2 * self.n_qubits], w[:, 1])
+            angles_z = torch.add(inputs[:, x_idx + 2 * self.n_qubits: x_idx + 3 * self.n_qubits], w[:, 2])
+            qml.AngleEmbedding(angles_x, wires=self.wires, rotation="X")
+            qml.AngleEmbedding(angles_y, wires=self.wires, rotation="Y")
+            qml.AngleEmbedding(angles_z, wires=self.wires, rotation="Z")
+
+            return [qml.expval(qml.PauliZ(wires=i)) for i in self.wires]
+
         return circuit
     
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
