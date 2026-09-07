@@ -270,9 +270,10 @@ class TrainerConfigParser:
             "seed": seed,
             "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
             "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
-            "report_to": list(t_kwargs.get("report_to", ["tensorboard"])),
-            "logging_dir": str(out_path / "logs"),
         }
+
+        if "report_to" in valid_params:
+            kwargs["report_to"] = []
 
         eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
         if "eval_strategy" in valid_params:

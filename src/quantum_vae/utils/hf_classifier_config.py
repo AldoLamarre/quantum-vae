@@ -43,7 +43,6 @@ class HFAmplitudeClassifierModelConfig:
 @dataclass(frozen=True)
 class HFTrainingConfig:
     output_dir: str
-    logging_dir: str
     overwrite_output_dir: bool
     logging_strategy: str
     logging_steps: int
@@ -55,7 +54,6 @@ class HFTrainingConfig:
     per_device_eval_batch_size: int
     learning_rate: float
     num_train_epochs: int
-    report_to: list[str]
 
 
 def load_config(path: Optional[str | Path] = None) -> Dict[str, Any]:
@@ -209,12 +207,6 @@ def build_training_args(config: Dict[str, Any], project_root: Optional[str | Pat
     output_dir = resolve_output_dir(config, project_root)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    logging_dir = Path(trainer_cfg.get("logging_dir", str(output_dir / "logs")))
-    if not logging_dir.is_absolute():
-        root = Path(project_root) if project_root is not None else PROJECT_ROOT
-        logging_dir = root / logging_dir
-    logging_dir.mkdir(parents=True, exist_ok=True)
-
     save_strategy = str(trainer_cfg.get("save_strategy", "epoch"))
     save_total_limit = trainer_cfg.get("save_total_limit")
     if not bool(config.get("checkpoint", False)):
@@ -223,7 +215,6 @@ def build_training_args(config: Dict[str, Any], project_root: Optional[str | Pat
 
     return HFTrainingConfig(
         output_dir=str(output_dir),
-        logging_dir=str(logging_dir),
         overwrite_output_dir=bool(trainer_cfg.get("overwrite_output_dir", False)),
         logging_strategy=str(trainer_cfg.get("logging_strategy", "steps")),
         logging_steps=int(trainer_cfg.get("logging_steps", 25)),
@@ -235,7 +226,6 @@ def build_training_args(config: Dict[str, Any], project_root: Optional[str | Pat
         per_device_eval_batch_size=int(trainer_cfg.get("per_device_eval_batch_size", 32)),
         learning_rate=float(trainer_cfg.get("learning_rate", 1e-4)),
         num_train_epochs=int(trainer_cfg.get("num_train_epochs", 1)),
-        report_to=list(trainer_cfg.get("report_to", ["tensorboard"])),
     )
 
 
