@@ -144,7 +144,8 @@ class TrainerConfigParser:
             parsed = self.parse(parsed)
 
         if parsed.task_type == "vae":
-            from src.quantum_vae.models import QuantumVAEAmplitude, QuantumVAEDataReupload
+            from src.quantum_vae.models.quantum_vae_amplitude import QuantumVAEAmplitude
+            from src.quantum_vae.models.quantum_vae_datareupload import QuantumVAEDataReupload
 
             model_name = str(parsed.model_name).lower()
             if "datareupload" in model_name or "data_reupload" in model_name or "circuit" in model_name:
@@ -205,7 +206,7 @@ class TrainerConfigParser:
             return model
 
         else:
-            from src.quantum_vae.models import (
+            from src.quantum_vae.models.amplitude_classifier import (
                 AmplitudeClassifierPipeline,
                 ClassifierPipelineConfig,
                 PretrainedAnsatzClassifierPipeline,
