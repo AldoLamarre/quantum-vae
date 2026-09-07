@@ -20,11 +20,11 @@ from .data_collators import VAEDataCollator
 from .metrics import compute_vae_metrics
 
 try:
-    from taming.modules.losses.lpips import LPIPS
+    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
     has_lpips = True
 except ImportError:
-    LPIPS = None  # type: ignore
+    LearnedPerceptualImagePatchSimilarity = None  # type: ignore
     has_lpips = False
 
 
@@ -67,8 +67,8 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.lpips_loss = None
         if self.loss_type == "lpips":
             if not has_lpips:
-                raise ImportError("LPIPS loss requested but taming.modules.losses.lpips is unavailable.")
-            self.lpips_loss = LPIPS().eval()
+                raise ImportError("LPIPS loss requested but torchmetrics.image.lpip is unavailable.")
+            self.lpips_loss = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).eval()
 
         super().__init__(
             model=model,
@@ -145,7 +145,9 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 if self.lpips_loss is None:
                     raise RuntimeError("LPIPS loss is not initialized.")
                 self.lpips_loss = self.lpips_loss.to(sample.device)
-                recon_loss = self.lpips_loss(reconstruction, sample).mean()
+                recon_loss = self.lpips_loss(reconstruction, sample)
+                if hasattr(recon_loss, "mean"):
+                    recon_loss = recon_loss.mean()
             else:
                 recon_loss = F.mse_loss(reconstruction, sample)
 

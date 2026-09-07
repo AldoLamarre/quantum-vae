@@ -1,6 +1,6 @@
 from typing import Optional, Union, Callable
 import sys
-from taming.modules.losses.lpips import LPIPS
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from pathlib import Path
 import sys
 
@@ -282,7 +282,7 @@ if __name__ == '__main__':
     print(model)
     # loss_fn = nn.BCELoss(reduction='sum')
     loss_val = 1000000
-    loss_fn = LPIPS().to(device).eval()
+    loss_fn = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     # loss_kl = nn.KLDivLoss(reduction="batchmean")
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     epochs = 1000

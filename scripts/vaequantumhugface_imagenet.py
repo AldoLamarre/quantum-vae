@@ -5,7 +5,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from typing import Optional, Union
 
-from taming.modules.losses.lpips import LPIPS
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import torch
 from diffusers import AutoencoderKL
 from diffusers.models.autoencoders.vae import DecoderOutput
@@ -249,7 +249,7 @@ if __name__ == '__main__':
     print(model)
     # loss_fn = nn.BCELoss(reduction='sum')
     loss_val = 1000000
-    loss_fn = LPIPS().to(device).eval()
+    loss_fn = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     # loss_kl = nn.KLDivLoss(reduction="batchmean")
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     epochs = 1000

@@ -1,5 +1,6 @@
 numpy
 torch
+torchmetrics
 PennyLane
 torchvision
 matplotlib
@@ -11,5 +12,4 @@ Pillow
 transformers
 diffusers[torch]
 huggingface_hub
-taming-transformers
 scikit-image

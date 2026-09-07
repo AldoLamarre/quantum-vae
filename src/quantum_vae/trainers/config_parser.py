@@ -8,21 +8,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
-try:
-    import torch
-    import torch.nn as nn
-    has_torch = True
-except ImportError:
-    torch = None  # type: ignore
-    nn = None  # type: ignore
-    has_torch = False
-
-try:
-    from transformers import TrainingArguments
-    has_transformers_args = True
-except ImportError:
-    TrainingArguments = None  # type: ignore
-    has_transformers_args = False
+import torch
+import torch.nn as nn
+from transformers import TrainingArguments
 
 from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
 from .vae_trainer import QuantumVAETrainer
@@ -186,7 +174,7 @@ class TrainerConfigParser:
             # those layers are created on the first forward() call inside the training
             # loop -- which happens *after* the optimizer has already snapshotted the
             # parameter list -- so they silently never get trained (stay at random init).
-            if has_torch and hasattr(model, "initialize_projections") and getattr(model, "project_to_quantum", "sentinel") is None:
+            if hasattr(model, "initialize_projections") and getattr(model, "project_to_quantum", "sentinel") is None:
                 dummy_channels = kwargs.get("in_channels", 3)
                 dummy_size = kwargs.get("sample_size", 32)
                 dummy_input = torch.zeros(1, dummy_channels, dummy_size, dummy_size)
@@ -266,37 +254,35 @@ class TrainerConfigParser:
         log_steps = int(t_kwargs.get("logging_steps", 25))
         seed = int(t_kwargs.get("seed", 42))
 
-        if has_transformers and has_transformers_args:
-            try:
-                import inspect
-                sig = inspect.signature(TrainingArguments.__init__)
-                valid_params = sig.parameters.keys()
+        try:
+            import inspect
+            sig = inspect.signature(TrainingArguments.__init__)
+            valid_params = sig.parameters.keys()
 
-                kwargs: Dict[str, Any] = {
-                    "output_dir": str(out_path),
-                    "num_train_epochs": epochs,
-                    "learning_rate": lr,
-                    "per_device_train_batch_size": train_bs,
-                    "per_device_eval_batch_size": eval_bs,
-                    "logging_steps": log_steps,
-                    "seed": seed,
-                    "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
-                    "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
-                    "report_to": list(t_kwargs.get("report_to", ["tensorboard"])),
-                    "logging_dir": str(out_path / "logs"),
-                }
+            kwargs: Dict[str, Any] = {
+                "output_dir": str(out_path),
+                "num_train_epochs": epochs,
+                "learning_rate": lr,
+                "per_device_train_batch_size": train_bs,
+                "per_device_eval_batch_size": eval_bs,
+                "logging_steps": log_steps,
+                "seed": seed,
+                "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
+                "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
+                "report_to": list(t_kwargs.get("report_to", ["tensorboard"])),
+                "logging_dir": str(out_path / "logs"),
+            }
 
-                eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
-                if "eval_strategy" in valid_params:
-                    kwargs["eval_strategy"] = eval_strat
-                elif "evaluation_strategy" in valid_params:
-                    kwargs["evaluation_strategy"] = eval_strat
+            eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
+            if "eval_strategy" in valid_params:
+                kwargs["eval_strategy"] = eval_strat
+            elif "evaluation_strategy" in valid_params:
+                kwargs["evaluation_strategy"] = eval_strat
 
-                # Filter kwargs to valid_params
-                final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-                return TrainingArguments(**final_kwargs)
-            except Exception:
-                pass
+            final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+            return TrainingArguments(**final_kwargs)
+        except Exception:
+            pass
 
         # Standalone Training Arguments object
         class StandaloneTrainingArguments:

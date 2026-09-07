@@ -6,29 +6,14 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-try:
-    import torch
-    import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
-    has_torch = True
-except ImportError:
-    torch = None  # type: ignore
-    nn = None  # type: ignore
-    DataLoader = None  # type: ignore
-    Dataset = None  # type: ignore
-    has_torch = False
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, Dataset
+from transformers import Trainer, TrainingArguments
+from transformers.trainer_callback import TrainerCallback
 
-try:
-    import transformers
-    from transformers import Trainer, TrainingArguments
-    from transformers.trainer_callback import TrainerCallback
-    has_transformers = True
-except ImportError:
-    transformers = None  # type: ignore
-    Trainer = object  # type: ignore
-    TrainingArguments = None  # type: ignore
-    TrainerCallback = None  # type: ignore
-    has_transformers = False
+has_torch = True
+has_transformers = True
 
 
 class StandaloneHFTrainer:
@@ -99,9 +84,6 @@ class StandaloneHFTrainer:
     def get_train_dataloader(self) -> Any:
         if self.train_dataset is None:
             raise ValueError("Training requires a train_dataset.")
-        if not has_torch:
-            return self.train_dataset
-
         batch_size = getattr(self.args, "per_device_train_batch_size", 32)
         return DataLoader(
             self.train_dataset,
@@ -114,9 +96,6 @@ class StandaloneHFTrainer:
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
         if dataset is None:
             raise ValueError("Evaluation requires an eval_dataset.")
-        if not has_torch:
-            return dataset
-
         batch_size = getattr(self.args, "per_device_eval_batch_size", 32)
         return DataLoader(
             dataset,
@@ -130,7 +109,7 @@ class StandaloneHFTrainer:
 
     def train(self) -> Dict[str, Any]:
         """Execute standard training loop."""
-        if not has_torch or self.model is None or self.train_dataset is None:
+        if self.model is None or self.train_dataset is None:
             return {"training_loss": 0.0, "global_step": 0}
 
         device = getattr(self.args, "device", None)
@@ -179,7 +158,7 @@ class StandaloneHFTrainer:
 
     def evaluate(self, eval_dataset: Optional[Any] = None) -> Dict[str, float]:
         """Execute evaluation loop and compute metrics."""
-        if not has_torch or self.model is None:
+        if self.model is None:
             return {"eval_loss": 0.0}
 
         dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
@@ -229,30 +208,24 @@ class StandaloneHFTrainer:
         """Save model checkpoint to directory."""
         target_dir = output_dir or self.output_dir
         Path(target_dir).mkdir(parents=True, exist_ok=True)
-        if has_torch and self.model is not None:
+        if self.model is not None:
             torch.save(self.model.state_dict(), os.path.join(target_dir, "model.pt"))
 
 
 import inspect
 
-# Base class inherits from transformers.Trainer if available, otherwise StandaloneHFTrainer
-BaseParent = Trainer if has_transformers else StandaloneHFTrainer
+BaseParent = Trainer
 
 
 class BaseHFQuantumTrainer(BaseParent):
     """Unified base class for Hugging Face Trainer integration with Quantum models."""
 
     def __init__(self, *args, **kwargs):
-        if has_transformers:
-            # Inspect Trainer.__init__ to only pass supported arguments
-            sig = inspect.signature(Trainer.__init__)
-            valid_params = sig.parameters.keys()
-            
-            # Map tokenizer to processing_class if tokenizer is not accepted but processing_class is
-            if "tokenizer" in kwargs and "tokenizer" not in valid_params and "processing_class" in valid_params:
-                kwargs["processing_class"] = kwargs.pop("tokenizer")
+        sig = inspect.signature(Trainer.__init__)
+        valid_params = sig.parameters.keys()
 
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-            super().__init__(*args, **filtered_kwargs)
-        else:
-            super().__init__(*args, **kwargs)
+        if "tokenizer" in kwargs and "tokenizer" not in valid_params and "processing_class" in valid_params:
+            kwargs["processing_class"] = kwargs.pop("tokenizer")
+
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+        super().__init__(*args, **filtered_kwargs)

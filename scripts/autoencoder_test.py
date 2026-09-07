@@ -7,7 +7,7 @@ from typing import Optional, Union
 
 from pathlib import Path
 
-from taming.modules.losses.lpips import LPIPS
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 import pennylane as qml
 import torch
 import torch.nn as nn
@@ -257,7 +257,7 @@ def test_cifar10():
     # modelVAE.load_state_dict(torch.load("autoencoderkl_imagenet-epoch-1.pt", map_location=device))
     state_dict = torch.load(registered_model_path("cifar10_autoencoderkl"), map_location=device)
     modelVAE.load_state_dict(state_dict)
-    loss_fn = LPIPS().to(device).eval()
+    loss_fn = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     test(test_dataloader, modelVAE, loss_fn)
 
 
