@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
+from .base import BaseHFQuantumTrainer
 from .data_collators import ClassifierDataCollator
 from .metrics import compute_classification_metrics
 

@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from transformers import TrainingArguments
 
-from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
+from .base import BaseHFQuantumTrainer
 from .vae_trainer import QuantumVAETrainer
 from .classifier_trainer import QuantumClassifierTrainer
 from .data_collators import VAEDataCollator, ClassifierDataCollator
@@ -255,54 +255,33 @@ class TrainerConfigParser:
         log_steps = int(t_kwargs.get("logging_steps", 25))
         seed = int(t_kwargs.get("seed", 42))
 
-        try:
-            import inspect
-            sig = inspect.signature(TrainingArguments.__init__)
-            valid_params = sig.parameters.keys()
+        import inspect
 
-            kwargs: Dict[str, Any] = {
-                "output_dir": str(out_path),
-                "num_train_epochs": epochs,
-                "learning_rate": lr,
-                "per_device_train_batch_size": train_bs,
-                "per_device_eval_batch_size": eval_bs,
-                "logging_steps": log_steps,
-                "seed": seed,
-                "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
-                "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
-                "report_to": list(t_kwargs.get("report_to", ["tensorboard"])),
-                "logging_dir": str(out_path / "logs"),
-            }
+        sig = inspect.signature(TrainingArguments.__init__)
+        valid_params = sig.parameters.keys()
 
-            eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
-            if "eval_strategy" in valid_params:
-                kwargs["eval_strategy"] = eval_strat
-            elif "evaluation_strategy" in valid_params:
-                kwargs["evaluation_strategy"] = eval_strat
+        kwargs: Dict[str, Any] = {
+            "output_dir": str(out_path),
+            "num_train_epochs": epochs,
+            "learning_rate": lr,
+            "per_device_train_batch_size": train_bs,
+            "per_device_eval_batch_size": eval_bs,
+            "logging_steps": log_steps,
+            "seed": seed,
+            "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
+            "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
+            "report_to": list(t_kwargs.get("report_to", ["tensorboard"])),
+            "logging_dir": str(out_path / "logs"),
+        }
 
-            final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
-            return TrainingArguments(**final_kwargs)
-        except Exception:
-            pass
+        eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
+        if "eval_strategy" in valid_params:
+            kwargs["eval_strategy"] = eval_strat
+        elif "evaluation_strategy" in valid_params:
+            kwargs["evaluation_strategy"] = eval_strat
 
-        # Standalone Training Arguments object
-        class StandaloneTrainingArguments:
-            def __init__(self):
-                self.output_dir = str(out_path)
-                self.num_train_epochs = epochs
-                self.learning_rate = lr
-                self.per_device_train_batch_size = train_bs
-                self.per_device_eval_batch_size = eval_bs
-                self.logging_steps = log_steps
-                self.seed = seed
-                self.full_determinism = bool(t_kwargs.get("full_determinism", False))
-                self.save_strategy = str(t_kwargs.get("save_strategy", "epoch"))
-                self.evaluation_strategy = str(t_kwargs.get("evaluation_strategy", "epoch"))
-                self.overwrite_output_dir = bool(t_kwargs.get("overwrite_output_dir", False))
-                self.report_to = list(t_kwargs.get("report_to", ["tensorboard"]))
-                self.logging_dir = str(out_path / "logs")
-
-        return StandaloneTrainingArguments()
+        final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+        return TrainingArguments(**final_kwargs)
 
     def build_trainer(
         self,
