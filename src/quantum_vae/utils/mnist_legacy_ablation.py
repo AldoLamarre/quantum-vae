@@ -13,7 +13,6 @@ def build_mnist_legacy_ablation_bundle(
     train_size=50000,
     val_size=10000,
     train_ratio=0.9,
-    filtered_test_source="train",
 ):
     """Build the MNIST bundle used by the legacy MLP-VAE ablation family.
 
