@@ -69,7 +69,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
             **kwargs,
         )
 
-    def _extract_sample(self, inputs: Union[Dict[str, Any], Any]) -> Any:
+    def _extract_input_images(self, inputs: Union[Dict[str, Any], Any]) -> Any:
         if isinstance(inputs, dict):
             for key in ("sample", "pixel_values", "images", "inputs", "x"):
                 if key in inputs:
@@ -109,34 +109,35 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         **kwargs,
     ) -> Any:
         """Compute VAE loss: reconstruction_loss + kl_weight * kl_div."""
-        sample = self._extract_sample(inputs)
-        noisy_sample = sample
+        input_images = self._extract_input_images(inputs)
+        target_images = input_images
+        model_input_images = input_images
 
-        if isinstance(sample, torch.Tensor) and getattr(model, "training", False) and self.noise_after_epoch is not None:
+        if isinstance(input_images, torch.Tensor) and getattr(model, "training", False) and self.noise_after_epoch is not None:
             current_epoch = getattr(self.state, "epoch", None)
             if current_epoch is not None and float(current_epoch) >= float(self.noise_after_epoch):
-                noisy_sample = sample + torch.randn_like(sample) * self.noise_std
+                model_input_images = input_images + torch.randn_like(input_images) * self.noise_std
 
         # Initialize projections if required (e.g. DataReupload)
         if hasattr(model, "project_to_quantum") and model.project_to_quantum is None:
             if hasattr(model, "initialize_projections"):
-                model.initialize_projections(sample)
+                model.initialize_projections(input_images)
 
         # Forward pass through VAE
         if hasattr(model, "forward"):
-            forward_out = model(noisy_sample, sample_posterior=True, return_dict=False)
+            forward_out = model(model_input_images, sample_posterior=True, return_dict=False)
             if isinstance(forward_out, (tuple, list)):
                 reconstruction, kl_div, z_quantum = forward_out[0], forward_out[1], forward_out[2]
             else:
                 reconstruction = getattr(forward_out, "sample", forward_out)
-                kl_div = torch.tensor(0.0, device=sample.device) if isinstance(sample, torch.Tensor) else 0.0
+                kl_div = torch.tensor(0.0, device=input_images.device) if isinstance(input_images, torch.Tensor) else 0.0
                 z_quantum = None
         else:
-            reconstruction = sample
+            reconstruction = input_images
             kl_div = 0.0
             z_quantum = None
 
-        if not isinstance(sample, torch.Tensor):
+        if not isinstance(target_images, torch.Tensor):
             loss = 0.0
         else:
             if not isinstance(reconstruction, torch.Tensor):
@@ -145,18 +146,18 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
 
             # Calculate reconstruction loss
             if self.loss_type == "l1":
-                recon_loss = F.l1_loss(reconstruction_tensor, sample)
+                recon_loss = F.l1_loss(reconstruction_tensor, target_images)
             elif self.loss_type == "bce":
-                recon_loss = F.binary_cross_entropy(torch.clamp(reconstruction_tensor, 0.0, 1.0), sample)
+                recon_loss = F.binary_cross_entropy(torch.clamp(reconstruction_tensor, 0.0, 1.0), target_images)
             elif self.loss_type == "lpips":
                 if self.lpips_loss_01 is None or self.lpips_loss_11 is None:
                     raise RuntimeError("LPIPS loss is not initialized.")
-                lpips_metric, recon_lpips, sample_lpips = self._prepare_lpips_inputs(reconstruction_tensor, sample)
+                lpips_metric, recon_lpips, sample_lpips = self._prepare_lpips_inputs(reconstruction_tensor, target_images)
                 recon_loss = lpips_metric(recon_lpips, sample_lpips)
                 if hasattr(recon_loss, "mean"):
                     recon_loss = recon_loss.mean()
             else:
-                recon_loss = F.mse_loss(reconstruction_tensor, sample)
+                recon_loss = F.mse_loss(reconstruction_tensor, target_images)
 
             loss = recon_loss + self.kl_weight * kl_div
 
@@ -168,3 +169,31 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         }
 
         return (loss, outputs) if return_outputs else loss
+
+    def prediction_step(
+        self,
+        model: Any,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            with self.compute_loss_context_manager():
+                loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
+
+        detached_loss: Optional[torch.Tensor]
+        if isinstance(loss, torch.Tensor):
+            detached_loss = loss.mean().detach()
+        else:
+            detached_loss = None
+
+        if prediction_loss_only:
+            return detached_loss, None, None
+
+        reconstruction = outputs.get("reconstruction") if isinstance(outputs, dict) else None
+        target_images = self._extract_input_images(inputs)
+
+        pred_tensor = reconstruction.detach() if isinstance(reconstruction, torch.Tensor) else None
+        target_tensor = target_images.detach() if isinstance(target_images, torch.Tensor) else None
+        return detached_loss, pred_tensor, target_tensor
