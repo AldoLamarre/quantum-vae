@@ -33,7 +33,6 @@ def build_mnist_legacy_ablation_bundle(
         test_data,
         label_map,
         train_ratio=train_ratio,
-        filtered_test_source=filtered_test_source,
     )
 
     return {
