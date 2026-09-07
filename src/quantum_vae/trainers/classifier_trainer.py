@@ -4,16 +4,9 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    has_torch = True
-except ImportError:
-    torch = None  # type: ignore
-    nn = None  # type: ignore
-    F = None  # type: ignore
-    has_torch = False
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
 from .data_collators import ClassifierDataCollator
@@ -98,7 +91,7 @@ class QuantumClassifierTrainer(BaseHFQuantumTrainer):
         else:
             outputs = feat_inputs
 
-        if labels is None or not has_torch or not isinstance(outputs, torch.Tensor):
+        if labels is None or not isinstance(outputs, torch.Tensor):
             loss = 0.0
             return (loss, outputs) if return_outputs else loss
 

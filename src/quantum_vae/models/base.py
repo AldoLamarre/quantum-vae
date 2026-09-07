@@ -9,16 +9,11 @@ differing only in their quantum encoding strategy (process_latent).
 from abc import ABC, abstractmethod
 from typing import Optional, Union, Tuple
 
-try:
-    import torch
-    from diffusers import AutoencoderKL
-    from diffusers.models.autoencoders.vae import DecoderOutput
-    has_torch_diffusers = True
-except ImportError:
-    torch = None  # type: ignore
-    AutoencoderKL = object  # type: ignore
-    DecoderOutput = object  # type: ignore
-    has_torch_diffusers = False
+
+import torch
+from diffusers import AutoencoderKL
+from diffusers.models.autoencoders.vae import DecoderOutput
+has_torch_diffusers = True
 
 
 class QuantumVAEBase(ABC, AutoencoderKL):

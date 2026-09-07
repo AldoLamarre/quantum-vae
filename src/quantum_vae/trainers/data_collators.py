@@ -4,12 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple, Union
 
-try:
-    import torch
-    has_torch = True
-except ImportError:
-    torch = None  # type: ignore
-    has_torch = False
+import torch
 
 
 class VAEDataCollator:
@@ -27,22 +22,22 @@ class VAEDataCollator:
             # Already dict format
             if self.key in first:
                 return {
-                    self.key: torch.stack([item[self.key] for item in batch]) if has_torch and isinstance(first[self.key], torch.Tensor) else [item[self.key] for item in batch]
+                    self.key: torch.stack([item[self.key] for item in batch]) if isinstance(first[self.key], torch.Tensor) else [item[self.key] for item in batch]
                 }
             if "pixel_values" in first:
                 return {
-                    self.key: torch.stack([item["pixel_values"] for item in batch]) if has_torch and isinstance(first["pixel_values"], torch.Tensor) else [item["pixel_values"] for item in batch]
+                    self.key: torch.stack([item["pixel_values"] for item in batch]) if isinstance(first["pixel_values"], torch.Tensor) else [item["pixel_values"] for item in batch]
                 }
             return {k: [item[k] for item in batch] for k in first}
 
         if isinstance(first, (tuple, list)):
             # Dataset returns (image, label)
             images = [item[0] for item in batch]
-            if has_torch and isinstance(images[0], torch.Tensor):
+            if isinstance(images[0], torch.Tensor):
                 return {self.key: torch.stack(images)}
             return {self.key: images}
 
-        if has_torch and isinstance(first, torch.Tensor):
+        if isinstance(first, torch.Tensor):
             return {self.key: torch.stack(batch)}
 
         return {self.key: batch}
@@ -64,7 +59,7 @@ class ClassifierDataCollator:
             res = {}
             for k in first:
                 vals = [item[k] for item in batch]
-                if has_torch and isinstance(vals[0], torch.Tensor):
+                if isinstance(vals[0], torch.Tensor):
                     res[k] = torch.stack(vals)
                 else:
                     res[k] = vals
@@ -74,24 +69,23 @@ class ClassifierDataCollator:
             inputs = [item[0] for item in batch]
             labels = [item[1] for item in batch]
 
-            if has_torch:
-                if isinstance(inputs[0], torch.Tensor):
-                    inputs_tensor = torch.stack(inputs)
-                else:
-                    try:
-                        inputs_tensor = torch.tensor(inputs)
-                    except Exception:
-                        inputs_tensor = inputs
+            if isinstance(inputs[0], torch.Tensor):
+                inputs_tensor = torch.stack(inputs)
+            else:
+                try:
+                    inputs_tensor = torch.tensor(inputs)
+                except Exception:
+                    inputs_tensor = inputs
 
-                if isinstance(labels[0], torch.Tensor):
-                    labels_tensor = torch.stack(labels)
-                else:
-                    try:
-                        labels_tensor = torch.tensor(labels, dtype=torch.long)
-                    except Exception:
-                        labels_tensor = labels
+            if isinstance(labels[0], torch.Tensor):
+                labels_tensor = torch.stack(labels)
+            else:
+                try:
+                    labels_tensor = torch.tensor(labels, dtype=torch.long)
+                except Exception:
+                    labels_tensor = labels
 
-                return {self.input_key: inputs_tensor, self.label_key: labels_tensor}
+            return {self.input_key: inputs_tensor, self.label_key: labels_tensor}
 
             return {self.input_key: inputs, self.label_key: labels}
 

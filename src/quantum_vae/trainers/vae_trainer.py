@@ -4,28 +4,14 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-try:
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    has_torch = True
-except ImportError:
-    torch = None  # type: ignore
-    nn = None  # type: ignore
-    F = None  # type: ignore
-    has_torch = False
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from .base import BaseHFQuantumTrainer, StandaloneHFTrainer, has_transformers
 from .data_collators import VAEDataCollator
 from .metrics import compute_vae_metrics
-
-try:
-    from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
-
-    has_lpips = True
-except ImportError:
-    LearnedPerceptualImagePatchSimilarity = None  # type: ignore
-    has_lpips = False
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
 class QuantumVAETrainer(BaseHFQuantumTrainer):
@@ -66,8 +52,6 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.noise_std = float(noise_std)
         self.lpips_loss = None
         if self.loss_type == "lpips":
-            if not has_lpips:
-                raise ImportError("LPIPS loss requested but torchmetrics.image.lpip is unavailable.")
             self.lpips_loss = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).eval()
 
         super().__init__(
@@ -104,12 +88,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         sample = self._extract_sample(inputs)
         noisy_sample = sample
 
-        if (
-            has_torch
-            and isinstance(sample, torch.Tensor)
-            and getattr(model, "training", False)
-            and self.noise_after_epoch is not None
-        ):
+        if isinstance(sample, torch.Tensor) and getattr(model, "training", False) and self.noise_after_epoch is not None:
             current_epoch = getattr(self.state, "epoch", None)
             if current_epoch is not None and float(current_epoch) >= float(self.noise_after_epoch):
                 noisy_sample = sample + torch.randn_like(sample) * self.noise_std
@@ -126,14 +105,14 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 reconstruction, kl_div, z_quantum = forward_out[0], forward_out[1], forward_out[2]
             else:
                 reconstruction = getattr(forward_out, "sample", forward_out)
-                kl_div = torch.tensor(0.0, device=sample.device) if has_torch else 0.0
+                kl_div = torch.tensor(0.0, device=sample.device) if isinstance(sample, torch.Tensor) else 0.0
                 z_quantum = None
         else:
             reconstruction = sample
             kl_div = 0.0
             z_quantum = None
 
-        if not has_torch or not isinstance(sample, torch.Tensor):
+        if not isinstance(sample, torch.Tensor):
             loss = 0.0
         else:
             # Calculate reconstruction loss

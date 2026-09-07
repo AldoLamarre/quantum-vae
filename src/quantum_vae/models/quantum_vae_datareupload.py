@@ -11,18 +11,12 @@ from typing import Optional, Union, Tuple, Any, Callable
 from numpy import ndarray
 import numpy as np
 
-try:
-    import torch
-    import torch.nn as nn
-    import pennylane as qml
-    from diffusers.models.autoencoders.vae import DecoderOutput
-    has_quantum_deps = True
-except ImportError:
-    torch = None  # type: ignore
-    nn = object  # type: ignore
-    qml = None  # type: ignore
-    DecoderOutput = object  # type: ignore
-    has_quantum_deps = False
+
+import torch
+import torch.nn as nn
+import pennylane as qml
+from diffusers.models.autoencoders.vae import DecoderOutput
+has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
 

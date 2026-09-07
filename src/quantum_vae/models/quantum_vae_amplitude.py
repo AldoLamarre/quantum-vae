@@ -7,10 +7,8 @@ normalized as quantum state amplitudes, then used for decoding.
 Paper reference: [your paper figure/table here]
 """
 
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore
+import torch
+
 
 from typing import Optional
 

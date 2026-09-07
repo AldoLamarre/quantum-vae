@@ -7,17 +7,12 @@ from typing import Any, Optional
 
 import numpy as np
 
-try:
-    import pennylane as qml
-    import torch
-    import torch.nn as nn
 
-    has_quantum_deps = True
-except ImportError:
-    qml = None  # type: ignore
-    torch = None  # type: ignore
-    nn = object  # type: ignore
-    has_quantum_deps = False
+import pennylane as qml
+import torch
+import torch.nn as nn
+has_quantum_deps = True
+
 
 BaseTorchModule = nn.Module if has_quantum_deps else object
 

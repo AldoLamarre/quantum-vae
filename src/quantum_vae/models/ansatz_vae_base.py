@@ -3,10 +3,9 @@ from __future__ import annotations
 from abc import abstractmethod
 from typing import Iterable
 
-try:
-    import torch
-except ImportError:
-    torch = None  # type: ignore
+
+import torch
+
 
 from .base import QuantumVAEBase
 
