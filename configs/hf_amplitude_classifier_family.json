@@ -26,8 +26,8 @@
     "hidden_dim": 128
   },
   "trainer": {
-    "output_dir": "paperlogs/hf_amplitude_classifier",
-    "logging_dir": "paperlogs/hf_amplitude_classifier/logs",
+    "output_dir": "checkpoints/classifier/hf_amplitude_classifier_family",
+    "logging_dir": "checkpoints/classifier/hf_amplitude_classifier_family/logs",
     "overwrite_output_dir": false,
     "logging_strategy": "steps",
     "logging_steps": 25,
@@ -37,7 +37,7 @@
     "load_best_model_at_end": true,
     "per_device_train_batch_size": 32,
     "per_device_eval_batch_size": 32,
-    "learning_rate": 1e-4,
+    "learning_rate": 0.0001,
     "num_train_epochs": 1,
     "report_to": [
       "tensorboard"

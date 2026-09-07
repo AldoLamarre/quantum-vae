@@ -109,7 +109,8 @@ class TrainerConfigParser:
                 training_kwargs.update(cfg["trainer"])
 
             if "output" in cfg and isinstance(cfg["output"], dict):
-                training_kwargs["output_dir"] = cfg["output"].get("root", "checkpoints/vae_output")
+                default_root = f"checkpoints/vae/{cfg.get('family', cfg.get('model_name', 'run'))}"
+                training_kwargs["output_dir"] = cfg["output"].get("root", default_root)
 
         else:
             classifier_cfg = build_classifier_model_config(cfg)
@@ -249,7 +250,10 @@ class TrainerConfigParser:
 
         t_kwargs = parsed.training_kwargs
 
-        out_dir = output_dir or t_kwargs.get("output_dir", "checkpoints/hf_quantum_run")
+        family = parsed.raw_config.get("family", parsed.raw_config.get("model_name", parsed.raw_config.get("name", "run")))
+        task_dir = "vae" if parsed.task_type == "vae" else "classifier"
+        default_out_dir = f"checkpoints/{task_dir}/{family}"
+        out_dir = output_dir or t_kwargs.get("output_dir", default_out_dir)
         out_path = Path(out_dir)
         if not out_path.is_absolute():
             out_path = self.project_root / out_path

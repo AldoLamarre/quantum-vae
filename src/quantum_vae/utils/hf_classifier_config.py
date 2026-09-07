@@ -168,7 +168,32 @@ def build_classifier_config(config: Dict[str, Any]) -> ClassifierPipelineConfig:
 def resolve_output_dir(config: Dict[str, Any], project_root: Optional[str | Path] = None) -> Path:
     project_root_path = Path(project_root) if project_root is not None else PROJECT_ROOT
     trainer_cfg = config.get("trainer", {})
-    output_dir = project_root_path / trainer_cfg.get("output_dir", "checkpoints/hf_amplitude_classifier")
+    output_cfg = config.get("output", {})
+
+    family = str(config.get("family", config.get("model_name", config.get("name", "run")))).strip()
+    task_type = "classifier"
+    family_lower = family.lower()
+    if "classifier" not in family_lower and "measurement" not in config and "classifier_mode" not in config:
+        task_type = "vae"
+
+    if isinstance(output_cfg, dict) and output_cfg.get("root"):
+        requested = str(output_cfg["root"])
+    else:
+        requested = str(trainer_cfg.get("output_dir", ""))
+
+    if not requested:
+        requested = f"checkpoints/{task_type}/{family or 'run'}"
+
+    if "paperlogs" in requested:
+        requested = requested.split("paperlogs", 1)[-1].strip("/")
+        if requested:
+            output_dir = project_root_path / "checkpoints" / task_type / requested
+        else:
+            output_dir = project_root_path / "checkpoints" / task_type / (family or "run")
+    else:
+        output_dir = Path(requested)
+        if not output_dir.is_absolute():
+            output_dir = project_root_path / output_dir
 
     if bool(config.get("checkpoint", False)) and output_dir.exists() and not bool(
         trainer_cfg.get("overwrite_output_dir", False)

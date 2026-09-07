@@ -12,21 +12,33 @@
     "in_channels": 3,
     "out_channels": 3,
     "sample_size": 32,
-    "block_out_channels": [32, 32, 64],
-    "down_block_types": ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
-    "up_block_types": ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+    "block_out_channels": [
+      32,
+      32,
+      64
+    ],
+    "down_block_types": [
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D"
+    ],
+    "up_block_types": [
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D"
+    ]
   },
   "training": {
     "loss_type": "lpips",
-    "kl_weight": 1e-8,
+    "kl_weight": 1e-08,
     "noise_after_epoch": 6,
     "noise_std": 0.1,
     "num_train_epochs": 1000,
-    "learning_rate": 1e-4
+    "learning_rate": 0.0001
   },
   "trainer": {
-    "output_dir": "paperlogs/vaequantumhugface_cifar_pretraining_data_reupload",
-    "logging_dir": "paperlogs/vaequantumhugface_cifar_pretraining_data_reupload/logs",
+    "output_dir": "checkpoints/vae/vaequantumhugface_cifar_pretraining_data_reupload",
+    "logging_dir": "checkpoints/vae/vaequantumhugface_cifar_pretraining_data_reupload/logs",
     "overwrite_output_dir": false,
     "logging_strategy": "steps",
     "logging_steps": 25,
@@ -36,6 +48,8 @@
     "load_best_model_at_end": true,
     "per_device_train_batch_size": 128,
     "per_device_eval_batch_size": 128,
-    "report_to": ["tensorboard"]
+    "report_to": [
+      "tensorboard"
+    ]
   }
 }

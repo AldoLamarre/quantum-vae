@@ -1,9 +1,16 @@
 legacy/
+**/__pycache__/
 __pycache__/
 *.pyc
+.idea/
+/paperlogs/
 /paperlogsrenaud/
 /checkpoints/
 /results/
 /Benchmarking/
 /data/
 /local_refactor_tests/
+/Benchmarking/
+/data/
+/local_refactor_tests/
+/data/
