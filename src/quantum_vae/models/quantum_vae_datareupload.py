@@ -7,15 +7,13 @@ embed/rotate/entangle layers, and projected back to latent space for
 decoding.
 """
 
-from typing import Optional, Union, Tuple, Any, Callable
-from numpy import ndarray
+from typing import Optional, Callable
 import numpy as np
 
 
 import torch
 import torch.nn as nn
 import pennylane as qml
-from diffusers.models.autoencoders.vae import DecoderOutput
 has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
@@ -80,10 +78,22 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
             self.construct_circuit(),
             weight_shapes={"weights": self.shapeweight}
         )
-        
+        self._quantum_torch_device = self._infer_quantum_torch_device()
+
         # Projection layers (latent ↔ quantum) - initialized on first forward pass
         self.project_to_quantum: Optional[nn.Linear] = None
         self.project_from_quantum: Optional[nn.Linear] = None
+
+    def _infer_quantum_torch_device(self) -> torch.device:
+        try:
+            return next(self.qlayer.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def to(self, *args, **kwargs):
+        module = super().to(*args, **kwargs)
+        self.qlayer = self.qlayer.to(self._quantum_torch_device)
+        return module
     
     def initialize_projections(self, dummy: torch.FloatTensor) -> None:
         """Initialize projection layers based on latent dimension.
@@ -114,7 +124,7 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
             self.n_qubits,
             latent_dim
         ).to(dummy.device)
-    
+
     def construct_circuit(self) -> Callable:
         """Construct the parameterized data re-uploading quantum circuit.
 
@@ -202,6 +212,10 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
                 'Projections not initialized. Call initialize_projections() '
                 'before process_latent()'
             )
+        to_quantum_layer = self.project_to_quantum
+        from_quantum_layer = self.project_from_quantum
+        assert to_quantum_layer is not None
+        assert from_quantum_layer is not None
         
         # Remember original shape
         old_shape = z.shape
@@ -210,13 +224,16 @@ class QuantumVAEDataReupload(AnsatzVAEBase):
         z_flat = z.flatten(1)
         
         # Project to quantum input dimension: [batch_size, n_qubits * 3]
-        quantum_input = self.project_to_quantum(z_flat)
-        
+        quantum_input = to_quantum_layer(z_flat)
+
         # Process through quantum circuit: [batch_size, n_qubits * 3] → [batch_size, n_qubits]
+        quantum_input = quantum_input.to(self._quantum_torch_device)
         quantum_output = self.qlayer(quantum_input)
+        project_from_device = from_quantum_layer.weight.device
+        quantum_output = quantum_output.to(project_from_device)
         
         # Project back to latent dimension: [batch_size, n_qubits] → [batch_size, latent_dim]
-        z_quantum_flat = self.project_from_quantum(quantum_output)
+        z_quantum_flat = from_quantum_layer(quantum_output)
         
         # Reshape back to original latent shape
         return z_quantum_flat.reshape(old_shape)

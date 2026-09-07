@@ -51,6 +51,7 @@ class _VAEClassifierPipelineBase(BaseTorchModule):
             self.construct_circuit(),
             weight_shapes={"weights": self.weight_shape},
         )
+        self._quantum_torch_device = self._infer_quantum_torch_device()
 
         self._measurement_input_dim = 2 ** self.config.n_qubits
         self.measurement_projection: Optional[nn.Linear] = None
@@ -66,6 +67,17 @@ class _VAEClassifierPipelineBase(BaseTorchModule):
         else:
             self.postprocessing_mlp = nn.Identity()
         self.classifier = nn.Linear(measurement_dim, self.config.num_labels)
+
+    def _infer_quantum_torch_device(self) -> torch.device:
+        try:
+            return next(self.qlayer.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def to(self, *args, **kwargs):
+        module = super().to(*args, **kwargs)
+        self.qlayer = self.qlayer.to(self._quantum_torch_device)
+        return module
 
     def set_vae_backbone(self, vae_backbone_instance: Any) -> None:
         self.vae_backbone_instance = vae_backbone_instance
@@ -120,7 +132,9 @@ class _VAEClassifierPipelineBase(BaseTorchModule):
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         backbone_features = self._extract_backbone_features(inputs)
         measurement_state = self._to_measurement_state(backbone_features)
+        measurement_state = measurement_state.to(self._quantum_torch_device)
         measured = self.qlayer(measurement_state)
+        measured = measured.to(self.classifier.weight.device)
         features = self.postprocessing_mlp(measured)
         logits = self.classifier(features)
         return torch.softmax(logits, dim=-1)
