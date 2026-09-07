@@ -13,7 +13,6 @@ def build_mnist_3v5_dataset_bundle(
     test_data,
     batch_size=128,
     train_ratio=0.9,
-    filtered_test_source="train",
 ):
     filtered_train, filtered_test, train_set, val_set = build_label_mapped_splits(
         training_data,
@@ -39,7 +38,6 @@ def load_mnist_3v5_dataset_bundle(
     root="data",
     batch_size=128,
     train_ratio=0.9,
-    filtered_test_source="train",
     download=False,
 ):
     training_data = datasets.MNIST(
