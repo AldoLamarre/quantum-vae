@@ -295,6 +295,7 @@ class TrainerConfigParser:
                 self.per_device_eval_batch_size = eval_bs
                 self.logging_steps = log_steps
                 self.seed = seed
+                self.full_determinism = bool(t_kwargs.get("full_determinism", False))
                 self.save_strategy = str(t_kwargs.get("save_strategy", "epoch"))
                 self.evaluation_strategy = str(t_kwargs.get("evaluation_strategy", "epoch"))
                 self.overwrite_output_dir = bool(t_kwargs.get("overwrite_output_dir", False))
