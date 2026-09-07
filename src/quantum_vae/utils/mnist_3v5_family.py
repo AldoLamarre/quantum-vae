@@ -19,7 +19,6 @@ def build_mnist_3v5_dataset_bundle(
         test_data,
         LABEL_MAP,
         train_ratio=train_ratio,
-        filtered_test_source=filtered_test_source,
     )
 
     return {
@@ -58,5 +57,4 @@ def load_mnist_3v5_dataset_bundle(
         test_data,
         batch_size=batch_size,
         train_ratio=train_ratio,
-        filtered_test_source=filtered_test_source,
     )
