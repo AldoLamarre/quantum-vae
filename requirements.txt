@@ -1,6 +1,7 @@
 numpy
 torch
 torchmetrics
+torch-fidelity
 PennyLane
 torchvision
 matplotlib

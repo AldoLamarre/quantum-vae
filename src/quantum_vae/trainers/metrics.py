@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple, Union
 import numpy as np
+from .evaluation import compute_reconstruction_metrics_eval_pred
 
 
 def compute_classification_metrics(eval_pred: Union[Tuple[Any, Any], Any]) -> Dict[str, float]:
@@ -58,29 +59,13 @@ def compute_classification_metrics(eval_pred: Union[Tuple[Any, Any], Any]) -> Di
     return metrics
 
 
-def compute_vae_metrics(eval_pred: Union[Tuple[Any, Any], Any]) -> Dict[str, float]:
-    """Compute MSE reconstruction error and PSNR for VAE evaluation."""
-    if isinstance(eval_pred, (tuple, list)):
-        reconstructions, targets = eval_pred
-    else:
-        reconstructions = getattr(eval_pred, "predictions", None)
-        targets = getattr(eval_pred, "label_ids", None)
-
-    if reconstructions is None or targets is None:
+def compute_vae_metrics(
+    eval_pred: Union[Tuple[Any, Any], Any],
+    *,
+    image_range: str = "0_1",
+) -> Dict[str, float]:
+    """Compute non-FID reconstruction metrics for VAE evaluation."""
+    try:
+        return compute_reconstruction_metrics_eval_pred(eval_pred, image_range=image_range)
+    except RuntimeError:
         return {"reconstruction_mse": 0.0}
-
-    if hasattr(reconstructions, "detach"):
-        reconstructions = reconstructions.detach().cpu().numpy()
-    if hasattr(targets, "detach"):
-        targets = targets.detach().cpu().numpy()
-
-    reconstructions = np.asarray(reconstructions)
-    targets = np.asarray(targets)
-
-    mse = float(np.mean((reconstructions - targets) ** 2))
-    psnr = float(10.0 * np.log10(1.0 / max(1e-10, mse))) if mse > 0 else 100.0
-
-    return {
-        "reconstruction_mse": mse,
-        "psnr": psnr,
-    }
