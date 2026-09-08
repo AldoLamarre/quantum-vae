@@ -11,7 +11,7 @@
     }
   },
   "classifier": {
-    "softmax": true,
+    "logits": true,
     "num_labels": 10
   },
   "n_qubits": 7,

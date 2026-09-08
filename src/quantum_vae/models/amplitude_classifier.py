@@ -27,7 +27,8 @@ class ClassifierPipelineConfig:
     measurement_pauli: Optional[str] = None  # X | Y | Z (expectation only)
     postprocessing_mlp_enabled: bool = False
     postprocessing_mlp_hidden_dim: int = 128
-    softmax_enabled: bool = True
+    logits: bool = True
+    softmax_enabled: Optional[bool] = None
 
 
 class _VAEClassifierPipelineBase(BaseTorchModule):
@@ -37,8 +38,11 @@ class _VAEClassifierPipelineBase(BaseTorchModule):
         if not has_quantum_deps:
             raise ImportError("pennylane/torch dependencies are required for classifier pipelines.")
         super().__init__()
-        if not config.softmax_enabled:
-            raise ValueError("classifier.softmax=false is not implemented yet; set classifier.softmax=true.")
+        logits_enabled = config.logits if config.softmax_enabled is None else bool(config.softmax_enabled)
+        if not logits_enabled:
+            raise ValueError(
+                "classifier.logits=false is not implemented yet; measurement-based classifier outputs are not supported in this code path."
+            )
         self.config = config
         self.vae_backbone_instance = vae_backbone_instance
         self.wires = np.arange(self.config.n_qubits)
@@ -137,7 +141,7 @@ class _VAEClassifierPipelineBase(BaseTorchModule):
         measured = measured.to(self.classifier.weight.device)
         features = self.postprocessing_mlp(measured)
         logits = self.classifier(features)
-        return torch.softmax(logits, dim=-1)
+        return logits
 
 
 class PretrainedAnsatzClassifierPipeline(_VAEClassifierPipelineBase):

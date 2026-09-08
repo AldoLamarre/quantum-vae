@@ -6,7 +6,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+import ssl
+import torch
+
+from datasets import load_dataset
+from torchvision import datasets
+from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
+
 from src.quantum_vae.models.amplitude_classifier import ClassifierPipelineConfig
+from src.quantum_vae.models.quantum_vae_amplitude import QuantumVAEAmplitude
+from src.quantum_vae.models.quantum_vae_datareupload import QuantumVAEDataReupload
+from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
+from src.quantum_vae.utils.imagenet_family import build_imagenet_data_bundle
+from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
+from src.quantum_vae.utils.model_paths import registered_model_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "hf_amplitude_classifier_family.json"
@@ -32,12 +45,13 @@ class HFAmplitudeClassifierModelConfig:
     vae_backbone: VAEBackboneConfig
     measurement_kind: str
     measurement_pauli: Optional[str]
-    softmax_enabled: bool
-    num_labels: int
-    n_qubits: int
-    n_layers: int
-    postprocessing_mlp_enabled: bool
-    postprocessing_mlp_hidden_dim: int
+    logits: bool
+    softmax_enabled: Optional[bool] = None
+    num_labels: int = 10
+    n_qubits: int = 7
+    n_layers: int = 20
+    postprocessing_mlp_enabled: bool = False
+    postprocessing_mlp_hidden_dim: int = 128
 
 
 @dataclass(frozen=True)
@@ -66,10 +80,15 @@ def _dataset_name(config: Dict[str, Any]) -> str:
     return str(config.get("dataset", "cifar10")).lower()
 
 
-def _resolve_softmax_enabled(config: Dict[str, Any]) -> bool:
+def _resolve_logits_enabled(config: Dict[str, Any]) -> bool:
     classifier_cfg = config.get("classifier")
-    if isinstance(classifier_cfg, dict) and "softmax" in classifier_cfg:
-        return bool(classifier_cfg.get("softmax", True))
+    if isinstance(classifier_cfg, dict):
+        if "logits" in classifier_cfg:
+            return bool(classifier_cfg.get("logits", True))
+        if "softmax" in classifier_cfg:
+            return bool(classifier_cfg.get("softmax", True))
+    if "logits" in config:
+        return bool(config.get("logits", True))
     return bool(config.get("softmax", True))
 
 
@@ -120,9 +139,11 @@ def build_model_config(config: Dict[str, Any]) -> HFAmplitudeClassifierModelConf
     if classifier_mode not in {"ansatz", "amplitude"}:
         raise ValueError("classifier_mode must be 'ansatz' or 'amplitude'.")
 
-    softmax_enabled = _resolve_softmax_enabled(config)
-    if not softmax_enabled:
-        raise ValueError("classifier.softmax=false is not implemented yet; set classifier.softmax=true.")
+    logits_enabled = _resolve_logits_enabled(config)
+    if not logits_enabled:
+        raise ValueError(
+            "classifier.logits=false is not implemented yet; measurement-based classifier outputs are not supported in this code path."
+        )
     num_labels_cfg = config.get("classifier", {})
     if isinstance(num_labels_cfg, dict) and "num_labels" in num_labels_cfg:
         num_labels = int(num_labels_cfg["num_labels"])
@@ -139,7 +160,8 @@ def build_model_config(config: Dict[str, Any]) -> HFAmplitudeClassifierModelConf
         vae_backbone=vae_backbone,
         measurement_kind=measurement_kind,
         measurement_pauli=measurement_pauli,
-        softmax_enabled=softmax_enabled,
+        logits=logits_enabled,
+        softmax_enabled=None,
         num_labels=num_labels,
         n_qubits=n_qubits,
         n_layers=n_layers,
@@ -159,8 +181,80 @@ def build_classifier_config(config: Dict[str, Any]) -> ClassifierPipelineConfig:
         measurement_pauli=model_cfg.measurement_pauli,
         postprocessing_mlp_enabled=model_cfg.postprocessing_mlp_enabled,
         postprocessing_mlp_hidden_dim=model_cfg.postprocessing_mlp_hidden_dim,
+        logits=model_cfg.logits,
         softmax_enabled=model_cfg.softmax_enabled,
     )
+
+
+def _default_vae_model_kwargs(dataset: str) -> Dict[str, Any]:
+    dataset_name = str(dataset).lower()
+    if dataset_name == "mnist":
+        return {
+            "in_channels": 1,
+            "out_channels": 1,
+            "sample_size": 28,
+            "block_out_channels": (32, 32, 64),
+            "down_block_types": ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+            "up_block_types": ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+        }
+    return {
+        "in_channels": 3,
+        "out_channels": 3,
+        "sample_size": 32,
+        "block_out_channels": (32, 32, 64),
+        "down_block_types": ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
+        "up_block_types": ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
+    }
+
+
+def build_vae_backbone_instance(
+    config: Dict[str, Any],
+    project_root: Optional[str | Path] = None,
+):
+    model_cfg = build_model_config(config)
+    backbone_cfg = model_cfg.vae_backbone
+    dataset_name = model_cfg.dataset
+    root = Path(project_root) if project_root is not None else PROJECT_ROOT
+
+    if backbone_cfg.strategy == "ansatz_vae":
+        backbone_cls = QuantumVAEDataReupload
+        quantum_kwargs = {
+            "n_qubits": backbone_cfg.n_qubits or 10,
+            "n_quantum_layers": backbone_cfg.n_quantum_layers or 10,
+        }
+    else:
+        backbone_cls = QuantumVAEAmplitude
+        quantum_kwargs = {}
+
+    backbone = backbone_cls(**_default_vae_model_kwargs(dataset_name), **quantum_kwargs)
+
+    checkpoint = backbone_cfg.checkpoint
+    if checkpoint:
+        checkpoint_value = str(checkpoint).strip()
+        checkpoint_path = Path(checkpoint_value)
+        if not checkpoint_path.is_absolute():
+            candidate = root / checkpoint_path
+            if candidate.exists():
+                checkpoint_path = candidate
+            else:
+                checkpoint_path = Path(registered_model_path(checkpoint_value, project_root=root))
+        state = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(state, dict):
+            if isinstance(state.get("state_dict"), dict):
+                state = state["state_dict"]
+            elif isinstance(state.get("model_state_dict"), dict):
+                state = state["model_state_dict"]
+        backbone.load_state_dict(state, strict=False)
+
+    for name, param in backbone.named_parameters():
+        if "qlayer" in name:
+            param.requires_grad = bool(backbone_cfg.train_quantum_parts)
+        elif "project_to_quantum" in name or "project_from_quantum" in name:
+            param.requires_grad = bool(backbone_cfg.train_projection_layers)
+        else:
+            param.requires_grad = not bool(backbone_cfg.freeze_classical_parts)
+
+    return backbone
 
 
 def resolve_output_dir(config: Dict[str, Any], project_root: Optional[str | Path] = None) -> Path:
@@ -229,9 +323,49 @@ def build_training_args(config: Dict[str, Any], project_root: Optional[str | Pat
     )
 
 
+def build_classifier_dataset_bundle(config: Dict[str, Any]) -> Dict[str, Any]:
+    data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
+    batch_size = int(data_cfg.get("batch_size", 32))
+    root = str(data_cfg.get("root", "data"))
+    dataset_name = _dataset_name(config)
+
+    if dataset_name == "mnist":
+        training_data = datasets.MNIST(root=root, train=True, download=True, transform=ToTensor())
+        test_data = datasets.MNIST(root=root, train=False, download=True, transform=ToTensor())
+        return build_mnist_data_bundle(training_data, test_data, batch_size=batch_size)
+
+    if dataset_name == "cifar10":
+        training_data = datasets.CIFAR10(root=root, train=True, download=True, transform=ToTensor())
+        test_data = datasets.CIFAR10(root=root, train=False, download=True, transform=ToTensor())
+        return build_cifar10_data_bundle(training_data, test_data, batch_size=batch_size)
+
+    if dataset_name in {"imagenet", "imagenet-1k"}:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        resolution = int(data_cfg.get("resolution", 256))
+        dataset = load_dataset("imagenet-1k", trust_remote_code=True)
+        train_dataset = dataset["train"]
+        val_dataset = dataset["validation"]
+        test_dataset = dataset["test"]
+        transform = Compose(
+            [
+                Resize(resolution),
+                CenterCrop(224),
+                ToTensor(),
+                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        train_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
+        val_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
+        test_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
+        return build_imagenet_data_bundle(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
+
+    raise ValueError(f"Unsupported classifier dataset: {dataset_name}")
+
+
 def main(config_path: Optional[str | Path] = None) -> None:
     import argparse
-    from src.quantum_vae.trainers import TrainerConfigParser, build_trainer_from_config
+    from src.quantum_vae.trainers import TrainerConfigParser
+    from src.quantum_vae.trainers.config_parser import train_from_config
 
     parser = argparse.ArgumentParser(description="Hugging Face Quantum Model Trainer")
     parser.add_argument("--config", type=str, default=str(DEFAULT_CONFIG_PATH), help="Path to config JSON")
@@ -244,8 +378,23 @@ def main(config_path: Optional[str | Path] = None) -> None:
     parsed = config_parser.parse(target_config)
     print(f"Task type: {parsed.task_type}, Model: {parsed.model_name}")
 
-    trainer = build_trainer_from_config(target_config)
-    print(f"Trainer constructed: {type(trainer).__name__}")
+    bundle = build_classifier_dataset_bundle(parsed.raw_config)
+    trainer, train_results, eval_results = train_from_config(
+        target_config,
+        train_dataset=bundle["train_set"],
+        eval_dataset=bundle["val_set"],
+    )
+    print(f"Trainer built: {type(trainer).__name__}")
+    if train_results is not None:
+        print("Training complete.")
+        print(train_results)
+    if eval_results is not None:
+        print("Validation complete.")
+        print(eval_results)
+    if "test_set" in bundle:
+        test_results = trainer.evaluate(eval_dataset=bundle["test_set"], metric_key_prefix="test")
+        print("Test complete.")
+        print(test_results)
 
 
 __all__ = [

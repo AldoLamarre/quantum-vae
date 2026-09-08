@@ -13,7 +13,10 @@ from transformers import TrainingArguments
 from .base import BaseHFQuantumTrainer
 from .vae_trainer import QuantumVAETrainer
 from .classifier_trainer import QuantumClassifierTrainer
-from src.quantum_vae.utils.hf_classifier_config import build_model_config as build_classifier_model_config
+from src.quantum_vae.utils.hf_classifier_config import (
+    build_model_config as build_classifier_model_config,
+    build_vae_backbone_instance,
+)
 from src.quantum_vae.utils.model_paths import registered_model_path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -114,6 +117,7 @@ class TrainerConfigParser:
                 "measurement_pauli": classifier_cfg.measurement_pauli,
                 "postprocessing_mlp_enabled": classifier_cfg.postprocessing_mlp_enabled,
                 "postprocessing_mlp_hidden_dim": classifier_cfg.postprocessing_mlp_hidden_dim,
+                "logits": classifier_cfg.logits,
                 "softmax_enabled": classifier_cfg.softmax_enabled,
                 "vae_backbone": cfg.get("vae_backbone", {}),
             })
@@ -223,12 +227,22 @@ class TrainerConfigParser:
                 measurement_pauli=parsed.model_kwargs.get("measurement_pauli", "Z"),
                 postprocessing_mlp_enabled=parsed.model_kwargs.get("postprocessing_mlp_enabled", False),
                 postprocessing_mlp_hidden_dim=parsed.model_kwargs.get("postprocessing_mlp_hidden_dim", 128),
-                softmax_enabled=parsed.model_kwargs.get("softmax_enabled", True),
+                logits=parsed.model_kwargs.get("logits", parsed.model_kwargs.get("softmax_enabled", True)),
+                softmax_enabled=parsed.model_kwargs.get("softmax_enabled", None),
             )
             mode = str(classifier_cfg.classifier_mode).lower()
+            backbone_cfg = parsed.raw_config.get("vae_backbone")
+            backbone_instance = None
+            if isinstance(backbone_cfg, dict) and backbone_cfg:
+                backbone_instance = build_vae_backbone_instance(parsed.raw_config, project_root=self.project_root)
             if mode == "amplitude":
-                return AmplitudeClassifierPipeline(classifier_cfg)
-            return PretrainedAnsatzClassifierPipeline(classifier_cfg)
+                model = AmplitudeClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
+            else:
+                model = PretrainedAnsatzClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
+
+            if backbone_instance is not None:
+                model.set_vae_backbone(backbone_instance)
+            return model
 
     def build_training_args(
         self,
@@ -370,7 +384,8 @@ def train_from_config(
         eval_dataset=eval_dataset,
         **kwargs,
     )
-    train_results = trainer.train()
+    train_output = trainer.train()
+    train_results = getattr(train_output, "metrics", train_output)
     eval_results = None
     if eval_dataset is not None or getattr(trainer, "eval_dataset", None) is not None:
         eval_results = trainer.evaluate()

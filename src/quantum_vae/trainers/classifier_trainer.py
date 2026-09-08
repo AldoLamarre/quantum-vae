@@ -99,19 +99,16 @@ class QuantumClassifierTrainer(BaseHFQuantumTrainer):
         if self.custom_loss_fn is not None:
             loss = self.custom_loss_fn(outputs, labels)
         elif self.loss_fn_name in ("cross_entropy", "ce"):
-            # Check if targets are 1D integer class indices
-            if labels.dim() == 1 or (labels.dim() == 2 and labels.size(1) == 1):
-                labels_clean = labels.view(-1).long()
-                # Check if outputs are already softmax probabilities vs raw logits
-                if getattr(getattr(model, "config", None), "softmax_enabled", False):
-                    # Softmax already applied; use NLL loss on log(probs)
-                    log_probs = torch.log(torch.clamp(outputs, min=1e-9, max=1.0))
-                    loss = F.nll_loss(log_probs, labels_clean)
-                else:
-                    loss = F.cross_entropy(outputs, labels_clean)
+            model_cfg = getattr(model, "config", None)
+            logits_mode = getattr(model_cfg, "logits", getattr(model_cfg, "softmax_enabled", True))
+            if not logits_mode:
+                raise ValueError("classifier.logits=false is not supported; measurement-based classifier outputs are intentionally unsupported for now.")
+
+            if labels.dim() == 2 and labels.size(1) > 1:
+                labels_clean = labels.argmax(dim=-1).long()
             else:
-                # One-hot or multi-dim targets
-                loss = F.cross_entropy(outputs, labels.float())
+                labels_clean = labels.view(-1).long()
+            loss = F.cross_entropy(outputs, labels_clean)
         elif self.loss_fn_name in ("bce", "bce_with_logits"):
             loss = F.binary_cross_entropy_with_logits(outputs.view(-1), labels.view(-1).float())
         elif self.loss_fn_name == "mse":
