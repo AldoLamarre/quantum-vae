@@ -50,7 +50,7 @@ def build_vae_dataset_bundle(config: dict[str, object]) -> dict[str, object]:
                 Resize(resolution),
                 CenterCrop(224),
                 ToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
         train_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
