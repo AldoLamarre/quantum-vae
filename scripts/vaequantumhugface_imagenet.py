@@ -44,7 +44,7 @@ transform = transforms.Compose([
     transforms.Resize(256),                # Resize the image
     transforms.CenterCrop(224),             # Crop the center of the image
     transforms.ToTensor(),                  # Convert image to tensor
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # Normalize
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Normalize to [-1, 1]
 ])
 train_dataset.set_transform(lambda example: {'pixel_values': transform(example['image'])})
 val_dataset.set_transform(lambda example: {'pixel_values': transform(example['image'])})

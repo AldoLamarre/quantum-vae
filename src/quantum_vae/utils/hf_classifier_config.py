@@ -351,7 +351,7 @@ def build_classifier_dataset_bundle(config: Dict[str, Any]) -> Dict[str, Any]:
                 Resize(resolution),
                 CenterCrop(224),
                 ToTensor(),
-                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ]
         )
         train_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
