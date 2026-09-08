@@ -5,6 +5,7 @@ import json
 import ssl
 from pathlib import Path
 import sys
+import torch
 
 from datasets import load_dataset
 from torchvision import datasets
@@ -15,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.quantum_vae.trainers.config_parser import train_from_config
+from src.quantum_vae.trainers.evaluation import evaluate_vae_reconstruction_dataset
 from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
 from src.quantum_vae.utils.imagenet_family import build_imagenet_data_bundle
 from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
@@ -84,10 +86,51 @@ def main(config_path: str | Path | None = None) -> None:
     if eval_results is not None:
         print("Evaluation complete.")
         print(eval_results)
+
+    if torch.cuda.is_available():
+        eval_device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        eval_device = torch.device("mps")
+    else:
+        eval_device = torch.device("cpu")
+    trainer.model.to(eval_device)
+
+    image_range = str(getattr(trainer, "image_range", "0_1"))
+    eval_batch_size = int(getattr(trainer.args, "per_device_eval_batch_size", 32))
+
+    final_metrics = {}
+    full_val_metrics = evaluate_vae_reconstruction_dataset(
+        model=trainer.model,
+        dataset=bundle["val_set"],
+        data_collator=trainer.data_collator,
+        image_range=image_range,
+        batch_size=eval_batch_size,
+        compute_fid=True,
+        sample_posterior=True,
+    )
+    final_metrics["validation"] = full_val_metrics
+    print("Final validation metrics (with FID):")
+    print(full_val_metrics)
+
     if "test_set" in bundle:
-        test_results = trainer.evaluate(eval_dataset=bundle["test_set"])
-        print("Test complete.")
-        print(test_results)
+        full_test_metrics = evaluate_vae_reconstruction_dataset(
+            model=trainer.model,
+            dataset=bundle["test_set"],
+            data_collator=trainer.data_collator,
+            image_range=image_range,
+            batch_size=eval_batch_size,
+            compute_fid=True,
+            sample_posterior=True,
+        )
+        final_metrics["test"] = full_test_metrics
+        print("Final test metrics (with FID):")
+        print(full_test_metrics)
+
+    metrics_path = Path(trainer.args.output_dir) / "evaluation" / "full_metrics.json"
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", encoding="utf-8") as handle:
+        json.dump(final_metrics, handle, indent=2)
+    print(f"Saved full metrics to: {metrics_path}")
 
 
 if __name__ == "__main__":

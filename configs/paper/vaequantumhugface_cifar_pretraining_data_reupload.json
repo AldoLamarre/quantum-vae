@@ -29,6 +29,7 @@
     ]
   },
   "training": {
+    "image_range": "0_1",
     "loss_type": "lpips",
     "kl_weight": 1e-08,
     "noise_after_epoch": 6,

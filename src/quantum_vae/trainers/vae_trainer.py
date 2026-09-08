@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from torchvision.utils import make_grid, save_image
 
 from .base import BaseHFQuantumTrainer
 from .data_collators import VAEDataCollator
+from .evaluation import extract_input_images, normalize_image_range
 from .metrics import compute_vae_metrics
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -38,22 +41,34 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         loss_type: str = "mse",
         noise_after_epoch: Optional[int] = None,
         noise_std: float = 0.1,
+        image_range: str = "0_1",
+        save_reconstructions: bool = True,
+        reconstruction_every_n_epochs: int = 10,
+        reconstruction_num_images: int = 8,
+        save_test_reconstructions: bool = True,
         **kwargs,
     ):
         if data_collator is None:
             data_collator = VAEDataCollator()
-        if compute_metrics is None:
-            compute_metrics = compute_vae_metrics
 
         self.kl_weight = float(kl_weight)
         self.loss_type = str(loss_type).lower()
         self.noise_after_epoch = noise_after_epoch
         self.noise_std = float(noise_std)
-        self.lpips_loss_01 = None
-        self.lpips_loss_11 = None
+        self.image_range = self._normalize_image_range(image_range)
+        if compute_metrics is None:
+            compute_metrics = lambda eval_pred: compute_vae_metrics(eval_pred, image_range=self.image_range)
+        self.save_reconstructions = bool(save_reconstructions)
+        self.reconstruction_every_n_epochs = max(1, int(reconstruction_every_n_epochs))
+        self.reconstruction_num_images = max(1, int(reconstruction_num_images))
+        self.save_test_reconstructions = bool(save_test_reconstructions)
+        self._best_eval_loss: Optional[float] = None
+        self.lpips_loss = None
         if self.loss_type == "lpips":
-            self.lpips_loss_01 = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=True).eval()
-            self.lpips_loss_11 = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).eval()
+            self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
+                net_type="vgg",
+                normalize=(self.image_range == "0_1"),
+            ).eval()
 
         super().__init__(
             model=model,
@@ -70,36 +85,101 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         )
 
     def _extract_input_images(self, inputs: Union[Dict[str, Any], Any]) -> Any:
-        if isinstance(inputs, dict):
-            for key in ("sample", "pixel_values", "images", "inputs", "x"):
-                if key in inputs:
-                    return inputs[key]
-            # fallback to first value
-            return next(iter(inputs.values()))
-        return inputs
+        return extract_input_images(inputs)
+
+    def _normalize_image_range(self, image_range: str) -> str:
+        return normalize_image_range(image_range)
+
+    def _clamp_to_image_range(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.image_range == "0_1":
+            return torch.clamp(tensor, 0.0, 1.0)
+        return torch.clamp(tensor, -1.0, 1.0)
+
+    def _to_display_0_1(self, tensor: torch.Tensor) -> torch.Tensor:
+        clamped = self._clamp_to_image_range(tensor)
+        if self.image_range == "-1_1":
+            clamped = (clamped + 1.0) * 0.5
+        return torch.clamp(clamped, 0.0, 1.0)
 
     def _prepare_lpips_inputs(
         self,
         reconstruction: torch.Tensor,
-        sample: torch.Tensor,
+        target_images: torch.Tensor,
     ) -> Tuple[LearnedPerceptualImagePatchSimilarity, torch.Tensor, torch.Tensor]:
-        sample_min = float(sample.detach().amin().item())
-        sample_max = float(sample.detach().amax().item())
+        if self.lpips_loss is None:
+            raise RuntimeError("LPIPS loss is not initialized.")
+        metric = self.lpips_loss.to(target_images.device)
+        recon_lpips = self._clamp_to_image_range(reconstruction).float()
+        target_lpips = self._clamp_to_image_range(target_images).float()
+        return metric, recon_lpips, target_lpips
 
-        if sample_min >= -1e-3 and sample_max <= 1.0 + 1e-3:
-            if self.lpips_loss_01 is None:
-                raise RuntimeError("LPIPS [0,1] loss is not initialized.")
-            metric = self.lpips_loss_01.to(sample.device)
-            recon_lpips = torch.clamp(reconstruction, 0.0, 1.0).float()
-            sample_lpips = torch.clamp(sample, 0.0, 1.0).float()
-            return metric, recon_lpips, sample_lpips
+    def _extract_dataset_image(self, item: Any) -> Optional[torch.Tensor]:
+        if isinstance(item, torch.Tensor):
+            return item
+        if isinstance(item, dict):
+            value = self._extract_input_images(item)
+            return value if isinstance(value, torch.Tensor) else None
+        if isinstance(item, (tuple, list)) and item:
+            return item[0] if isinstance(item[0], torch.Tensor) else None
+        return None
 
-        if self.lpips_loss_11 is None:
-            raise RuntimeError("LPIPS [-1,1] loss is not initialized.")
-        metric = self.lpips_loss_11.to(sample.device)
-        recon_lpips = torch.clamp(reconstruction, -1.0, 1.0).float()
-        sample_lpips = torch.clamp(sample, -1.0, 1.0).float()
-        return metric, recon_lpips, sample_lpips
+    def _build_preview_batch(self, dataset: Any, num_images: int) -> Optional[torch.Tensor]:
+        if dataset is None or not hasattr(dataset, "__len__") or not hasattr(dataset, "__getitem__"):
+            return None
+
+        images: List[torch.Tensor] = []
+        max_items = min(len(dataset), max(num_images * 4, num_images))
+        for idx in range(max_items):
+            image = self._extract_dataset_image(dataset[idx])
+            if image is None:
+                continue
+            if image.ndim == 2:
+                image = image.unsqueeze(0)
+            images.append(image)
+            if len(images) >= num_images:
+                break
+        if not images:
+            return None
+        return torch.stack(images)
+
+    def _save_reconstruction_preview(self, dataset: Any, split: str, tag: str, epoch: int) -> None:
+        if not self.save_reconstructions:
+            return
+        if self.model is None:
+            return
+        batch = self._build_preview_batch(dataset, self.reconstruction_num_images)
+        if batch is None:
+            return
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                prepared = self._prepare_inputs({"sample": batch})
+                input_images = prepared["sample"]
+                forward_out = self.model(input_images, sample_posterior=False, return_dict=False)
+                if isinstance(forward_out, (tuple, list)):
+                    reconstruction = forward_out[0]
+                else:
+                    reconstruction = getattr(forward_out, "sample", forward_out)
+                if not isinstance(reconstruction, torch.Tensor):
+                    return
+
+                target_cpu = input_images.detach().cpu()
+                recon_cpu = reconstruction.detach().cpu()
+        finally:
+            if was_training:
+                self.model.train()
+
+        target_disp = self._to_display_0_1(target_cpu)
+        recon_disp = self._to_display_0_1(recon_cpu)
+        diff_disp = torch.clamp(torch.abs(recon_disp - target_disp), 0.0, 1.0)
+        triplet_rows = torch.cat([target_disp, recon_disp, diff_disp], dim=3)
+        grid = make_grid(triplet_rows, nrow=1)
+
+        output_dir = Path(self.args.output_dir) / "reconstructions" / split / tag
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_image(grid, output_dir / f"epoch-{epoch:04d}.png")
 
     def compute_loss(
         self,
@@ -150,7 +230,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
             elif self.loss_type == "bce":
                 recon_loss = F.binary_cross_entropy(torch.clamp(reconstruction_tensor, 0.0, 1.0), target_images)
             elif self.loss_type == "lpips":
-                if self.lpips_loss_01 is None or self.lpips_loss_11 is None:
+                if self.lpips_loss is None:
                     raise RuntimeError("LPIPS loss is not initialized.")
                 lpips_metric, recon_lpips, sample_lpips = self._prepare_lpips_inputs(reconstruction_tensor, target_images)
                 recon_loss = lpips_metric(recon_lpips, sample_lpips)
@@ -197,3 +277,31 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         pred_tensor = reconstruction.detach() if isinstance(reconstruction, torch.Tensor) else None
         target_tensor = target_images.detach() if isinstance(target_images, torch.Tensor) else None
         return detached_loss, pred_tensor, target_tensor
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Any] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        metrics = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
+        dataset_for_preview = eval_dataset if eval_dataset is not None else self.eval_dataset
+        current_epoch = int(round(float(getattr(self.state, "epoch", 0.0) or 0.0)))
+        if current_epoch <= 0:
+            current_epoch = 1
+
+        if metric_key_prefix == "eval":
+            should_save_periodic = current_epoch == 1 or (current_epoch % self.reconstruction_every_n_epochs == 0)
+            if should_save_periodic:
+                self._save_reconstruction_preview(dataset_for_preview, split="validation", tag="periodic", epoch=current_epoch)
+
+            eval_loss = metrics.get("eval_loss")
+            if isinstance(eval_loss, (float, int)):
+                eval_loss_value = float(eval_loss)
+                if self._best_eval_loss is None or eval_loss_value < self._best_eval_loss:
+                    self._best_eval_loss = eval_loss_value
+                    self._save_reconstruction_preview(dataset_for_preview, split="validation", tag="best", epoch=current_epoch)
+        elif metric_key_prefix == "test" and self.save_test_reconstructions:
+            self._save_reconstruction_preview(dataset_for_preview, split="test", tag="final", epoch=current_epoch)
+
+        return metrics

@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 from transformers import TrainingArguments
 
 from .base import BaseHFQuantumTrainer
 from .vae_trainer import QuantumVAETrainer
 from .classifier_trainer import QuantumClassifierTrainer
-from .data_collators import VAEDataCollator, ClassifierDataCollator
-from .metrics import compute_classification_metrics, compute_vae_metrics
 from src.quantum_vae.utils.hf_classifier_config import build_model_config as build_classifier_model_config
 from src.quantum_vae.utils.model_paths import registered_model_path
 
@@ -95,6 +91,12 @@ class TrainerConfigParser:
                 training_kwargs.update(cfg["training"])
             if isinstance(cfg.get("trainer"), dict):
                 training_kwargs.update(cfg["trainer"])
+
+            image_range = training_kwargs.get("image_range", cfg.get("image_range"))
+            if image_range is None:
+                dataset_name = str(cfg.get("dataset", data_kwargs.get("dataset", "mnist"))).lower()
+                image_range = "-1_1" if "imagenet" in dataset_name else "0_1"
+            training_kwargs["image_range"] = str(image_range)
 
             if "output" in cfg and isinstance(cfg["output"], dict):
                 default_root = f"checkpoints/vae/{cfg.get('family', cfg.get('model_name', 'run'))}"
@@ -316,6 +318,11 @@ class TrainerConfigParser:
                 loss_type=loss_type,
                 noise_after_epoch=int(noise_after_epoch) if noise_after_epoch is not None else None,
                 noise_std=noise_std,
+                image_range=str(parsed.training_kwargs.get("image_range", "0_1")),
+                save_reconstructions=bool(parsed.training_kwargs.get("save_reconstructions", True)),
+                reconstruction_every_n_epochs=int(parsed.training_kwargs.get("reconstruction_every_n_epochs", 10)),
+                reconstruction_num_images=int(parsed.training_kwargs.get("reconstruction_num_images", 8)),
+                save_test_reconstructions=bool(parsed.training_kwargs.get("save_test_reconstructions", True)),
                 **trainer_kwargs,
             )
         else:
@@ -354,7 +361,7 @@ def train_from_config(
     train_dataset: Optional[Any] = None,
     eval_dataset: Optional[Any] = None,
     **kwargs,
-) -> Tuple[BaseHFQuantumTrainer, Dict[str, Any], Optional[Dict[str, float]]]:
+) -> Tuple[BaseHFQuantumTrainer, Any, Optional[Dict[str, float]]]:
     """Load config, construct trainer, execute training, evaluate, and save model."""
     trainer = build_trainer_from_config(
         config_source=config_source,
