@@ -12,6 +12,16 @@ from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
+class MissingEvalDataError(RuntimeError):
+    """Raised when eval_pred has no predictions/targets to compute metrics from.
+
+    This is the one case where a caller may reasonably want to fall back to
+    a placeholder result. Any other RuntimeError raised while computing
+    metrics (shape mismatches, etc.) is a real bug and should NOT be caught
+    the same way.
+    """
+
+
 def normalize_image_range(image_range: str) -> str:
     value = str(image_range).strip().lower()
     if value in {"0_1", "zero_one"}:
@@ -85,7 +95,7 @@ def _prepare_eval_pred_tensors(eval_pred: Union[Tuple[Any, Any], Any]) -> Tuple[
         targets = getattr(eval_pred, "label_ids", None)
 
     if reconstructions is None or targets is None:
-        raise RuntimeError("Missing predictions/targets for VAE evaluation metrics.")
+        raise MissingEvalDataError("Missing predictions/targets for VAE evaluation metrics.")
 
     recon_tensor = torch.as_tensor(reconstructions, dtype=torch.float32)
     target_tensor = torch.as_tensor(targets, dtype=torch.float32)

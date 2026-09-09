@@ -60,6 +60,13 @@ def managed_model_path(model_key, project_root=None, create_parent=False):
 
 
 def registered_model_path(model_key, project_root=None):
+    """Resolve a registered model key to an existing file path.
+
+    Raises FileNotFoundError if none of the managed/legacy candidate paths
+    actually exist on disk, instead of silently returning a guessed path.
+    A caller that gets a return value from this function can rely on that
+    path existing.
+    """
     model_spec = REGISTERED_MODELS[model_key]
     root = _project_root(project_root)
     managed_path = root / model_spec["managed"]
@@ -71,5 +78,10 @@ def registered_model_path(model_key, project_root=None):
         if legacy_path.exists():
             return str(legacy_path)
 
-    return str(legacy_paths[0])
+    tried = [str(managed_path)] + [str(p) for p in legacy_paths]
+    raise FileNotFoundError(
+        f"No file found for registered model '{model_key}'. Tried: {tried}. "
+        "Download/place the checkpoint at one of these paths, or pass an "
+        "explicit checkpoint path instead of a registry key."
+    )
 

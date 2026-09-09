@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -244,7 +245,18 @@ def build_vae_backbone_instance(
                 state = state["state_dict"]
             elif isinstance(state.get("model_state_dict"), dict):
                 state = state["model_state_dict"]
-        backbone.load_state_dict(state, strict=False)
+        load_result = backbone.load_state_dict(state, strict=False)
+        missing = getattr(load_result, "missing_keys", [])
+        unexpected = getattr(load_result, "unexpected_keys", [])
+        if missing or unexpected:
+            warnings.warn(
+                f"Loaded VAE backbone checkpoint '{checkpoint_path}' with mismatched keys: "
+                f"{len(missing)} missing, {len(unexpected)} unexpected. "
+                f"missing_keys={missing[:10]}{'...' if len(missing) > 10 else ''}, "
+                f"unexpected_keys={unexpected[:10]}{'...' if len(unexpected) > 10 else ''}. "
+                "The backbone may be partially randomly initialized.",
+                stacklevel=2,
+            )
 
     for name, param in backbone.named_parameters():
         if "qlayer" in name:

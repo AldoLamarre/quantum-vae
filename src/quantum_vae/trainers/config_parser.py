@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
@@ -163,7 +164,7 @@ class TrainerConfigParser:
             kwargs = dict(parsed.model_kwargs)
             try:
                 model = model_cls(**kwargs)
-            except Exception:
+            except Exception as exc:
                 # Fallback to default small kwargs if needed
                 fallback_kwargs = dict(
                     in_channels=kwargs.get("in_channels", 3),
@@ -172,6 +173,14 @@ class TrainerConfigParser:
                     block_out_channels=kwargs.get("block_out_channels", (32, 32, 64)),
                     down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
                     up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
+                )
+                warnings.warn(
+                    f"Failed to construct {model_cls.__name__} with configured kwargs "
+                    f"{kwargs}: {type(exc).__name__}: {exc}. Falling back to default "
+                    f"architecture kwargs {fallback_kwargs}. The model you get may NOT "
+                    "match what your config requested -- fix the underlying error above "
+                    "if that matters for this run.",
+                    stacklevel=2,
                 )
                 model = model_cls(**fallback_kwargs)
                 
@@ -192,6 +201,7 @@ class TrainerConfigParser:
             if isinstance(checkpoint, str) and checkpoint.strip():
                 checkpoint_value = checkpoint.strip()
                 checkpoint_path = Path(checkpoint_value)
+                registry_error: Optional[Exception] = None
                 if not checkpoint_path.is_absolute():
                     candidate = self.project_root / checkpoint_path
                     if candidate.exists():
@@ -199,16 +209,38 @@ class TrainerConfigParser:
                     else:
                         try:
                             checkpoint_path = Path(registered_model_path(checkpoint_value, project_root=self.project_root))
-                        except Exception:
+                        except Exception as exc:
+                            # checkpoint_value isn't a registry key either; fall
+                            # through to the explicit existence check below,
+                            # which will raise with a clear message.
+                            registry_error = exc
                             checkpoint_path = candidate
-                if checkpoint_path.exists():
-                    state = torch.load(checkpoint_path, map_location="cpu")
-                    if isinstance(state, dict):
-                        if isinstance(state.get("state_dict"), dict):
-                            state = state["state_dict"]
-                        elif isinstance(state.get("model_state_dict"), dict):
-                            state = state["model_state_dict"]
-                    model.load_state_dict(state, strict=False)
+                if not checkpoint_path.exists():
+                    hint = f" (registry lookup also failed: {registry_error})" if registry_error is not None else ""
+                    raise FileNotFoundError(
+                        f"Checkpoint '{checkpoint_value}' was requested in the config but could not be "
+                        f"resolved to an existing file (looked for: {checkpoint_path}){hint}. "
+                        "Fix the path/registry key, or remove base_checkpoint/checkpoint from the "
+                        "config to train from scratch."
+                    )
+                state = torch.load(checkpoint_path, map_location="cpu")
+                if isinstance(state, dict):
+                    if isinstance(state.get("state_dict"), dict):
+                        state = state["state_dict"]
+                    elif isinstance(state.get("model_state_dict"), dict):
+                        state = state["model_state_dict"]
+                load_result = model.load_state_dict(state, strict=False)
+                missing = getattr(load_result, "missing_keys", [])
+                unexpected = getattr(load_result, "unexpected_keys", [])
+                if missing or unexpected:
+                    warnings.warn(
+                        f"Loaded checkpoint '{checkpoint_path}' with mismatched keys: "
+                        f"{len(missing)} missing, {len(unexpected)} unexpected. "
+                        f"missing_keys={missing[:10]}{'...' if len(missing) > 10 else ''}, "
+                        f"unexpected_keys={unexpected[:10]}{'...' if len(unexpected) > 10 else ''}. "
+                        "The model may be partially randomly initialized.",
+                        stacklevel=2,
+                    )
             return model
 
         else:
