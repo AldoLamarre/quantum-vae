@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -39,6 +40,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         optimizers: Tuple[Optional[Any], Optional[Any]] = (None, None),
         kl_weight: float = 1e-4,
         loss_type: str = "mse",
+        perceptual_weight: float = 0.0,
         noise_after_epoch: Optional[int] = None,
         noise_std: float = 0.1,
         image_range: str = "0_1",
@@ -53,6 +55,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
 
         self.kl_weight = float(kl_weight)
         self.loss_type = str(loss_type).lower()
+        self.perceptual_weight = float(perceptual_weight)
         self.noise_after_epoch = noise_after_epoch
         self.noise_std = float(noise_std)
         self.image_range = self._normalize_image_range(image_range)
@@ -64,11 +67,18 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.save_test_reconstructions = bool(save_test_reconstructions)
         self._best_eval_loss: Optional[float] = None
         self.lpips_loss = None
-        if self.loss_type == "lpips":
+        if self.loss_type == "lpips" or self.perceptual_weight > 0:
             self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
                 net_type="vgg",
                 normalize=(self.image_range == "0_1"),
             ).eval()
+        if self.loss_type == "lpips" and self.perceptual_weight > 0:
+            warnings.warn(
+                "perceptual_weight > 0 has no effect when loss_type='lpips' "
+                "(that path is pure LPIPS, kept for reproducibility). "
+                "Use loss_type='l1' or 'mse' with perceptual_weight to combine them.",
+                stacklevel=2,
+            )
 
         super().__init__(
             model=model,
@@ -247,6 +257,23 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                     f"Unsupported loss_type '{self.loss_type}'. Supported values: "
                     "'mse', 'l1', 'lpips'."
                 )
+
+            # LDM/SD's actual recipe adds LPIPS on top of the pixel loss
+            # (rec_loss = pixel_loss + perceptual_weight * lpips), rather than
+            # using LPIPS alone. Opt-in via perceptual_weight > 0; leaves the
+            # pure loss_type="lpips" path above untouched for reproducibility.
+            # Scales don't match LDM exactly (their LPIPS term is elementwise
+            # and shares the pixel-sum scale; torchmetrics' LPIPS is already a
+            # single batch-mean scalar), so perceptual_weight will need its
+            # own tuning rather than reusing LDM's default of 1.0.
+            if self.perceptual_weight > 0 and self.loss_type in ("l1", "mse"):
+                if self.lpips_loss is None:
+                    raise RuntimeError("LPIPS loss is not initialized.")
+                lpips_metric, recon_lpips, sample_lpips = self._prepare_lpips_inputs(reconstruction_tensor, target_images)
+                perceptual_term = lpips_metric(recon_lpips, sample_lpips)
+                if hasattr(perceptual_term, "mean"):
+                    perceptual_term = perceptual_term.mean()
+                recon_loss = recon_loss + self.perceptual_weight * perceptual_term
 
             loss = recon_loss + self.kl_weight * kl_div
 

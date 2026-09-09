@@ -86,28 +86,10 @@ class QuantumVAEBase(ABC, AutoencoderKL):
         return DecoderOutput(sample=reconstruction), kl_div, z_quantum
 
     def _compute_kl(self, posterior) -> torch.FloatTensor:
-        """Compute KL divergence for standard Gaussian VAE, matching the
-        Stable Diffusion / LDM (CompVis/latent-diffusion) convention.
+        """KL(N(μ, σ²) || N(0, 1)) = -0.5 * Σ(1 + log(σ²) - μ² - σ²).
 
-        `posterior` is a diffusers `DiagonalGaussianDistribution`, and its
-        `.kl()` method already computes, per sample:
-            0.5 * sum_d(mean_d^2 + var_d - 1 - logvar_d)
-        summed over latent dimensions d (dim=[1, 2, 3]) -- this is the exact
-        same computation used in LDM's LPIPSWithDiscriminator
-        (`kl_loss = posteriors.kl(); kl_loss = torch.sum(kl_loss) / kl_loss.shape[0]`),
-        just before the final mean-over-batch step, which we do here.
-
-        With kl_weight=1.0 and a reconstruction loss that is likewise
-        "sum over pixels per sample, mean over batch" (see vae_trainer.py),
-        recon_loss + kl_weight * kl_div reproduces the LDM/SD VAE loss
-        exactly. This is also batch-size invariant, so kl_weight doesn't
-        need retuning when per_device_train_batch_size changes.
-
-        Args:
-            posterior: diffusers DiagonalGaussianDistribution (mean/logvar/var)
-
-        Returns:
-            Scalar KL divergence, averaged over the batch
+        Uses diffusers' own DiagonalGaussianDistribution.kl() (sum over
+        latent dims per sample), averaged over the batch.
         """
         return posterior.kl().mean()
 

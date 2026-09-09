@@ -353,6 +353,7 @@ class TrainerConfigParser:
         if parsed.task_type == "vae":
             kl_weight = float(parsed.training_kwargs.get("kl_weight", 1e-4))
             loss_type = str(parsed.training_kwargs.get("loss_type", "mse"))
+            perceptual_weight = float(parsed.training_kwargs.get("perceptual_weight", 0.0))
             noise_after_epoch = parsed.training_kwargs.get("noise_after_epoch")
             noise_std = float(parsed.training_kwargs.get("noise_std", 0.1))
             return QuantumVAETrainer(
@@ -362,6 +363,7 @@ class TrainerConfigParser:
                 eval_dataset=eval_dataset,
                 kl_weight=kl_weight,
                 loss_type=loss_type,
+                perceptual_weight=perceptual_weight,
                 noise_after_epoch=int(noise_after_epoch) if noise_after_epoch is not None else None,
                 noise_std=noise_std,
                 image_range=str(parsed.training_kwargs.get("image_range", "0_1")),
