@@ -76,7 +76,7 @@ class TrainerConfigParser:
                     task_type = "vae"
             elif "model" in cfg and isinstance(cfg["model"], dict) and "down_block_types" in cfg["model"]:
                 task_type = "vae"
-            elif "classifier" in cfg or "measurement" in cfg:
+            elif "classifier" in cfg or "measurement" in cfg or "classifier_mode" in cfg:
                 task_type = "classifier"
             elif "kl_weight" in cfg.get("training", {}):
                 task_type = "vae"
@@ -85,9 +85,9 @@ class TrainerConfigParser:
                 raise ValueError(
                     "Could not determine task_type ('vae' or 'classifier') from this "
                     "config -- none of the usual signals (family name, model."
-                    "down_block_types, classifier/measurement keys, training.kl_weight) "
-                    "matched. Add an explicit \"task_type\": \"vae\" or "
-                    "\"task_type\": \"classifier\" field to the config to resolve this."
+                    "down_block_types, classifier/measurement/classifier_mode keys, "
+                    "training.kl_weight) matched. Add an explicit \"task_type\": \"vae\" "
+                    "or \"task_type\": \"classifier\" field to the config to resolve this."
                 )
 
         model_kwargs: Dict[str, Any] = {}
@@ -335,6 +335,7 @@ class TrainerConfigParser:
             from src.quantum_vae.models.amplitude_classifier import AmplitudeClassifierPipeline
             from src.quantum_vae.models.classifier_base import ClassifierPipelineConfig
             from src.quantum_vae.models.datareupload_classifier import DataReuploadClassifierPipeline
+            from src.quantum_vae.models.neutral_atom_classifier import NeutralAtomClassifierPipeline
 
             classifier_cfg = ClassifierPipelineConfig(
                 classifier_mode=parsed.model_kwargs.get("classifier_mode", "ansatz"),
@@ -355,6 +356,8 @@ class TrainerConfigParser:
                 backbone_instance = build_vae_backbone_instance(parsed.raw_config, project_root=self.project_root)
             if mode == "amplitude":
                 model = AmplitudeClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
+            elif mode == "neutral_atom":
+                model = NeutralAtomClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
             else:
                 model = DataReuploadClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
 

@@ -17,6 +17,7 @@ from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTen
 from src.quantum_vae.models.classifier_base import ClassifierPipelineConfig
 from src.quantum_vae.models.quantum_vae_amplitude import QuantumVAEAmplitude
 from src.quantum_vae.models.quantum_vae_datareupload import QuantumVAEDataReupload
+from src.quantum_vae.models.quantum_vae_neutral_atom import NeutralAtomDeviceConfig, QuantumVAENeutralAtom
 from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
 from src.quantum_vae.utils.imagenet_family import build_imagenet_data_bundle
 from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
@@ -28,7 +29,7 @@ DEFAULT_CONFIG_PATH = PROJECT_ROOT / "configs" / "hf_amplitude_classifier_family
 
 @dataclass(frozen=True)
 class VAEBackboneConfig:
-    strategy: str  # ansatz_vae | amplitude_vae
+    strategy: str  # ansatz_vae | amplitude_vae | neutral_atom_vae
     checkpoint: Optional[str]
     vae_class: str
     freeze_classical_parts: bool
@@ -37,6 +38,15 @@ class VAEBackboneConfig:
     ansatz_name: Optional[str]
     n_qubits: Optional[int]
     n_quantum_layers: Optional[int]
+    # neutral_atom_vae-only device fields (see NeutralAtomDeviceConfig).
+    # None for the other two strategies.
+    n_atoms: Optional[int] = None
+    register_geometry: Optional[str] = None
+    atom_spacing_um: Optional[float] = None
+    r0_um: Optional[float] = None
+    C6: Optional[float] = None
+    evolution_time_us: Optional[float] = None
+    n_segments: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -99,15 +109,19 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         vae_cfg = config.get("base_vae", {})
 
     strategy = str(vae_cfg.get("strategy", "ansatz_vae")).lower()
-    if strategy not in {"ansatz_vae", "amplitude_vae"}:
-        raise ValueError("vae_backbone.strategy must be 'ansatz_vae' or 'amplitude_vae'.")
+    if strategy not in {"ansatz_vae", "amplitude_vae", "neutral_atom_vae"}:
+        raise ValueError("vae_backbone.strategy must be 'ansatz_vae', 'amplitude_vae', or 'neutral_atom_vae'.")
 
     strategy_cfg = vae_cfg.get(strategy, {})
     if not isinstance(strategy_cfg, dict):
         strategy_cfg = {}
 
     checkpoint = strategy_cfg.get("checkpoint", vae_cfg.get("checkpoint"))
-    default_vae_class = "QuantumVAEDataReupload" if strategy == "ansatz_vae" else "QuantumVAEAmplitude"
+    default_vae_class = {
+        "ansatz_vae": "QuantumVAEDataReupload",
+        "amplitude_vae": "QuantumVAEAmplitude",
+        "neutral_atom_vae": "QuantumVAENeutralAtom",
+    }[strategy]
     vae_class = str(strategy_cfg.get("vae_class", vae_cfg.get("vae_class", default_vae_class)))
     freeze_classical_parts = bool(strategy_cfg.get("freeze_classical_parts", True))
     train_quantum_parts = bool(strategy_cfg.get("train_quantum_parts", True))
@@ -120,6 +134,20 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     ansatz_name = strategy_cfg.get("name")
     n_qubits = strategy_cfg.get("n_qubits", vae_cfg.get("n_qubits"))
     n_quantum_layers = strategy_cfg.get("n_quantum_layers", vae_cfg.get("n_quantum_layers"))
+
+    n_atoms = strategy_cfg.get("n_atoms", vae_cfg.get("n_atoms"))
+    register_geometry = strategy_cfg.get("register_geometry", vae_cfg.get("register_geometry"))
+    atom_spacing_um = strategy_cfg.get("atom_spacing_um", vae_cfg.get("atom_spacing_um"))
+    r0_um = strategy_cfg.get("r0_um", vae_cfg.get("r0_um"))
+    C6 = strategy_cfg.get("C6", vae_cfg.get("C6"))
+    evolution_time_us = strategy_cfg.get("evolution_time_us", vae_cfg.get("evolution_time_us"))
+    n_segments = strategy_cfg.get("n_segments", vae_cfg.get("n_segments"))
+    if strategy == "neutral_atom_vae" and n_atoms is None:
+        raise ValueError(
+            "vae_backbone.neutral_atom_vae.n_atoms is required when "
+            "strategy='neutral_atom_vae' (see NeutralAtomDeviceConfig)."
+        )
+
     return VAEBackboneConfig(
         strategy=strategy,
         checkpoint=str(checkpoint) if checkpoint is not None else None,
@@ -130,6 +158,13 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         ansatz_name=str(ansatz_name) if ansatz_name is not None else None,
         n_qubits=int(n_qubits) if n_qubits is not None else None,
         n_quantum_layers=int(n_quantum_layers) if n_quantum_layers is not None else None,
+        n_atoms=int(n_atoms) if n_atoms is not None else None,
+        register_geometry=str(register_geometry) if register_geometry is not None else None,
+        atom_spacing_um=float(atom_spacing_um) if atom_spacing_um is not None else None,
+        r0_um=float(r0_um) if r0_um is not None else None,
+        C6=float(C6) if C6 is not None else None,
+        evolution_time_us=float(evolution_time_us) if evolution_time_us is not None else None,
+        n_segments=int(n_segments) if n_segments is not None else None,
     )
 
 
@@ -142,8 +177,8 @@ def build_model_config(config: Dict[str, Any]) -> HFAmplitudeClassifierModelConf
 
     post_cfg = config.get("postprocessing_mlp", {})
     classifier_mode = str(config.get("classifier_mode", "ansatz")).lower()
-    if classifier_mode not in {"ansatz", "amplitude"}:
-        raise ValueError("classifier_mode must be 'ansatz' or 'amplitude'.")
+    if classifier_mode not in {"ansatz", "amplitude", "neutral_atom"}:
+        raise ValueError("classifier_mode must be 'ansatz', 'amplitude', or 'neutral_atom'.")
 
     logits_enabled = _resolve_logits_enabled(config)
     if not logits_enabled:
@@ -228,11 +263,40 @@ def build_vae_backbone_instance(
             "n_qubits": backbone_cfg.n_qubits or 10,
             "n_quantum_layers": backbone_cfg.n_quantum_layers or 10,
         }
+        backbone = backbone_cls(**_default_vae_model_kwargs(dataset_name), **quantum_kwargs)
+    elif backbone_cfg.strategy == "neutral_atom_vae":
+        # QuantumVAENeutralAtom takes a NeutralAtomDeviceConfig as its
+        # first positional arg, not flat quantum kwargs -- built
+        # separately rather than folded into the generic quantum_kwargs
+        # dict the other two strategies use.
+        device_cfg = NeutralAtomDeviceConfig.from_geometry(
+            n_atoms=backbone_cfg.n_atoms,
+            register_geometry=backbone_cfg.register_geometry or "chain",
+            atom_spacing_um=backbone_cfg.atom_spacing_um or 8.0,
+            r0_um=backbone_cfg.r0_um,
+            C6=backbone_cfg.C6 or 862690.0,
+            evolution_time_us=backbone_cfg.evolution_time_us or 4.0,
+            n_segments=backbone_cfg.n_segments or 6,
+        )
+        backbone = QuantumVAENeutralAtom(device_cfg, **_default_vae_model_kwargs(dataset_name))
     else:
         backbone_cls = QuantumVAEAmplitude
-        quantum_kwargs = {}
+        backbone = backbone_cls(**_default_vae_model_kwargs(dataset_name))
 
-    backbone = backbone_cls(**_default_vae_model_kwargs(dataset_name), **quantum_kwargs)
+    # IMPORTANT: force lazily-created layers (project_to_quantum /
+    # project_from_quantum) to exist NOW, before checkpoint loading. Both
+    # ansatz-style backbones only create these submodules on first
+    # initialize_projections() call. Without this, load_state_dict below
+    # finds no project_to_quantum/project_from_quantum submodule to load
+    # into -- those checkpoint keys silently land in unexpected_keys and
+    # get dropped, and the projections are later randomly reinitialized
+    # (not restored from the pretrained checkpoint) the first time
+    # get_pre_quantum_features()/process_latent() lazily initializes them.
+    if hasattr(backbone, "initialize_projections") and getattr(backbone, "project_to_quantum", "sentinel") is None:
+        dummy_kwargs = _default_vae_model_kwargs(dataset_name)
+        dummy_input = torch.zeros(1, dummy_kwargs["in_channels"], dummy_kwargs["sample_size"], dummy_kwargs["sample_size"])
+        with torch.no_grad():
+            backbone.initialize_projections(dummy_input)
 
     checkpoint = backbone_cfg.checkpoint
     if checkpoint:
