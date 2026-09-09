@@ -160,10 +160,43 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     """Bridges a batched, JAX-differentiable pulse qnode into torch autograd.
 
     Forward runs the JAX computation and stashes a jax.vjp closure;
-    backward evaluates that closure on the incoming torch gradient. All
-    numerics happen in float64 on the JAX side (pulse ODE integration is
-    not well behaved in float32) and are cast back to the caller's
-    dtype/device.
+    backward evaluates that closure on the incoming torch gradient.
+
+    Device handoff uses DLPack via the standard __dlpack__/__dlpack_device__
+    protocol (jax.numpy.from_dlpack / torch.from_dlpack -- both frameworks'
+    top-level entry points, no jax.dlpack/torch.utils.dlpack submodule
+    imports needed on jax>=0.7ish/torch>=2.x), which shares the underlying
+    buffer directly between torch and jax when both tensors already live
+    on the same device -- no host-RAM round trip. This matters specifically on
+    GPU: the previous .detach().cpu().numpy() implementation forced every
+    single forward AND backward call through host memory even when both
+    frameworks had CUDA tensors sitting right next to each other, which
+    left the GPU idling between compute bursts instead of actually being
+    used continuously (visible as alternating 99%/0% utilization in
+    nvidia-smi during real training).
+
+    All numerics still happen in float64 (pulse ODE integration is not
+    well behaved in float32) -- callers are expected to hand this
+    float64 tensors already (NeutralAtomPulseLayer.forward does this via
+    process_latent's explicit .to(dtype=torch.float64)); this class
+    asserts rather than silently upcasts, since an implicit upcast would
+    itself require a copy and defeat the point of the zero-copy path.
+
+    NOT YET VERIFIED ON GPU. Built and reasoned through against jax
+    0.10.2 / torch 2.14's documented DLPack APIs, and the CPU path is
+    covered by the existing gradcheck suite, but the zero-copy behavior
+    specifically only manifests differently on GPU, which this
+    (CPU-only) development environment cannot exercise. Known rough
+    edges to check if this errors on real hardware:
+      - 0-dim scalar tensors (Omega0_MHz/Delta0_MHz/lam are all 0-dim)
+        have had version-dependent DLPack support gaps across
+        frameworks -- if these specifically fail, that's the first
+        thing to suspect.
+      - jax's default device must actually match the torch tensor's
+        CUDA device index; if NeutralAtomPulseLayer wasn't moved to the
+        same device the input tensors are on, DLPack will either raise
+        or silently trigger the exact copy this change is meant to
+        avoid.
     """
 
     @staticmethod
@@ -173,25 +206,39 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
         ctx.Delta0_device, ctx.Delta0_dtype = Delta0_MHz.device, Delta0_MHz.dtype
         ctx.lam_device, ctx.lam_dtype = lam.device, lam.dtype
 
-        x_jax = jnp.asarray(x.detach().cpu().numpy(), dtype=jnp.float64)
-        Omega0_jax = jnp.asarray(Omega0_MHz.detach().cpu().numpy(), dtype=jnp.float64)
-        Delta0_jax = jnp.asarray(Delta0_MHz.detach().cpu().numpy(), dtype=jnp.float64)
-        lam_jax = jnp.asarray(lam.detach().cpu().numpy(), dtype=jnp.float64)
+        for name, t in (("x", x), ("Omega0_MHz", Omega0_MHz), ("Delta0_MHz", Delta0_MHz), ("lam", lam)):
+            if t.dtype != torch.float64:
+                raise TypeError(
+                    f"_NeutralAtomPulseFunction requires float64 inputs (pulse ODE "
+                    f"integration is not well behaved in float32), got {name}.dtype="
+                    f"{t.dtype}. Cast before calling, e.g. "
+                    f"tensor.to(dtype=torch.float64) -- an implicit upcast here would "
+                    "itself require a copy and defeat the point of the DLPack "
+                    "zero-copy path."
+                )
+
+        x_jax = jnp.from_dlpack(x.detach().contiguous())
+        Omega0_jax = jnp.from_dlpack(Omega0_MHz.detach().contiguous())
+        Delta0_jax = jnp.from_dlpack(Delta0_MHz.detach().contiguous())
+        lam_jax = jnp.from_dlpack(lam.detach().contiguous())
 
         out_jax, vjp_fn = jax.vjp(batched_qnode, x_jax, Omega0_jax, Delta0_jax, lam_jax)
         ctx.vjp_fn = vjp_fn
 
-        return torch.from_numpy(np.array(out_jax)).to(device=ctx.x_device, dtype=ctx.x_dtype)
+        out_torch = torch.from_dlpack(out_jax)
+        return out_torch.to(device=ctx.x_device, dtype=ctx.x_dtype)
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_jax = jnp.asarray(grad_output.detach().cpu().numpy(), dtype=jnp.float64)
+        if grad_output.dtype != torch.float64:
+            grad_output = grad_output.to(dtype=torch.float64)
+        grad_jax = jnp.from_dlpack(grad_output.detach().contiguous())
         d_x, d_Omega0, d_Delta0, d_lam = ctx.vjp_fn(grad_jax)
 
-        d_x_t = torch.from_numpy(np.array(d_x)).to(device=ctx.x_device, dtype=ctx.x_dtype)
-        d_Omega0_t = torch.from_numpy(np.array(d_Omega0)).to(device=ctx.Omega0_device, dtype=ctx.Omega0_dtype)
-        d_Delta0_t = torch.from_numpy(np.array(d_Delta0)).to(device=ctx.Delta0_device, dtype=ctx.Delta0_dtype)
-        d_lam_t = torch.from_numpy(np.array(d_lam)).to(device=ctx.lam_device, dtype=ctx.lam_dtype)
+        d_x_t = torch.from_dlpack(d_x).to(device=ctx.x_device, dtype=ctx.x_dtype)
+        d_Omega0_t = torch.from_dlpack(d_Omega0).to(device=ctx.Omega0_device, dtype=ctx.Omega0_dtype)
+        d_Delta0_t = torch.from_dlpack(d_Delta0).to(device=ctx.Delta0_device, dtype=ctx.Delta0_dtype)
+        d_lam_t = torch.from_dlpack(d_lam).to(device=ctx.lam_device, dtype=ctx.lam_dtype)
         return d_x_t, d_Omega0_t, d_Delta0_t, d_lam_t, None
 
 
@@ -291,13 +338,43 @@ class NeutralAtomPulseLayer(nn.Module):
         Args:
             x: [batch, n_atoms] local-detuning input (MHz-scale, before
                the V0(1+lam*x) transform, which happens inside the qnode).
+               Cast to float64 here if not already -- callers elsewhere in
+               the codebase (e.g. AnsatzClassifierPipelineBase, shared
+               across every ansatz-style circuit family) reasonably don't
+               know this variant specifically needs float64 for the pulse
+               ODE solve, so this public entry point is where that
+               requirement gets enforced, not pushed onto every caller.
+               A no-op (no copy) when x is already float64, which is the
+               common case -- QuantumVAENeutralAtom.process_latent()
+               already casts explicitly before calling this.
+               _NeutralAtomPulseFunction itself stays strict (raises
+               rather than silently upcasting) since it's the low-level
+               primitive where an unnoticed implicit copy would silently
+               defeat the DLPack zero-copy path this bridges through.
 
         Returns:
             [batch, n_atoms] Pauli-Z expectation values.
         """
-        return _NeutralAtomPulseFunction.apply(
+        if x.dtype != torch.float64:
+            original_dtype = x.dtype
+            x = x.to(dtype=torch.float64)
+        else:
+            original_dtype = None
+        out = _NeutralAtomPulseFunction.apply(
             x, self.Omega0_MHz, self.Delta0_MHz, self.lam, self._batched_qnode
         )
+        if original_dtype is not None:
+            # Cast back to whatever dtype the caller actually passed in --
+            # e.g. AnsatzClassifierPipelineBase's classifier head is a
+            # plain (float32) nn.Linear; the pulse computation itself
+            # needs float64 internally, but that's this layer's own
+            # implementation detail, not something callers elsewhere in
+            # the codebase should have to account for in their own
+            # dtype. This .to() is a normal on-device dtype cast (and
+            # autograd-transparent), not the host-RAM round trip that was
+            # actually the problem -- unrelated to the DLPack fix above.
+            out = out.to(dtype=original_dtype)
+        return out
 
     def extra_repr(self) -> str:
         """Human-readable dump for the collaborating lab's verification --
