@@ -160,6 +160,91 @@ def compute_reconstruction_metrics_eval_pred(
     )
 
 
+class IncrementalVAEMetrics:
+    """Stateful `compute_metrics` callable for `TrainingArguments(batch_eval_metrics=True)`.
+
+    With batch_eval_metrics=True, transformers calls
+    `compute_metrics(eval_pred, compute_result=is_last_batch)` once per eval
+    batch instead of concatenating every batch's predictions/targets into
+    one big tensor and calling compute_metrics once at the end. That default
+    full-gather behavior is what makes evaluating VAE reconstructions on a
+    large validation set (e.g. ImageNet's 50k images) a real GPU/host-memory
+    risk -- every reconstructed and target image gets held in memory at
+    once. This class instead keeps a running weighted sum across calls and
+    only returns the final averaged metrics dict on the last batch,
+    so the full eval set is never materialized at once.
+
+    SSIM/LPIPS metric objects (the latter wraps a VGG network) are created
+    once and reused across the whole evaluation loop rather than reloaded
+    per batch.
+    """
+
+    def __init__(self, image_range: str = "0_1"):
+        self.image_range = normalize_image_range(image_range)
+        self._ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).eval()
+        self._lpips_metric = LearnedPerceptualImagePatchSimilarity(
+            net_type="vgg",
+            normalize=(self.image_range == "0_1"),
+        ).eval()
+        self._reset_running_state()
+
+    def _reset_running_state(self) -> None:
+        self._mse_sum = 0.0
+        self._ssim_sum = 0.0
+        self._lpips_sum = 0.0
+        self._count = 0
+
+    def __call__(self, eval_pred, compute_result: bool = True) -> Dict[str, float]:
+        try:
+            reconstruction, target_images = _prepare_eval_pred_tensors(eval_pred)
+        except MissingEvalDataError:
+            if not compute_result:
+                return {}
+            self._reset_running_state()
+            return {"reconstruction_mse": 0.0}
+
+        reconstruction = _ensure_4d(reconstruction.float())
+        target_images = _ensure_4d(target_images.float())
+        recon_clamped = clamp_to_image_range(reconstruction, self.image_range)
+        target_clamped = clamp_to_image_range(target_images, self.image_range)
+
+        batch_size = recon_clamped.shape[0]
+        mse_value = float(F.mse_loss(recon_clamped, target_clamped, reduction="mean").item())
+
+        recon_disp = to_display_0_1(recon_clamped, self.image_range)
+        target_disp = to_display_0_1(target_clamped, self.image_range)
+        device = recon_disp.device
+        ssim_value = float(self._ssim_metric.to(device)(recon_disp, target_disp).item())
+
+        recon_lpips, target_lpips = recon_clamped, target_clamped
+        if recon_lpips.shape[1] == 1:
+            recon_lpips = _ensure_3_channels(recon_lpips)
+            target_lpips = _ensure_3_channels(target_lpips)
+        lpips_value = self._lpips_metric.to(device)(recon_lpips, target_lpips)
+        if hasattr(lpips_value, "mean"):
+            lpips_value = lpips_value.mean()
+        lpips_value = float(lpips_value.item())
+
+        self._mse_sum += mse_value * batch_size
+        self._ssim_sum += ssim_value * batch_size
+        self._lpips_sum += lpips_value * batch_size
+        self._count += batch_size
+
+        if not compute_result:
+            return {}
+
+        count = max(1, self._count)
+        mse = self._mse_sum / count
+        result = {
+            "reconstruction_mse": mse,
+            "psnr": float(10.0 * torch.log10(torch.tensor(1.0 / max(1e-10, mse))).item()),
+            "ssim": self._ssim_sum / count,
+            "lpips": self._lpips_sum / count,
+        }
+        self._reset_running_state()
+        return result
+
+
 def evaluate_vae_reconstruction_dataset(
     *,
     model: Any,

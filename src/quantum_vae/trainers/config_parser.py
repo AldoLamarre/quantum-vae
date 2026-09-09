@@ -53,21 +53,42 @@ class TrainerConfigParser:
         """Parse raw configuration into a structured TrainerParsedConfig."""
         cfg = self.load_config(config_source)
 
-        # Detect task type: VAE vs Classifier
-        task_type = "classifier"
-        if "family" in cfg and "vae" in str(cfg["family"]).lower():
-            if "classifier" in str(cfg["family"]).lower():
-                task_type = "classifier"
-            elif "ablation" in str(cfg["family"]).lower():
-                task_type = "classifier"
-            else:
+        # Detect task type: VAE vs Classifier.
+        # An explicit "task_type" field always wins. Otherwise, fall back to
+        # heuristics based on config shape/naming -- but if none of those
+        # match either, raise rather than silently assuming "classifier".
+        explicit_task_type = cfg.get("task_type")
+        if explicit_task_type is not None:
+            task_type = str(explicit_task_type).lower()
+            if task_type not in ("vae", "classifier"):
+                raise ValueError(
+                    f"Unsupported task_type '{explicit_task_type}' in config. "
+                    "Expected 'vae' or 'classifier'."
+                )
+        else:
+            task_type = None
+            if "family" in cfg and "vae" in str(cfg["family"]).lower():
+                if "classifier" in str(cfg["family"]).lower():
+                    task_type = "classifier"
+                elif "ablation" in str(cfg["family"]).lower():
+                    task_type = "classifier"
+                else:
+                    task_type = "vae"
+            elif "model" in cfg and isinstance(cfg["model"], dict) and "down_block_types" in cfg["model"]:
                 task_type = "vae"
-        elif "model" in cfg and isinstance(cfg["model"], dict) and "down_block_types" in cfg["model"]:
-            task_type = "vae"
-        elif "classifier" in cfg or "measurement" in cfg:
-            task_type = "classifier"
-        elif "kl_weight" in cfg.get("training", {}) or "tomography" in cfg:
-            task_type = "vae"
+            elif "classifier" in cfg or "measurement" in cfg:
+                task_type = "classifier"
+            elif "kl_weight" in cfg.get("training", {}) or "tomography" in cfg:
+                task_type = "vae"
+
+            if task_type is None:
+                raise ValueError(
+                    "Could not determine task_type ('vae' or 'classifier') from this "
+                    "config -- none of the usual signals (family name, model."
+                    "down_block_types, classifier/measurement keys, training.kl_weight, "
+                    "tomography) matched. Add an explicit \"task_type\": \"vae\" or "
+                    "\"task_type\": \"classifier\" field to the config to resolve this."
+                )
 
         model_kwargs: Dict[str, Any] = {}
         data_kwargs: Dict[str, Any] = {}
@@ -329,6 +350,26 @@ class TrainerConfigParser:
         elif "evaluation_strategy" in valid_params:
             kwargs["evaluation_strategy"] = eval_strat
 
+        # For VAE runs, default to batch_eval_metrics=True: this makes
+        # transformers call compute_metrics per eval batch (see
+        # IncrementalVAEMetrics) instead of concatenating every batch's
+        # reconstructed + target images into one big tensor before calling
+        # compute_metrics once. Without this, periodic in-training
+        # evaluation on a large validation set (e.g. ImageNet's 50k images)
+        # buffers the whole eval set in memory -- a real GPU/host-RAM risk.
+        # Config-overridable via training.batch_eval_metrics; not enabled
+        # for the classifier path since compute_classification_metrics isn't
+        # written to support the per-batch calling convention.
+        if parsed.task_type == "vae":
+            kwargs["batch_eval_metrics"] = bool(t_kwargs.get("batch_eval_metrics", True))
+
+        dropped = [k for k in kwargs if k not in valid_params]
+        if dropped:
+            warnings.warn(
+                f"build_training_args: dropping kwargs not recognized by the "
+                f"installed transformers.TrainingArguments: {dropped}.",
+                stacklevel=2,
+            )
         final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
         return TrainingArguments(**final_kwargs)
 

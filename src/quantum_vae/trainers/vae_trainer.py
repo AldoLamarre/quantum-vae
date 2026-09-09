@@ -12,8 +12,7 @@ from torchvision.utils import make_grid, save_image
 
 from .base import BaseHFQuantumTrainer
 from .data_collators import VAEDataCollator
-from .evaluation import extract_input_images, normalize_image_range
-from .metrics import compute_vae_metrics
+from .evaluation import IncrementalVAEMetrics, extract_input_images, normalize_image_range
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
@@ -60,7 +59,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.noise_std = float(noise_std)
         self.image_range = self._normalize_image_range(image_range)
         if compute_metrics is None:
-            compute_metrics = lambda eval_pred: compute_vae_metrics(eval_pred, image_range=self.image_range)
+            compute_metrics = IncrementalVAEMetrics(self.image_range)
         self.save_reconstructions = bool(save_reconstructions)
         self.reconstruction_every_n_epochs = max(1, int(reconstruction_every_n_epochs))
         self.reconstruction_num_images = max(1, int(reconstruction_num_images))
