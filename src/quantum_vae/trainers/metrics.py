@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Tuple, Union
+import warnings
 import numpy as np
-from .evaluation import compute_reconstruction_metrics_eval_pred
+from .evaluation import MissingEvalDataError, compute_reconstruction_metrics_eval_pred
 
 
 def compute_classification_metrics(eval_pred: Union[Tuple[Any, Any], Any]) -> Dict[str, float]:
@@ -16,6 +17,12 @@ def compute_classification_metrics(eval_pred: Union[Tuple[Any, Any], Any]) -> Di
         labels = getattr(eval_pred, "label_ids", None)
 
     if logits is None or labels is None:
+        warnings.warn(
+            "compute_classification_metrics: predictions or labels are missing; "
+            "returning a placeholder accuracy=0.0. This is NOT a real measurement -- "
+            "check that eval_dataset/predictions are set up correctly.",
+            stacklevel=2,
+        )
         return {"accuracy": 0.0}
 
     if hasattr(logits, "detach"):
@@ -67,5 +74,11 @@ def compute_vae_metrics(
     """Compute non-FID reconstruction metrics for VAE evaluation."""
     try:
         return compute_reconstruction_metrics_eval_pred(eval_pred, image_range=image_range)
-    except RuntimeError:
+    except MissingEvalDataError as exc:
+        warnings.warn(
+            f"compute_vae_metrics: no eval data available ({exc}); "
+            "returning a placeholder reconstruction_mse=0.0. This is NOT a real "
+            "measurement -- check that eval_dataset/predictions are set up correctly.",
+            stacklevel=2,
+        )
         return {"reconstruction_mse": 0.0}

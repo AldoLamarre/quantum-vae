@@ -1,7 +1,6 @@
 numpy
 torch
 torchmetrics
-torch-fidelity
 PennyLane
 torchvision
 matplotlib
@@ -14,4 +13,3 @@ transformers
 diffusers[torch]
 huggingface_hub
 scikit-image
-datasets

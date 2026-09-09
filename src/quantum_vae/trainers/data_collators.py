@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
@@ -74,7 +75,14 @@ class ClassifierDataCollator:
             else:
                 try:
                     inputs_tensor = torch.tensor(inputs)
-                except Exception:
+                except Exception as exc:
+                    warnings.warn(
+                        f"ClassifierDataCollator: could not convert batch inputs to a "
+                        f"tensor ({type(exc).__name__}: {exc}); passing through a raw "
+                        "Python list instead. Downstream code expecting a tensor will "
+                        "likely fail with a less obvious error.",
+                        stacklevel=2,
+                    )
                     inputs_tensor = inputs
 
             if isinstance(labels[0], torch.Tensor):
@@ -82,11 +90,16 @@ class ClassifierDataCollator:
             else:
                 try:
                     labels_tensor = torch.tensor(labels, dtype=torch.long)
-                except Exception:
+                except Exception as exc:
+                    warnings.warn(
+                        f"ClassifierDataCollator: could not convert batch labels to a "
+                        f"tensor ({type(exc).__name__}: {exc}); passing through a raw "
+                        "Python list instead. Downstream code expecting a tensor will "
+                        "likely fail with a less obvious error.",
+                        stacklevel=2,
+                    )
                     labels_tensor = labels
 
             return {self.input_key: inputs_tensor, self.label_key: labels_tensor}
-
-            return {self.input_key: inputs, self.label_key: labels}
 
         return {self.input_key: batch}
