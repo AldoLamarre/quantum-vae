@@ -120,6 +120,21 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         metric = self.lpips_loss.to(target_images.device)
         recon_lpips = self._clamp_to_image_range(reconstruction).float()
         target_lpips = self._clamp_to_image_range(target_images).float()
+        # torchmetrics' LPIPS is VGG-backed and strictly requires 3-channel
+        # (RGB) input -- it raises ValueError on 1-channel (grayscale)
+        # tensors rather than handling them. Repeat the single channel
+        # into 3 identical channels so grayscale datasets (e.g. MNIST)
+        # work with loss_type="lpips" the same way they already work with
+        # "mse"/"l1". This does not change what the metric measures for
+        # RGB datasets (n_channels == 3 is a no-op repeat). Caveat: VGG's
+        # features are calibrated on natural RGB photos, not grayscale
+        # digit strokes -- this is a standard, correct way to satisfy the
+        # shape requirement, not a claim that it's a perfect perceptual
+        # metric for this domain.
+        if recon_lpips.shape[1] == 1:
+            recon_lpips = recon_lpips.repeat(1, 3, 1, 1)
+        if target_lpips.shape[1] == 1:
+            target_lpips = target_lpips.repeat(1, 3, 1, 1)
         return metric, recon_lpips, target_lpips
 
     def _extract_dataset_image(self, item: Any) -> Optional[torch.Tensor]:
