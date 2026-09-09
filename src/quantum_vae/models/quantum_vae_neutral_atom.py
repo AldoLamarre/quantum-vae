@@ -159,21 +159,20 @@ class NeutralAtomDeviceConfig:
 class _NeutralAtomPulseFunction(torch.autograd.Function):
     """Bridges a batched, JAX-differentiable pulse qnode into torch autograd.
 
-    Forward runs the JAX computation and stashes a jax.vjp closure;
-    backward evaluates that closure on the incoming torch gradient.
+    Forward calls a persistent jax.jit-compiled function; backward calls a
+    separate persistent jax.jit-compiled function that recomputes the
+    primal (standard, accepted tradeoff -- see NeutralAtomPulseLayer's
+    _jit_forward/_jit_backward for why this specific structure, not just
+    "wrap jax.vjp in jax.jit", is what's needed for the compiled
+    executable to actually get reused across training steps rather than
+    retraced from Python every single call.
 
     Device handoff uses DLPack via the standard __dlpack__/__dlpack_device__
     protocol (jax.numpy.from_dlpack / torch.from_dlpack -- both frameworks'
     top-level entry points, no jax.dlpack/torch.utils.dlpack submodule
     imports needed on jax>=0.7ish/torch>=2.x), which shares the underlying
     buffer directly between torch and jax when both tensors already live
-    on the same device -- no host-RAM round trip. This matters specifically on
-    GPU: the previous .detach().cpu().numpy() implementation forced every
-    single forward AND backward call through host memory even when both
-    frameworks had CUDA tensors sitting right next to each other, which
-    left the GPU idling between compute bursts instead of actually being
-    used continuously (visible as alternating 99%/0% utilization in
-    nvidia-smi during real training).
+    on the same device -- no host-RAM round trip.
 
     All numerics still happen in float64 (pulse ODE integration is not
     well behaved in float32) -- callers are expected to hand this
@@ -182,12 +181,8 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     asserts rather than silently upcasts, since an implicit upcast would
     itself require a copy and defeat the point of the zero-copy path.
 
-    NOT YET VERIFIED ON GPU. Built and reasoned through against jax
-    0.10.2 / torch 2.14's documented DLPack APIs, and the CPU path is
-    covered by the existing gradcheck suite, but the zero-copy behavior
-    specifically only manifests differently on GPU, which this
-    (CPU-only) development environment cannot exercise. Known rough
-    edges to check if this errors on real hardware:
+    NOT YET VERIFIED ON GPU. Known rough edges to check if this errors
+    on real hardware:
       - 0-dim scalar tensors (Omega0_MHz/Delta0_MHz/lam are all 0-dim)
         have had version-dependent DLPack support gaps across
         frameworks -- if these specifically fail, that's the first
@@ -200,7 +195,7 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, Omega0_MHz, Delta0_MHz, lam, batched_qnode):
+    def forward(ctx, x, Omega0_MHz, Delta0_MHz, lam, jit_forward, jit_backward):
         ctx.x_device, ctx.x_dtype = x.device, x.dtype
         ctx.Omega0_device, ctx.Omega0_dtype = Omega0_MHz.device, Omega0_MHz.dtype
         ctx.Delta0_device, ctx.Delta0_dtype = Delta0_MHz.device, Delta0_MHz.dtype
@@ -222,8 +217,18 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
         Delta0_jax = jnp.from_dlpack(Delta0_MHz.detach().contiguous())
         lam_jax = jnp.from_dlpack(lam.detach().contiguous())
 
-        out_jax, vjp_fn = jax.vjp(batched_qnode, x_jax, Omega0_jax, Delta0_jax, lam_jax)
-        ctx.vjp_fn = vjp_fn
+        # Stashed (not save_for_backward -- these are jax arrays, not
+        # torch tensors, so torch's tensor-lifecycle bookkeeping doesn't
+        # apply) so backward can recompute the primal via jit_backward,
+        # which is what avoids ever calling the unjitted jax.vjp(...)
+        # directly (that closure is a fresh, never-cached Python object
+        # every call, and was the actual source of the flat, un-amortized
+        # per-step cost -- not the earlier host-RAM transfer, which was a
+        # real but secondary inefficiency).
+        ctx.jit_backward = jit_backward
+        ctx.x_jax, ctx.Omega0_jax, ctx.Delta0_jax, ctx.lam_jax = x_jax, Omega0_jax, Delta0_jax, lam_jax
+
+        out_jax = jit_forward(x_jax, Omega0_jax, Delta0_jax, lam_jax)
 
         out_torch = torch.from_dlpack(out_jax)
         return out_torch.to(device=ctx.x_device, dtype=ctx.x_dtype)
@@ -233,13 +238,16 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
         if grad_output.dtype != torch.float64:
             grad_output = grad_output.to(dtype=torch.float64)
         grad_jax = jnp.from_dlpack(grad_output.detach().contiguous())
-        d_x, d_Omega0, d_Delta0, d_lam = ctx.vjp_fn(grad_jax)
+
+        _, (d_x, d_Omega0, d_Delta0, d_lam) = ctx.jit_backward(
+            ctx.x_jax, ctx.Omega0_jax, ctx.Delta0_jax, ctx.lam_jax, grad_jax
+        )
 
         d_x_t = torch.from_dlpack(d_x).to(device=ctx.x_device, dtype=ctx.x_dtype)
         d_Omega0_t = torch.from_dlpack(d_Omega0).to(device=ctx.Omega0_device, dtype=ctx.Omega0_dtype)
         d_Delta0_t = torch.from_dlpack(d_Delta0).to(device=ctx.Delta0_device, dtype=ctx.Delta0_dtype)
         d_lam_t = torch.from_dlpack(d_lam).to(device=ctx.lam_device, dtype=ctx.lam_dtype)
-        return d_x_t, d_Omega0_t, d_Delta0_t, d_lam_t, None
+        return d_x_t, d_Omega0_t, d_Delta0_t, d_lam_t, None, None
 
 
 class LatentToLocalField(nn.Module):
@@ -287,6 +295,34 @@ class NeutralAtomPulseLayer(nn.Module):
 
         self._qnode = self._build_qnode()
         self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, None, None, None))
+
+        # Persistent, jit-compiled forward/backward -- built ONCE here and
+        # never recreated. This is what actually caches the compiled XLA
+        # executable across training steps and reuses it, instead of every
+        # single forward+backward call retracing the whole circuit in
+        # Python and rebuilding the XLA program from scratch (this was
+        # the dominant, un-amortized per-step cost -- present even before
+        # the DLPack fix, on CPU too, and NOT fixed by DLPack alone, since
+        # DLPack only addresses the host-RAM transfer, not compilation).
+        #
+        # jax.vjp's returned closure is a fresh Python object every call
+        # and is NOT cached across calls even if wrapped in jax.jit
+        # per-call (jit's cache keys on the function object itself, and a
+        # freshly-built closure is always "new"). The fix is to wrap the
+        # entire forward-then-differentiate computation in one persistent
+        # jax.jit, accepting that backward recomputes the primal forward
+        # pass internally (a standard, accepted tradeoff -- the whole
+        # point is that this recomputation itself gets compiled once and
+        # reused, rather than every call paying full Python-level tracing
+        # cost on top of the actual physics computation).
+        self._jit_forward = jax.jit(self._batched_qnode)
+
+        def _forward_and_vjp(x, Omega0_MHz, Delta0_MHz, lam, cotangent):
+            out, vjp_fn = jax.vjp(self._batched_qnode, x, Omega0_MHz, Delta0_MHz, lam)
+            grads = vjp_fn(cotangent)
+            return out, grads
+
+        self._jit_backward = jax.jit(_forward_and_vjp)
 
     def _build_qnode(self) -> Callable:
         """Assemble H_interaction + H_drive + H_local exactly as documented
@@ -361,7 +397,7 @@ class NeutralAtomPulseLayer(nn.Module):
         else:
             original_dtype = None
         out = _NeutralAtomPulseFunction.apply(
-            x, self.Omega0_MHz, self.Delta0_MHz, self.lam, self._batched_qnode
+            x, self.Omega0_MHz, self.Delta0_MHz, self.lam, self._jit_forward, self._jit_backward
         )
         if original_dtype is not None:
             # Cast back to whatever dtype the caller actually passed in --
