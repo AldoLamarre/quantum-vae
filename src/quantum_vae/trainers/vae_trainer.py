@@ -224,9 +224,15 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 raise RuntimeError("VAE reconstruction output must be a torch.Tensor.")
             reconstruction_tensor = reconstruction
 
-            # Calculate reconstruction loss
+            # Calculate reconstruction loss.
+            # Uses the LDM/Stable Diffusion convention: sum over all pixels
+            # per sample, then mean over the batch -- i.e. reduction="sum"
+            # divided by batch size (torch.sum(x)/N is algebraically the
+            # same as (per-sample sum).mean()). This must match _compute_kl's
+            # convention or kl_weight silently changes meaning.
+            batch_size = reconstruction_tensor.size(0)
             if self.loss_type == "l1":
-                recon_loss = F.l1_loss(reconstruction_tensor, target_images)
+                recon_loss = F.l1_loss(reconstruction_tensor, target_images, reduction="sum") / batch_size
             elif self.loss_type == "lpips":
                 if self.lpips_loss is None:
                     raise RuntimeError("LPIPS loss is not initialized.")
@@ -235,7 +241,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 if hasattr(recon_loss, "mean"):
                     recon_loss = recon_loss.mean()
             elif self.loss_type == "mse":
-                recon_loss = F.mse_loss(reconstruction_tensor, target_images)
+                recon_loss = F.mse_loss(reconstruction_tensor, target_images, reduction="sum") / batch_size
             else:
                 raise ValueError(
                     f"Unsupported loss_type '{self.loss_type}'. Supported values: "
