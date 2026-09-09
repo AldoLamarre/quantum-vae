@@ -227,8 +227,6 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
             # Calculate reconstruction loss
             if self.loss_type == "l1":
                 recon_loss = F.l1_loss(reconstruction_tensor, target_images)
-            elif self.loss_type == "bce":
-                recon_loss = F.binary_cross_entropy(torch.clamp(reconstruction_tensor, 0.0, 1.0), target_images)
             elif self.loss_type == "lpips":
                 if self.lpips_loss is None:
                     raise RuntimeError("LPIPS loss is not initialized.")
@@ -236,8 +234,13 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 recon_loss = lpips_metric(recon_lpips, sample_lpips)
                 if hasattr(recon_loss, "mean"):
                     recon_loss = recon_loss.mean()
-            else:
+            elif self.loss_type == "mse":
                 recon_loss = F.mse_loss(reconstruction_tensor, target_images)
+            else:
+                raise ValueError(
+                    f"Unsupported loss_type '{self.loss_type}'. Supported values: "
+                    "'mse', 'l1', 'lpips'."
+                )
 
             loss = recon_loss + self.kl_weight * kl_div
 
