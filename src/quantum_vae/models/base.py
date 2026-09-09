@@ -88,15 +88,19 @@ class QuantumVAEBase(ABC, AutoencoderKL):
     def _compute_kl(self, posterior) -> torch.FloatTensor:
         """Compute KL divergence for standard Gaussian VAE.
         
-        KL(N(μ, σ²) || N(0, 1)) = -0.5 * Σ(1 + log(σ²) - μ² - σ²)
-        
+        KL(N(μ, σ²) || N(0, 1)) = -0.5 * Σ(1 + log(σ²) - μ² - σ²).
+        Average across the batch and latent dimensions so the scale is stable
+        as per_device_train_batch_size changes and matches the mean reduction
+        used by standard reconstruction losses.
+
         Args:
             posterior: Distribution object with logvar and mean attributes
             
         Returns:
             Scalar KL divergence
         """
-        return -0.5 * torch.sum(1 + posterior.logvar - posterior.mean.pow(2) - posterior.var)
+        kl_per_sample = -0.5 * (1 + posterior.logvar - posterior.mean.pow(2) - posterior.var)
+        return torch.mean(kl_per_sample)
     
     @abstractmethod
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
