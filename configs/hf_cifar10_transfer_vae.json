@@ -1,6 +1,5 @@
 {
   "seed": 42,
-  "tomography": false,
   "data": {
     "root": "data",
     "resolution": 256,

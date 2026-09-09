@@ -78,15 +78,15 @@ class TrainerConfigParser:
                 task_type = "vae"
             elif "classifier" in cfg or "measurement" in cfg:
                 task_type = "classifier"
-            elif "kl_weight" in cfg.get("training", {}) or "tomography" in cfg:
+            elif "kl_weight" in cfg.get("training", {}):
                 task_type = "vae"
 
             if task_type is None:
                 raise ValueError(
                     "Could not determine task_type ('vae' or 'classifier') from this "
                     "config -- none of the usual signals (family name, model."
-                    "down_block_types, classifier/measurement keys, training.kl_weight, "
-                    "tomography) matched. Add an explicit \"task_type\": \"vae\" or "
+                    "down_block_types, classifier/measurement keys, training.kl_weight) "
+                    "matched. Add an explicit \"task_type\": \"vae\" or "
                     "\"task_type\": \"classifier\" field to the config to resolve this."
                 )
 
@@ -99,7 +99,13 @@ class TrainerConfigParser:
             if isinstance(cfg.get("model"), dict):
                 model_kwargs.update(cfg["model"])
             if "tomography" in cfg:
-                model_kwargs["Tomography"] = cfg["tomography"]
+                raise ValueError(
+                    "'tomography' is no longer a supported config option (it was a "
+                    "deprecated MNIST-only ablation that doesn't generalize across "
+                    "dimensions). Remove it from the config. If you need it for "
+                    "debugging a specific model instance, call model.set_Tomo(...) "
+                    "directly instead."
+                )
             if "n_qubits" in cfg:
                 model_kwargs["n_qubits"] = int(cfg["n_qubits"])
             if "n_quantum_layers" in cfg:

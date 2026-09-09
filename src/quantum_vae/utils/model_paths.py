@@ -67,6 +67,13 @@ def registered_model_path(model_key, project_root=None):
     A caller that gets a return value from this function can rely on that
     path existing.
     """
+    if model_key not in REGISTERED_MODELS:
+        raise FileNotFoundError(
+            f"'{model_key}' is neither an existing file path nor a registered "
+            f"model key. Registered keys: {sorted(REGISTERED_MODELS.keys())}. "
+            "If this was meant to be a raw checkpoint path, check that the "
+            "file actually exists at that location."
+        )
     model_spec = REGISTERED_MODELS[model_key]
     root = _project_root(project_root)
     managed_path = root / model_spec["managed"]
