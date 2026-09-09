@@ -111,6 +111,23 @@ class TrainerConfigParser:
             if "n_quantum_layers" in cfg:
                 model_kwargs["n_quantum_layers"] = int(cfg["n_quantum_layers"])
 
+            # Neutral-atom pulse variant: device-level keys (see
+            # NeutralAtomDeviceConfig / build_model's is_pulse branch).
+            if "n_atoms" in cfg:
+                model_kwargs["n_atoms"] = int(cfg["n_atoms"])
+            if "register_geometry" in cfg:
+                model_kwargs["register_geometry"] = str(cfg["register_geometry"])
+            if "atom_spacing_um" in cfg:
+                model_kwargs["atom_spacing_um"] = float(cfg["atom_spacing_um"])
+            if "r0_um" in cfg:
+                model_kwargs["r0_um"] = float(cfg["r0_um"])
+            if "C6" in cfg:
+                model_kwargs["C6"] = float(cfg["C6"])
+            if "evolution_time_us" in cfg:
+                model_kwargs["evolution_time_us"] = float(cfg["evolution_time_us"])
+            if "n_segments" in cfg:
+                model_kwargs["n_segments"] = int(cfg["n_segments"])
+
             # Data
             if isinstance(cfg.get("data"), dict):
                 data_kwargs.update(cfg["data"])
@@ -180,36 +197,80 @@ class TrainerConfigParser:
         if parsed.task_type == "vae":
             from src.quantum_vae.models.quantum_vae_amplitude import QuantumVAEAmplitude
             from src.quantum_vae.models.quantum_vae_datareupload import QuantumVAEDataReupload
+            from src.quantum_vae.models.quantum_vae_neutral_atom import NeutralAtomDeviceConfig, QuantumVAENeutralAtom
 
             model_name = str(parsed.model_name).lower()
-            if "datareupload" in model_name or "data_reupload" in model_name or "circuit" in model_name:
+            pulse_keywords = ("neutral_atom", "neutral atom", "rydberg", "pulse", "analog")
+            is_pulse = any(kw in model_name for kw in pulse_keywords)
+            if is_pulse:
+                model_cls = QuantumVAENeutralAtom
+            elif "datareupload" in model_name or "data_reupload" in model_name or "circuit" in model_name:
                 model_cls = QuantumVAEDataReupload
             else:
                 model_cls = QuantumVAEAmplitude
 
             # Filter kwargs
             kwargs = dict(parsed.model_kwargs)
-            try:
-                model = model_cls(**kwargs)
-            except Exception as exc:
-                # Fallback to default small kwargs if needed
-                fallback_kwargs = dict(
-                    in_channels=kwargs.get("in_channels", 3),
-                    out_channels=kwargs.get("out_channels", 3),
-                    sample_size=kwargs.get("sample_size", 32),
-                    block_out_channels=kwargs.get("block_out_channels", (32, 32, 64)),
-                    down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
-                    up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
+
+            if is_pulse:
+                # QuantumVAENeutralAtom takes a NeutralAtomDeviceConfig, not
+                # flat kwargs -- pull device-level keys out of kwargs first,
+                # everything else (in_channels, sample_size, ...) still
+                # flows through to AutoencoderKL as usual.
+                device_keys = (
+                    "n_atoms", "register_geometry", "atom_spacing_um",
+                    "r0_um", "C6", "evolution_time_us", "n_segments",
                 )
-                warnings.warn(
-                    f"Failed to construct {model_cls.__name__} with configured kwargs "
-                    f"{kwargs}: {type(exc).__name__}: {exc}. Falling back to default "
-                    f"architecture kwargs {fallback_kwargs}. The model you get may NOT "
-                    "match what your config requested -- fix the underlying error above "
-                    "if that matters for this run.",
-                    stacklevel=2,
-                )
-                model = model_cls(**fallback_kwargs)
+                device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
+                if "n_atoms" not in device_kwargs:
+                    raise ValueError(
+                        "Pulse VAE config (model_name matching "
+                        f"{pulse_keywords}) must specify 'n_atoms'."
+                    )
+                device_cfg = NeutralAtomDeviceConfig.from_geometry(**device_kwargs)
+                try:
+                    model = model_cls(device_cfg, **kwargs)
+                except Exception as exc:
+                    fallback_kwargs = dict(
+                        in_channels=kwargs.get("in_channels", 3),
+                        out_channels=kwargs.get("out_channels", 3),
+                        sample_size=kwargs.get("sample_size", 32),
+                        block_out_channels=kwargs.get("block_out_channels", (32, 32, 64)),
+                        down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
+                        up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
+                    )
+                    warnings.warn(
+                        f"Failed to construct {model_cls.__name__} with configured kwargs "
+                        f"{kwargs}: {type(exc).__name__}: {exc}. Falling back to default "
+                        f"architecture kwargs {fallback_kwargs}. The model you get may NOT "
+                        "match what your config requested -- fix the underlying error above "
+                        "if that matters for this run.",
+                        stacklevel=2,
+                    )
+                    model = model_cls(device_cfg, **fallback_kwargs)
+            else:
+                try:
+                    model = model_cls(**kwargs)
+                except Exception as exc:
+                    # Fallback to default small kwargs if needed
+                    fallback_kwargs = dict(
+                        in_channels=kwargs.get("in_channels", 3),
+                        out_channels=kwargs.get("out_channels", 3),
+                        sample_size=kwargs.get("sample_size", 32),
+                        block_out_channels=kwargs.get("block_out_channels", (32, 32, 64)),
+                        down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
+                        up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
+                    )
+                    warnings.warn(
+                        f"Failed to construct {model_cls.__name__} with configured kwargs "
+                        f"{kwargs}: {type(exc).__name__}: {exc}. Falling back to default "
+                        f"architecture kwargs {fallback_kwargs}. The model you get may NOT "
+                        "match what your config requested -- fix the underlying error above "
+                        "if that matters for this run.",
+                        stacklevel=2,
+                    )
+                    model = model_cls(**fallback_kwargs)
+
                 
             # IMPORTANT: force any lazily-created layers (e.g. project_to_quantum /
             # project_from_quantum) to exist NOW, before checkpoint loading and before
