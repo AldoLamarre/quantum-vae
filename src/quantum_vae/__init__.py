@@ -2,8 +2,10 @@
 
 from .models import (
     AmplitudeClassifierPipeline,
+    AnsatzClassifierPipelineBase,
     AnsatzVAEBase,
     ClassifierPipelineConfig,
+    DataReuploadClassifierPipeline,
     PretrainedAnsatzClassifierPipeline,
     QuantumVAEAmplitude,
     QuantumVAEBase,
@@ -28,6 +30,8 @@ __all__: list[str] = [
     "QuantumVAEDataReupload",
     "AnsatzVAEBase",
     "ClassifierPipelineConfig",
+    "AnsatzClassifierPipelineBase",
+    "DataReuploadClassifierPipeline",
     "PretrainedAnsatzClassifierPipeline",
     "AmplitudeClassifierPipeline",
     "BaseHFQuantumTrainer",

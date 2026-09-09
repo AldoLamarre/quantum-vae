@@ -271,11 +271,9 @@ class TrainerConfigParser:
             return model
 
         else:
-            from src.quantum_vae.models.amplitude_classifier import (
-                AmplitudeClassifierPipeline,
-                ClassifierPipelineConfig,
-                PretrainedAnsatzClassifierPipeline,
-            )
+            from src.quantum_vae.models.amplitude_classifier import AmplitudeClassifierPipeline
+            from src.quantum_vae.models.classifier_base import ClassifierPipelineConfig
+            from src.quantum_vae.models.datareupload_classifier import DataReuploadClassifierPipeline
 
             classifier_cfg = ClassifierPipelineConfig(
                 classifier_mode=parsed.model_kwargs.get("classifier_mode", "ansatz"),
@@ -297,7 +295,7 @@ class TrainerConfigParser:
             if mode == "amplitude":
                 model = AmplitudeClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
             else:
-                model = PretrainedAnsatzClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
+                model = DataReuploadClassifierPipeline(classifier_cfg, vae_backbone_instance=backbone_instance)
 
             if backbone_instance is not None:
                 model.set_vae_backbone(backbone_instance)

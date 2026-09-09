@@ -1,36 +1,11 @@
-"""Classifier pipelines based on VAE-backbone composition.
+"""Classifier pipeline for amplitude VAE backbones.
 
-Class hierarchy (mirrors the VAE model hierarchy in models/__init__.py:
-QuantumVAEBase -> AnsatzVAEBase -> {QuantumVAEDataReupload, QuantumVAENeutralAtom}
-QuantumVAEBase -> QuantumVAEAmplitude):
-
-    _VAEClassifierPipelineBase          (config/postprocessing/classifier-head
-     |                                   plumbing only -- no circuit assumptions)
-     |
-     +-- AmplitudeClassifierPipeline     (builds its own fresh StronglyEntanglingLayers
-     |                                    circuit; correct for QuantumVAEAmplitude backbones)
-     |
-     +-- AnsatzClassifierPipelineBase    (reuses -- never rebuilds, never
-          |                               reinitializes -- an AnsatzVAEBase
-          |                               backbone's own pretrained qlayer)
-          |
-          +-- DataReuploadClassifierPipeline   (backbone: QuantumVAEDataReupload)
-          +-- (NeutralAtomClassifierPipeline lands here once the pulse
-               variant exists -- same base class, no new logic needed)
-
-Prior to this refactor, PretrainedAnsatzClassifierPipeline was an empty
-subclass that inherited _VAEClassifierPipelineBase's circuit/forward
-verbatim -- i.e. it silently built a *fresh, unrelated*
-QubitStateVector + StronglyEntanglingLayers circuit and fed it an
-already-fully-processed get_latent() output, discarding the ansatz
-backbone's own pretrained quantum layer entirely instead of reusing it.
-That was a bug, not a design choice; this file fixes it.
+Mirrors quantum_vae_amplitude.py (QuantumVAEAmplitude) on the VAE side.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
 
@@ -38,91 +13,8 @@ import numpy as np
 import pennylane as qml
 import torch
 import torch.nn as nn
-has_quantum_deps = True
 
-from .ansatz_vae_base import AnsatzVAEBase
-
-
-BaseTorchModule = nn.Module if has_quantum_deps else object
-
-
-@dataclass(frozen=True)
-class ClassifierPipelineConfig:
-    classifier_mode: str = "ansatz"  # ansatz | amplitude
-    n_qubits: int = 7
-    n_layers: int = 20
-    num_labels: int = 10
-    measurement_kind: str = "probability"  # probability | expectation
-    measurement_pauli: Optional[str] = None  # X | Y | Z (expectation only)
-    postprocessing_mlp_enabled: bool = False
-    postprocessing_mlp_hidden_dim: int = 128
-    logits: bool = True
-    softmax_enabled: Optional[bool] = None
-
-
-class _VAEClassifierPipelineBase(BaseTorchModule):
-    """Shared plumbing only: config, VAE-backbone reference, postprocessing
-    MLP, and the classifier head. Deliberately makes NO assumption about
-    what kind of circuit `qlayer` is or how inputs reach it -- that's
-    entirely delegated to `_build_qlayer()` / `_measurement_dim()` /
-    `forward()`, which every concrete subclass must supply.
-    """
-
-    def __init__(self, config: ClassifierPipelineConfig, vae_backbone_instance: Optional[Any] = None):
-        if not has_quantum_deps:
-            raise ImportError("pennylane/torch dependencies are required for classifier pipelines.")
-        super().__init__()
-        logits_enabled = config.logits if config.softmax_enabled is None else bool(config.softmax_enabled)
-        if not logits_enabled:
-            raise ValueError(
-                "classifier.logits=false is not implemented yet; measurement-based classifier outputs are not supported in this code path."
-            )
-        self.config = config
-        self.vae_backbone_instance = vae_backbone_instance
-
-        self.qlayer = self._build_qlayer()
-        self._quantum_torch_device = self._infer_quantum_torch_device()
-
-        measurement_dim = self._measurement_dim()
-        if self.config.postprocessing_mlp_enabled:
-            self.postprocessing_mlp = nn.Sequential(
-                nn.Linear(measurement_dim, self.config.postprocessing_mlp_hidden_dim),
-                nn.ReLU(),
-                nn.Linear(self.config.postprocessing_mlp_hidden_dim, measurement_dim),
-                nn.ReLU(),
-            )
-        else:
-            self.postprocessing_mlp = nn.Identity()
-        self.classifier = nn.Linear(measurement_dim, self.config.num_labels)
-
-    def _build_qlayer(self) -> nn.Module:
-        """Return this pipeline's quantum layer. Amplitude builds a fresh
-        one; ansatz pipelines bind the backbone's existing one.
-        """
-        raise NotImplementedError
-
-    def _measurement_dim(self) -> int:
-        """Dimensionality of qlayer's output, i.e. what the classifier
-        head's input size should be.
-        """
-        raise NotImplementedError
-
-    def _infer_quantum_torch_device(self) -> torch.device:
-        try:
-            return next(self.qlayer.parameters()).device
-        except StopIteration:
-            return torch.device("cpu")
-
-    def to(self, *args, **kwargs):
-        module = super().to(*args, **kwargs)
-        self.qlayer = self.qlayer.to(self._quantum_torch_device)
-        return module
-
-    def set_vae_backbone(self, vae_backbone_instance: Any) -> None:
-        self.vae_backbone_instance = vae_backbone_instance
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        raise NotImplementedError
+from .classifier_base import ClassifierPipelineConfig, _VAEClassifierPipelineBase
 
 
 class AmplitudeClassifierPipeline(_VAEClassifierPipelineBase):
@@ -208,61 +100,4 @@ class AmplitudeClassifierPipeline(_VAEClassifierPipelineBase):
         return self.classifier(features)
 
 
-class AnsatzClassifierPipelineBase(_VAEClassifierPipelineBase):
-    """Shared logic for classifier pipelines built on an AnsatzVAEBase
-    backbone (QuantumVAEDataReupload, QuantumVAENeutralAtom, ...).
-
-    Reuses the backbone's own qlayer object directly -- same tensors, same
-    pretrained-from-reconstruction values, still trainable unless the
-    caller froze it. Never builds a fresh circuit and never reinitializes
-    weights: whatever the VAE pretraining stage learned is exactly what
-    this pipeline starts fine-tuning from.
-
-    Whether qlayer / project_to_quantum / project_from_quantum / the
-    encoder-decoder are trainable at this stage is decided by whoever
-    constructed the backbone instance (see
-    hf_classifier_config.build_vae_backbone_instance's
-    train_quantum_parts / train_projection_layers / freeze_classical_parts
-    flags) -- this class only wires modules together, it does not itself
-    change any requires_grad flag.
-    """
-
-    def __init__(self, config: ClassifierPipelineConfig, vae_backbone_instance: Optional[Any] = None):
-        if not isinstance(vae_backbone_instance, AnsatzVAEBase):
-            raise TypeError(
-                f"{type(self).__name__} requires an AnsatzVAEBase backbone "
-                "(e.g. QuantumVAEDataReupload, QuantumVAENeutralAtom), got "
-                f"{type(vae_backbone_instance).__name__ if vae_backbone_instance is not None else None}."
-            )
-        super().__init__(config=config, vae_backbone_instance=vae_backbone_instance)
-
-    def _build_qlayer(self) -> nn.Module:
-        return self.vae_backbone_instance.qlayer   # shared reference, not a copy
-
-    def _measurement_dim(self) -> int:
-        return int(self.vae_backbone_instance.n_qubits)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        x = self.vae_backbone_instance.get_pre_quantum_features(inputs, sample_posterior=True)
-        measured = self.qlayer(x.to(self._quantum_torch_device))
-        measured = measured.to(self.classifier.weight.device)
-        features = self.postprocessing_mlp(measured)
-        return self.classifier(features)
-
-
-class DataReuploadClassifierPipeline(AnsatzClassifierPipelineBase):
-    """Classifier pipeline for a pretrained QuantumVAEDataReupload backbone."""
-
-
-# Backward-compatible alias: this class used to be an (incorrectly empty)
-# direct subclass of _VAEClassifierPipelineBase under this name.
-PretrainedAnsatzClassifierPipeline = DataReuploadClassifierPipeline
-
-
-__all__ = [
-    "ClassifierPipelineConfig",
-    "AnsatzClassifierPipelineBase",
-    "DataReuploadClassifierPipeline",
-    "PretrainedAnsatzClassifierPipeline",
-    "AmplitudeClassifierPipeline",
-]
+__all__ = ["AmplitudeClassifierPipeline"]

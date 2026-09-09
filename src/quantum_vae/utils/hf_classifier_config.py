@@ -14,7 +14,7 @@ from datasets import load_dataset
 from torchvision import datasets
 from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
 
-from src.quantum_vae.models.amplitude_classifier import ClassifierPipelineConfig
+from src.quantum_vae.models.classifier_base import ClassifierPipelineConfig
 from src.quantum_vae.models.quantum_vae_amplitude import QuantumVAEAmplitude
 from src.quantum_vae.models.quantum_vae_datareupload import QuantumVAEDataReupload
 from src.quantum_vae.utils.cifar_family import build_cifar10_data_bundle
@@ -111,7 +111,12 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     vae_class = str(strategy_cfg.get("vae_class", vae_cfg.get("vae_class", default_vae_class)))
     freeze_classical_parts = bool(strategy_cfg.get("freeze_classical_parts", True))
     train_quantum_parts = bool(strategy_cfg.get("train_quantum_parts", True))
-    train_projection_layers = bool(strategy_cfg.get("train_projection_layers", True))
+    # Default False: at classifier time, only the quantum layer (qlayer)
+    # is meant to fine-tune from its pretrained-during-VAE-reconstruction
+    # values. project_to_quantum/project_from_quantum are part of the
+    # *classical* encoder/decoder interface and should stay frozen along
+    # with the rest of the backbone unless a caller explicitly opts in.
+    train_projection_layers = bool(strategy_cfg.get("train_projection_layers", False))
     ansatz_name = strategy_cfg.get("name")
     n_qubits = strategy_cfg.get("n_qubits", vae_cfg.get("n_qubits"))
     n_quantum_layers = strategy_cfg.get("n_quantum_layers", vae_cfg.get("n_quantum_layers"))
