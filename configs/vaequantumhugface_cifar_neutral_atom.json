@@ -1,20 +1,20 @@
 {
-  "family": "vaequantumhugface_mnist_neutral_atom",
-  "dataset": "mnist",
+  "family": "vaequantumhugface_cifar_neutral_atom",
+  "dataset": "cifar10",
   "model_name": "neutral_atom",
   "data": {
     "root": "data",
     "batch_size": 32
   },
-  "n_atoms": 8,
+  "n_atoms": 12,
   "register_geometry": "chain",
   "atom_spacing_um": 8.0,
   "evolution_time_us": 4.0,
   "n_segments": 6,
   "model": {
-    "in_channels": 1,
-    "out_channels": 1,
-    "sample_size": 28,
+    "in_channels": 3,
+    "out_channels": 3,
+    "sample_size": 32,
     "block_out_channels": [
       32,
       32,
@@ -41,7 +41,7 @@
     "learning_rate": 0.0001
   },
   "trainer": {
-    "output_dir": "checkpoints/vae/vaequantumhugface_mnist_neutral_atom",
+    "output_dir": "checkpoints/vae/vaequantumhugface_cifar_neutral_atom",
     "overwrite_output_dir": false,
     "logging_strategy": "steps",
     "logging_steps": 25,

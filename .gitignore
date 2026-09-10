@@ -15,4 +15,4 @@ __pycache__/
 /local_refactor_tests/
 /data/
 *.egg-info/
-/scripts/data/
+/data/data/

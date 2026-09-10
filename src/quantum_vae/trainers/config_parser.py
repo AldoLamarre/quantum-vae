@@ -134,6 +134,14 @@ class TrainerConfigParser:
             elif "dataset" in cfg:
                 data_kwargs["dataset"] = cfg["dataset"]
 
+            # data.batch_size is the one field to set for batch size -- seeded
+            # here as training_kwargs' base value, before the training/trainer
+            # merges below, so it applies to both train and eval (per_device_eval
+            # defaults to per_device_train when unset) unless a config
+            # explicitly overrides one of them via trainer.per_device_*_batch_size.
+            if "batch_size" in data_kwargs:
+                training_kwargs["batch_size"] = data_kwargs["batch_size"]
+
             # Training
             if isinstance(cfg.get("training"), dict):
                 training_kwargs.update(cfg["training"])
@@ -170,6 +178,10 @@ class TrainerConfigParser:
             data_kwargs["dataset"] = classifier_cfg.dataset
             if isinstance(cfg.get("data"), dict):
                 data_kwargs.update(cfg["data"])
+
+            # Same single-source-of-truth pattern as the vae branch above.
+            if "batch_size" in data_kwargs:
+                training_kwargs["batch_size"] = data_kwargs["batch_size"]
 
             if isinstance(cfg.get("trainer"), dict):
                 training_kwargs.update(cfg["trainer"])

@@ -407,7 +407,13 @@ def build_training_args(config: Dict[str, Any], project_root: Optional[str | Pat
 def build_classifier_dataset_bundle(config: Dict[str, Any]) -> Dict[str, Any]:
     data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
     batch_size = int(data_cfg.get("batch_size", 32))
-    root = str(data_cfg.get("root", "data"))
+
+    from src.quantum_vae.trainers.config_parser import PROJECT_ROOT
+
+    root = Path(str(data_cfg.get("root", "data")))
+    if not root.is_absolute():
+        root = PROJECT_ROOT / root
+    root = str(root)
     dataset_name = _dataset_name(config)
 
     if dataset_name == "mnist":
