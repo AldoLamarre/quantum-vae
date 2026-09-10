@@ -10,11 +10,11 @@ Physical picture
     H_drive(t)    = Omega0/2 * sum_i sigma_x_i - Delta0 * sum_i n_i
     H_local(x)    = sum_i V_i(x) * n_i,  V_i(x) = V0_i * (1 + lam * x_i)
 
-H_local's functional form comes directly from the collaborating lab's own
-linearization of the Rydberg interaction under a small positional
-perturbation delta_r (V(delta_r) = V0 * (1 - (6/r0) * delta_r), V0 =
-C6/r0^6): the data-encoding sensitivity lam plays the role their own
--6/r0 derivative plays, made trainable instead of fixed by geometry.
+H_local's functional form is the standard linearization of the Rydberg
+van der Waals interaction under a small positional perturbation delta_r
+(V(delta_r) = V0 * (1 - (6/r0) * delta_r), V0 = C6/r0^6): the
+data-encoding sensitivity lam plays the role the fixed -6/r0 derivative
+plays, made trainable instead of fixed by geometry.
 
 Parameter tiers:
     - Fixed hardware constants (NeutralAtomDeviceConfig): n_atoms,
@@ -25,32 +25,32 @@ Parameter tiers:
     - Per-sample input x (LatentToLocalField's output): computed fresh
       every forward pass. Not a parameter -- this is the model's input.
 
-Hardware scope, confirmed (not speculative) against the collaborating
-lab's experimental-tier access:
+Hardware scope:
     - encoding="local_detuning" (Path A) only. Path B (data modulating
       interatomic distance / interaction strength instead of a per-atom
       field) is deliberately unimplemented -- its per-atom -> per-pair
-      combination rule was never validated against the lab's own
-      per-pair formulation.
-    - n_data_injections=1 only. This is a confirmed hardware limitation:
-      the local-detuning capability fixes its spatial pattern for the
-      entire program -- only the shared time-envelope can vary -- so a
-      genuinely different per-segment re-uploading pattern is not
-      physically realizable on the hardware this targets. Single
-      injection is final for this device, not a placeholder.
+      combination rule has not been validated against the target
+      platform's native per-pair formulation.
+    - n_data_injections=1 only, a hardware constraint rather than a
+      placeholder: local-detuning capability on the target platform
+      fixes its spatial pattern for the entire program -- only the
+      shared time-envelope can vary -- so a genuinely different
+      per-segment re-uploading pattern is not physically realizable.
 
-Implementation note: PennyLane's pulse-level ODE solver only supports
-interface="jax", not "torch". This module builds the circuit as a JAX
-qnode and bridges it into the surrounding torch model with a
-torch.autograd.Function using persistent jax.jit-compiled forward/
-backward functions (see _NeutralAtomPulseFunction), handed off via
-DLPack (zero-copy on-device when both frameworks share a device).
-Runs in float32, not float64 -- deliberately: consumer NVIDIA GPUs
-throttle FP64 throughput 32-64x relative to FP32, which was the actual
-dominant training-speed bottleneck on real hardware (RTX 4060), not
-anything about the bridge itself. Requires jax<0.11,jaxlib<0.11
-(PennyLane 0.45.1 still calls jax.core.is_concrete, removed in jax
-0.11 -- see CLAUDE_SETUP.md).
+Implementation notes:
+    - PennyLane's pulse-level ODE solver only supports interface="jax",
+      not "torch". This module builds the circuit as a JAX qnode and
+      bridges it into the surrounding torch model with a
+      torch.autograd.Function using persistent jax.jit-compiled
+      forward/backward functions (see _NeutralAtomPulseFunction), handed
+      off via DLPack (zero-copy on-device when both frameworks share a
+      device).
+    - Runs in float32, not float64. Consumer GPUs throttle FP64
+      throughput relative to FP32 by a large factor (market
+      segmentation, not a technical limit), which makes float64 a poor
+      default for a pulse ODE solve meant to run on GPU.
+    - Requires jax<0.11,jaxlib<0.11 (PennyLane 0.45.1 still calls
+      jax.core.is_concrete, removed in jax 0.11 -- see CLAUDE_SETUP.md).
 """
 
 from __future__ import annotations
@@ -163,60 +163,26 @@ class NeutralAtomDeviceConfig:
 class _NeutralAtomPulseFunction(torch.autograd.Function):
     """Bridges a batched, JAX-differentiable pulse qnode into torch autograd.
 
-    Forward calls a persistent jax.jit-compiled function; backward calls a
-    separate persistent jax.jit-compiled function that recomputes the
-    primal (standard, accepted tradeoff -- see NeutralAtomPulseLayer's
-    _jit_forward/_jit_backward for why this specific structure, not just
-    "wrap jax.vjp in jax.jit", is what's needed for the compiled
-    executable to actually get reused across training steps rather than
-    retraced from Python every single call.
+    Forward and backward each call a separate, persistent jax.jit-compiled
+    function (see NeutralAtomPulseLayer._jit_forward/_jit_backward) so the
+    compiled executable is reused across calls rather than retraced every
+    time. Backward recomputes the primal internally via jax.vjp before
+    applying the cotangent -- a standard tradeoff that keeps both
+    directions covered by the same persistent jit cache.
 
     Device handoff uses DLPack via the standard __dlpack__/__dlpack_device__
-    protocol (jax.numpy.from_dlpack / torch.from_dlpack -- both frameworks'
-    top-level entry points, no jax.dlpack/torch.utils.dlpack submodule
-    imports needed on jax>=0.7ish/torch>=2.x), which shares the underlying
-    buffer directly between torch and jax when both tensors already live
-    on the same device -- no host-RAM round trip.
+    protocol (jax.numpy.from_dlpack / torch.from_dlpack), which shares the
+    underlying buffer directly between torch and jax when both tensors
+    live on the same device -- no host-RAM round trip.
 
-    All numerics happen in float32, NOT float64 -- deliberately. jax
-    defaults to float32 unless jax_enable_x64 is explicitly turned on
-    (removed from this module for exactly this reason), and float32 is
-    required for reasonable performance on any consumer NVIDIA GPU:
-    every GeForce/RTX card since the Fermi generation (2010) deliberately
-    throttles FP64 throughput to 1/32-1/64th of FP32 (this is a market-
-    segmentation decision protecting Nvidia's datacenter lineup, not a
-    technical limitation -- confirmed present on Ada Lovelace, which the
-    RTX 4060 this was tested against is). Running the pulse ODE solve in
-    float64 was the actual dominant bottleneck behind slow GPU training
-    -- worse than CPU, since CPUs don't have anywhere near that FP64
-    penalty -- and neither the DLPack fix nor the jax.jit caching fix
-    (both real, both still needed) touched this at all, since neither
-    addresses raw arithmetic throughput.
-    Checked empirically before making this change: jax's default
-    ODE-solver tolerance (rtol=atol=1.4e-8, tuned for float64) does NOT
-    cause the adaptive step controller to misbehave in float32 despite
-    being below float32's ~1.2e-7 precision floor -- it produces stable,
-    sane output rather than stalling or diverging. Not proven optimal,
-    just confirmed not broken; loosening these explicitly (e.g. to 1e-6)
-    remains a reasonable thing to try if numerical behavior looks off in
-    practice.
-    Callers are expected to hand this float32 tensors already
-    (NeutralAtomPulseLayer.forward does this via process_latent's
-    explicit .to(dtype=torch.float32)); this class asserts rather than
-    silently casting, since an implicit cast here would itself require a
-    copy and defeat the point of the zero-copy path.
-
-    NOT YET VERIFIED ON GPU. Known rough edges to check if this errors
-    on real hardware:
-      - 0-dim scalar tensors (Omega0_MHz/Delta0_MHz/lam are all 0-dim)
-        have had version-dependent DLPack support gaps across
-        frameworks -- if these specifically fail, that's the first
-        thing to suspect.
-      - jax's default device must actually match the torch tensor's
-        CUDA device index; if NeutralAtomPulseLayer wasn't moved to the
-        same device the input tensors are on, DLPack will either raise
-        or silently trigger the exact copy this change is meant to
-        avoid.
+    Runs in float32. Consumer GPUs throttle FP64 throughput heavily
+    relative to FP32, making float64 a poor choice for this workload;
+    jax's default ODE-solver tolerance (tuned for float64) has been
+    checked empirically and does not cause instability at float32
+    precision. Callers are expected to hand this float32 tensors already
+    (NeutralAtomPulseLayer.forward enforces this); this class asserts
+    rather than silently casting, since an implicit cast here would
+    itself require a copy and defeat the point of the zero-copy path.
     """
 
     @staticmethod
@@ -242,14 +208,9 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
         Delta0_jax = jnp.from_dlpack(Delta0_MHz.detach().contiguous())
         lam_jax = jnp.from_dlpack(lam.detach().contiguous())
 
-        # Stashed (not save_for_backward -- these are jax arrays, not
-        # torch tensors, so torch's tensor-lifecycle bookkeeping doesn't
-        # apply) so backward can recompute the primal via jit_backward,
-        # which is what avoids ever calling the unjitted jax.vjp(...)
-        # directly (that closure is a fresh, never-cached Python object
-        # every call, and was the actual source of the flat, un-amortized
-        # per-step cost -- not the earlier host-RAM transfer, which was a
-        # real but secondary inefficiency).
+        # Stashed as plain ctx attributes (not save_for_backward, since
+        # these are jax arrays rather than torch tensors) so backward can
+        # recompute the primal via jit_backward.
         ctx.jit_backward = jit_backward
         ctx.x_jax, ctx.Omega0_jax, ctx.Delta0_jax, ctx.lam_jax = x_jax, Omega0_jax, Delta0_jax, lam_jax
 
@@ -321,25 +282,14 @@ class NeutralAtomPulseLayer(nn.Module):
         self._qnode = self._build_qnode()
         self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, None, None, None))
 
-        # Persistent, jit-compiled forward/backward -- built ONCE here and
-        # never recreated. This is what actually caches the compiled XLA
-        # executable across training steps and reuses it, instead of every
-        # single forward+backward call retracing the whole circuit in
-        # Python and rebuilding the XLA program from scratch (this was
-        # the dominant, un-amortized per-step cost -- present even before
-        # the DLPack fix, on CPU too, and NOT fixed by DLPack alone, since
-        # DLPack only addresses the host-RAM transfer, not compilation).
-        #
+        # Persistent, jit-compiled forward/backward, built once and never
+        # recreated so the compiled XLA executable is reused across calls.
         # jax.vjp's returned closure is a fresh Python object every call
-        # and is NOT cached across calls even if wrapped in jax.jit
-        # per-call (jit's cache keys on the function object itself, and a
-        # freshly-built closure is always "new"). The fix is to wrap the
-        # entire forward-then-differentiate computation in one persistent
-        # jax.jit, accepting that backward recomputes the primal forward
-        # pass internally (a standard, accepted tradeoff -- the whole
-        # point is that this recomputation itself gets compiled once and
-        # reused, rather than every call paying full Python-level tracing
-        # cost on top of the actual physics computation).
+        # and is not cached across calls even under jax.jit (jit's cache
+        # keys on the function object itself). Wrapping the entire
+        # forward-then-differentiate computation in one persistent
+        # jax.jit avoids this: backward recomputes the primal internally,
+        # but that recomputation is itself compiled once and reused.
         self._jit_forward = jax.jit(self._batched_qnode)
 
         def _forward_and_vjp(x, Omega0_MHz, Delta0_MHz, lam, cotangent):
@@ -382,7 +332,7 @@ class NeutralAtomPulseLayer(nn.Module):
         @qml.qnode(dev, interface="jax")
         def circuit(x, Omega0_MHz, Delta0_MHz, lam):
             V0_jax = jnp.asarray(V0_np)
-            V_local = V0_jax * (1.0 + lam * x)   # V0(1 + lam*x), the slide-28 formula
+            V_local = V0_jax * (1.0 + lam * x)   # V0*(1 + lam*x), see module docstring
             local_params = tuple(V_local[i] for i in range(n_atoms))
             qml.evolve(H)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
             return [qml.expval(qml.PauliZ(w)) for w in wires]
@@ -399,15 +349,9 @@ class NeutralAtomPulseLayer(nn.Module):
         Args:
             x: [batch, n_atoms] local-detuning input (MHz-scale, before
                the V0(1+lam*x) transform, which happens inside the qnode).
-               Cast to float32 here if not already -- this is now a no-op
-               in the common case, since float32 is both torch's own
-               default and this layer's required dtype (see
-               _NeutralAtomPulseFunction's docstring for why float32,
-               not float64, is required: consumer-GPU FP64 throughput is
-               throttled 32-64x relative to FP32). Kept as a defensive
-               cast/restore round-trip rather than a hard assert, in case
-               a caller is ever running the surrounding model in float64
-               for some other reason.
+               Cast to float32 if not already -- a no-op in the common
+               case, since float32 is both torch's default and this
+               layer's required dtype.
 
         Returns:
             [batch, n_atoms] Pauli-Z expectation values.
@@ -421,21 +365,16 @@ class NeutralAtomPulseLayer(nn.Module):
             x, self.Omega0_MHz, self.Delta0_MHz, self.lam, self._jit_forward, self._jit_backward
         )
         if original_dtype is not None:
-            # Cast back to whatever dtype the caller actually passed in --
-            # e.g. if the surrounding model is running in float64 for some
-            # other reason, this layer's own float32 requirement is an
-            # implementation detail it shouldn't leak to the caller.
-            # implementation detail, not something callers elsewhere in
-            # the codebase should have to account for in their own
-            # dtype. This .to() is a normal on-device dtype cast (and
-            # autograd-transparent), not the host-RAM round trip that was
-            # actually the problem -- unrelated to the DLPack fix above.
+            # Cast back to the caller's original dtype -- this layer's
+            # float32 requirement is an implementation detail, not
+            # something callers should have to account for.
             out = out.to(dtype=original_dtype)
         return out
 
     def extra_repr(self) -> str:
-        """Human-readable dump for the collaborating lab's verification --
-        same symbols as their own notation, not ML-flavored names.
+        """Human-readable dump for verification against experimental data --
+        same symbols as standard physics notation (Omega, Delta, lambda),
+        not ML-flavored parameter names.
         """
         return (
             f"n_atoms={self.device_cfg.n_atoms}, "
