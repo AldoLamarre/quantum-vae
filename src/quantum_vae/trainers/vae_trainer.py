@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -65,6 +66,13 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.reconstruction_num_images = max(1, int(reconstruction_num_images))
         self.save_test_reconstructions = bool(save_test_reconstructions)
         self._best_eval_loss: Optional[float] = None
+        # One timestamp per trainer instance (i.e. per run), used only to
+        # namespace the reconstruction preview PNGs -- two runs against the
+        # same config/output_dir previously overwrote each other's
+        # epoch-NNNN.png silently, since nothing in that path distinguished
+        # runs. Checkpoints are deliberately NOT touched by this: their path
+        # needs to stay stable for resume_from_checkpoint to work.
+        self._run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         self.lpips_loss = None
         if self.loss_type == "lpips" or self.perceptual_weight > 0:
             self.lpips_loss = LearnedPerceptualImagePatchSimilarity(
@@ -201,7 +209,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         triplet_rows = torch.cat([target_disp, recon_disp, diff_disp], dim=3)
         grid = make_grid(triplet_rows, nrow=1)
 
-        output_dir = Path(self.args.output_dir) / "reconstructions" / split / tag
+        output_dir = Path(self.args.output_dir) / "reconstructions" / split / tag / self._run_timestamp
         output_dir.mkdir(parents=True, exist_ok=True)
         save_image(grid, output_dir / f"epoch-{epoch:04d}.png")
 
