@@ -23,7 +23,7 @@ from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
 
 
 def build_vae_dataset_bundle(config: dict[str, object]) -> dict[str, object]:
-    data_cfg = config.get("../data/data", {}) if isinstance(config.get("../data/data"), dict) else {}
+    data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
     batch_size = int(data_cfg.get("batch_size", 128))
     root = Path(str(data_cfg.get("root", "data")))
     if not root.is_absolute():
