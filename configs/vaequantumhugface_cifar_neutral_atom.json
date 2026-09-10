@@ -4,9 +4,9 @@
   "model_name": "neutral_atom",
   "data": {
     "root": "data",
-    "batch_size": 32
+    "batch_size":128
   },
-  "n_atoms": 12,
+  "n_atoms": 8,
   "register_geometry": "chain",
   "atom_spacing_um": 8.0,
   "evolution_time_us": 4.0,
