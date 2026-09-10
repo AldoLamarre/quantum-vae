@@ -112,8 +112,21 @@ class NeutralAtomDeviceConfig:
     # evolution window; n_segments has no effect until that changes.
     n_data_injections: int = 1
     encoding: Literal["local_detuning", "geometry"] = "local_detuning"
+    # "expectation": n_atoms real values, one <Z_i> per atom. Hardware-native
+    # (single-shot Z-basis fluorescence detection, averaged), same cost as
+    # measuring probabilities from the underlying shots.
+    # "probability": 2**n_atoms values, the full computational-basis
+    # distribution. Same underlying shots as "expectation" -- richer readout
+    # for free at fixed n_atoms, but scales exponentially, not a substitute
+    # for more atoms at scale (2**24 is not a usable linear-layer width).
+    measurement_kind: Literal["expectation", "probability"] = "expectation"
 
     def __post_init__(self):
+        if self.measurement_kind not in ("expectation", "probability"):
+            raise ValueError(
+                f"measurement_kind='{self.measurement_kind}' is not "
+                "supported. Use 'expectation' or 'probability'."
+            )
         if self.encoding != "local_detuning":
             raise NotImplementedError(
                 f"encoding='{self.encoding}' is not implemented. The "
@@ -145,6 +158,7 @@ class NeutralAtomDeviceConfig:
         C6: float = 862690.0,
         evolution_time_us: float = 4.0,
         n_segments: int = 6,
+        measurement_kind: Literal["expectation", "probability"] = "expectation",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -157,6 +171,7 @@ class NeutralAtomDeviceConfig:
             C6=C6,
             evolution_time_us=evolution_time_us,
             n_segments=n_segments,
+            measurement_kind=measurement_kind,
         )
 
 
@@ -307,6 +322,7 @@ class NeutralAtomPulseLayer(nn.Module):
         wires = self.wires
         T = self.device_cfg.evolution_time_us
         V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
+        measurement_kind = self.device_cfg.measurement_kind
 
         H_interaction = qml.pulse.rydberg_interaction(
             list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
@@ -335,12 +351,32 @@ class NeutralAtomPulseLayer(nn.Module):
             V_local = V0_jax * (1.0 + lam * x)   # V0*(1 + lam*x), see module docstring
             local_params = tuple(V_local[i] for i in range(n_atoms))
             qml.evolve(H)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
+            if measurement_kind == "probability":
+                # Full computational-basis distribution, 2**n_atoms values.
+                # Hardware-native: the same single-shot Z-basis fluorescence
+                # detection as the expectation-value readout, just reporting
+                # the full outcome histogram instead of only per-atom means.
+                return qml.probs(wires=wires)
+            # n_atoms values, one <Z_i> per atom.
             return [qml.expval(qml.PauliZ(w)) for w in wires]
 
-        def circuit_stacked(x, Omega0_MHz, Delta0_MHz, lam):
-            return jnp.stack(circuit(x, Omega0_MHz, Delta0_MHz, lam))
+        if measurement_kind == "probability":
+            def circuit_stacked(x, Omega0_MHz, Delta0_MHz, lam):
+                return circuit(x, Omega0_MHz, Delta0_MHz, lam)
+        else:
+            def circuit_stacked(x, Omega0_MHz, Delta0_MHz, lam):
+                return jnp.stack(circuit(x, Omega0_MHz, Delta0_MHz, lam))
 
         return circuit_stacked
+
+    @property
+    def measurement_dim(self) -> int:
+        """Width of this layer's output. n_atoms for expectation-value
+        readout, 2**n_atoms for the full probability distribution.
+        """
+        if self.device_cfg.measurement_kind == "probability":
+            return 2 ** self.device_cfg.n_atoms
+        return self.device_cfg.n_atoms
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Evolve a batch of per-atom local-field inputs under the pulse
@@ -445,7 +481,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             latent_dim = z.flatten(1).shape[1]
 
         self.project_to_quantum = LatentToLocalField(latent_dim, self.device_cfg.n_atoms).to(dummy.device)
-        self.project_from_quantum = nn.Linear(self.device_cfg.n_atoms, latent_dim).to(dummy.device)
+        self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """Process latent through the neutral-atom pulse program.

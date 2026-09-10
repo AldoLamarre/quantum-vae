@@ -47,6 +47,7 @@ class VAEBackboneConfig:
     C6: Optional[float] = None
     evolution_time_us: Optional[float] = None
     n_segments: Optional[int] = None
+    measurement_kind: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     C6 = strategy_cfg.get("C6", vae_cfg.get("C6"))
     evolution_time_us = strategy_cfg.get("evolution_time_us", vae_cfg.get("evolution_time_us"))
     n_segments = strategy_cfg.get("n_segments", vae_cfg.get("n_segments"))
+    measurement_kind = strategy_cfg.get("measurement_kind", vae_cfg.get("measurement_kind"))
     if strategy == "neutral_atom_vae" and n_atoms is None:
         raise ValueError(
             "vae_backbone.neutral_atom_vae.n_atoms is required when "
@@ -165,6 +167,7 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         C6=float(C6) if C6 is not None else None,
         evolution_time_us=float(evolution_time_us) if evolution_time_us is not None else None,
         n_segments=int(n_segments) if n_segments is not None else None,
+        measurement_kind=str(measurement_kind) if measurement_kind is not None else None,
     )
 
 
@@ -277,6 +280,7 @@ def build_vae_backbone_instance(
             C6=backbone_cfg.C6 or 862690.0,
             evolution_time_us=backbone_cfg.evolution_time_us or 4.0,
             n_segments=backbone_cfg.n_segments or 6,
+            measurement_kind=backbone_cfg.measurement_kind or "expectation",
         )
         backbone = QuantumVAENeutralAtom(device_cfg, **_default_vae_model_kwargs(dataset_name))
     else:

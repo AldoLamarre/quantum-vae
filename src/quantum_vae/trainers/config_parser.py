@@ -127,6 +127,8 @@ class TrainerConfigParser:
                 model_kwargs["evolution_time_us"] = float(cfg["evolution_time_us"])
             if "n_segments" in cfg:
                 model_kwargs["n_segments"] = int(cfg["n_segments"])
+            if "measurement_kind" in cfg:
+                model_kwargs["measurement_kind"] = str(cfg["measurement_kind"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -232,6 +234,7 @@ class TrainerConfigParser:
                 device_keys = (
                     "n_atoms", "register_geometry", "atom_spacing_um",
                     "r0_um", "C6", "evolution_time_us", "n_segments",
+                    "measurement_kind",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

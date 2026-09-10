@@ -46,6 +46,14 @@ class AnsatzClassifierPipelineBase(_VAEClassifierPipelineBase):
         return self.vae_backbone_instance.qlayer   # shared reference, not a copy
 
     def _measurement_dim(self) -> int:
+        # Prefer the qlayer's own measurement_dim when it exposes one (e.g.
+        # NeutralAtomPulseLayer, which can be n_atoms or 2**n_atoms
+        # depending on measurement_kind). Falls back to n_qubits for
+        # variants with no such concept (e.g. the gate-model qlayer, which
+        # is always exactly n_qubits expectation values).
+        qlayer = self.vae_backbone_instance.qlayer
+        if hasattr(qlayer, "measurement_dim"):
+            return int(qlayer.measurement_dim)
         return int(self.vae_backbone_instance.n_qubits)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
