@@ -486,7 +486,6 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
     def to(self, *args, **kwargs):
         module = super().to(*args, **kwargs)
-        self.qlayer = self.qlayer.to(self._quantum_torch_device)
         self._quantum_torch_device = self._infer_quantum_torch_device()
         return module
 
