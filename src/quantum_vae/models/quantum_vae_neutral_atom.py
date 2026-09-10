@@ -201,13 +201,13 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, Omega0_MHz, Delta0_MHz, lam, jit_forward, jit_backward):
+    def forward(ctx, x, lam, Omega0_MHz, Delta0_MHz, jit_forward, jit_backward):
         ctx.x_device, ctx.x_dtype = x.device, x.dtype
+        ctx.lam_device, ctx.lam_dtype = lam.device, lam.dtype
         ctx.Omega0_device, ctx.Omega0_dtype = Omega0_MHz.device, Omega0_MHz.dtype
         ctx.Delta0_device, ctx.Delta0_dtype = Delta0_MHz.device, Delta0_MHz.dtype
-        ctx.lam_device, ctx.lam_dtype = lam.device, lam.dtype
 
-        for name, t in (("x", x), ("Omega0_MHz", Omega0_MHz), ("Delta0_MHz", Delta0_MHz), ("lam", lam)):
+        for name, t in (("x", x), ("lam", lam), ("Omega0_MHz", Omega0_MHz), ("Delta0_MHz", Delta0_MHz)):
             if t.dtype != torch.float32:
                 raise TypeError(
                     f"_NeutralAtomPulseFunction requires float32 inputs (float64 "
@@ -219,17 +219,17 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
                 )
 
         x_jax = jnp.from_dlpack(x.detach().contiguous())
+        lam_jax = jnp.from_dlpack(lam.detach().contiguous())
         Omega0_jax = jnp.from_dlpack(Omega0_MHz.detach().contiguous())
         Delta0_jax = jnp.from_dlpack(Delta0_MHz.detach().contiguous())
-        lam_jax = jnp.from_dlpack(lam.detach().contiguous())
 
         # Stashed as plain ctx attributes (not save_for_backward, since
         # these are jax arrays rather than torch tensors) so backward can
         # recompute the primal via jit_backward.
         ctx.jit_backward = jit_backward
-        ctx.x_jax, ctx.Omega0_jax, ctx.Delta0_jax, ctx.lam_jax = x_jax, Omega0_jax, Delta0_jax, lam_jax
+        ctx.x_jax, ctx.lam_jax, ctx.Omega0_jax, ctx.Delta0_jax = x_jax, lam_jax, Omega0_jax, Delta0_jax
 
-        out_jax = jit_forward(x_jax, Omega0_jax, Delta0_jax, lam_jax)
+        out_jax = jit_forward(x_jax, lam_jax, Omega0_jax, Delta0_jax)
 
         out_torch = torch.from_dlpack(out_jax)
         return out_torch.to(device=ctx.x_device, dtype=ctx.x_dtype)
@@ -240,62 +240,98 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
             grad_output = grad_output.to(dtype=torch.float32)
         grad_jax = jnp.from_dlpack(grad_output.detach().contiguous())
 
-        _, (d_x, d_Omega0, d_Delta0, d_lam) = ctx.jit_backward(
-            ctx.x_jax, ctx.Omega0_jax, ctx.Delta0_jax, ctx.lam_jax, grad_jax
+        _, (d_x, d_lam, d_Omega0, d_Delta0) = ctx.jit_backward(
+            ctx.x_jax, ctx.lam_jax, ctx.Omega0_jax, ctx.Delta0_jax, grad_jax
         )
 
         d_x_t = torch.from_dlpack(d_x).to(device=ctx.x_device, dtype=ctx.x_dtype)
+        d_lam_t = torch.from_dlpack(d_lam).to(device=ctx.lam_device, dtype=ctx.lam_dtype)
         d_Omega0_t = torch.from_dlpack(d_Omega0).to(device=ctx.Omega0_device, dtype=ctx.Omega0_dtype)
         d_Delta0_t = torch.from_dlpack(d_Delta0).to(device=ctx.Delta0_device, dtype=ctx.Delta0_dtype)
-        d_lam_t = torch.from_dlpack(d_lam).to(device=ctx.lam_device, dtype=ctx.lam_dtype)
-        return d_x_t, d_Omega0_t, d_Delta0_t, d_lam_t, None, None
+        return d_x_t, d_lam_t, d_Omega0_t, d_Delta0_t, None, None
 
 
 class LatentToLocalField(nn.Module):
-    """Maps VAE latent -> one local-detuning value (x_i) per atom.
+    """Maps VAE latent -> (x, lam) packed into one tensor.
 
-    Default implementation is a plain linear layer. This is the piece
-    intended to be replaced later (e.g. with symmetric attention) without
-    touching anything downstream -- its contract is fixed: consume the
-    flattened latent, produce [batch, n_atoms].
+    x: n_atoms values, the per-atom local-detuning pattern.
+    lam: n_segments values, a per-segment gate on how strongly x matters
+         at each pulse-shaping window (the pseudo-reuploading channel).
+
+    Returned as ONE concatenated [batch, n_atoms + n_segments] tensor,
+    not a tuple -- this keeps the single-tensor-in/single-tensor-out
+    contract AnsatzClassifierPipelineBase (shared with the gate-model
+    classifier) already assumes; NeutralAtomPulseLayer splits it back
+    apart internally. Default implementation is a plain linear layer;
+    this is the piece intended to be replaced later (e.g. with symmetric
+    attention) without touching anything downstream.
     """
 
-    def __init__(self, latent_dim: int, n_atoms: int):
+    def __init__(self, latent_dim: int, n_atoms: int, n_segments: int):
         super().__init__()
-        self.proj = nn.Linear(latent_dim, n_atoms)
+        self.n_atoms = n_atoms
+        self.n_segments = n_segments
+        self.proj = nn.Linear(latent_dim, n_atoms + n_segments)
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
-        return self.proj(z_flat)   # [batch, n_atoms] -- this is x
+        return self.proj(z_flat)   # [batch, n_atoms + n_segments]
 
 
 class NeutralAtomPulseLayer(nn.Module):
     """Trainable neutral-atom pulse program: H_interaction + H_drive + H_local.
 
-    Trainable: Omega0_MHz, Delta0_MHz, lam.
+    H(t) = H_interaction + H_drive(t) + H_local(x, lam, t)
+        H_drive(t) = Omega0(t)/2 * sum_i sigma_x_i - Delta0(t) * sum_i n_i
+        H_local(x, lam, t) = sum_i V0_i * (1 + lam(t) * x_i) * n_i
+
+    Omega0(t) and Delta0(t) are piecewise-constant over n_segments
+    windows, each with its own independently trained value
+    (Omega0_MHz[k], Delta0_MHz[k]) -- pure pulse shaping, shared across
+    every sample, no different in kind from your collaborator's own
+    slide-12 pulse schedule.
+
+    lam(t) is also piecewise-constant over the same n_segments windows,
+    but lam itself comes from the ENCODER (LatentToLocalField's output),
+    not from a trainable parameter here -- the same x gets re-exposed to
+    a different, per-sample lam_k at each window, structurally the pulse
+    analogue of gate-model data re-uploading ("encode -> trainable layer
+    -> encode -> trainable layer -> ..."), except what varies per
+    repetition is the (per-sample) weight on x, not x itself. x's
+    spatial pattern across atoms never changes -- only its shared,
+    time-varying, per-sample scale does, which is what keeps this legal
+    under local detuning's hardware constraint (spatial pattern fixed
+    for the whole program, only the shared envelope may vary in time).
+
+    Trainable: Omega0_MHz, Delta0_MHz (each n_segments-length vectors).
+    NOT trainable here: lam -- it's an encoder output, passed into
+    forward() alongside x, not a qlayer parameter.
     Not trainable: device (NeutralAtomDeviceConfig, tier-1 constants).
-    Input to forward(): x -- the per-atom local field, NOT a parameter.
 
     Named `qlayer` when attached to the VAE (mirroring
     QuantumVAEDataReupload) so AnsatzVAEBase.quantum_trainable_parameters
-    picks up Omega0_MHz/Delta0_MHz/lam automatically.
+    picks up Omega0_MHz/Delta0_MHz automatically.
     """
 
     def __init__(self, device: NeutralAtomDeviceConfig):
         super().__init__()
         self.device_cfg = device
         self.wires = list(range(device.n_atoms))
+        self.n_atoms = device.n_atoms
+        self.n_segments = device.n_segments
 
         # V0_i = C6 / r0^6 per atom -- fixed, from geometry, not trained.
         V0 = device.C6 / (device.r0_um ** 6)
         self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
 
-        # Trainable physics parameters (tier 2).
-        self.Omega0_MHz = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
-        self.Delta0_MHz = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
-        self.lam = nn.Parameter(torch.tensor(1e-4, dtype=torch.float32))
+        # Trainable physics parameters (tier 2): per-segment pulse shape,
+        # shared across every sample. lam is NOT here -- see class docstring.
+        self.Omega0_MHz = nn.Parameter(torch.ones(device.n_segments, dtype=torch.float32))
+        self.Delta0_MHz = nn.Parameter(torch.zeros(device.n_segments, dtype=torch.float32))
 
         self._qnode = self._build_qnode()
-        self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, None, None, None))
+        # x and lam are both batched (one pair per sample); Omega0/Delta0
+        # are shared, the same pulse shape applied to every sample in the batch.
+        self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, 0, None, None))
 
         # Persistent, jit-compiled forward/backward, built once and never
         # recreated so the compiled XLA executable is reused across calls.
@@ -307,8 +343,8 @@ class NeutralAtomPulseLayer(nn.Module):
         # but that recomputation is itself compiled once and reused.
         self._jit_forward = jax.jit(self._batched_qnode)
 
-        def _forward_and_vjp(x, Omega0_MHz, Delta0_MHz, lam, cotangent):
-            out, vjp_fn = jax.vjp(self._batched_qnode, x, Omega0_MHz, Delta0_MHz, lam)
+        def _forward_and_vjp(x, lam, Omega0_MHz, Delta0_MHz, cotangent):
+            out, vjp_fn = jax.vjp(self._batched_qnode, x, lam, Omega0_MHz, Delta0_MHz)
             grads = vjp_fn(cotangent)
             return out, grads
 
@@ -316,7 +352,7 @@ class NeutralAtomPulseLayer(nn.Module):
 
     def _build_qnode(self) -> Callable:
         """Assemble H_interaction + H_drive + H_local exactly as documented
-        in the module docstring -- no additional structure hidden here.
+        in the class docstring -- no additional structure hidden here.
         """
         n_atoms = self.device_cfg.n_atoms
         wires = self.wires
@@ -329,27 +365,37 @@ class NeutralAtomPulseLayer(nn.Module):
         )
 
         def amp_fn(p, t):
-            return p   # constant global Rabi frequency Omega0 for the evolution window
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Omega0 over n_segments windows
 
         def det_fn(p, t):
-            return p   # constant global detuning Delta0 for the evolution window
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Delta0 over n_segments windows
 
         H_drive = qml.pulse.rydberg_drive(amplitude=amp_fn, phase=0.0, detuning=det_fn, wires=wires)
-
-        # H_local: V_i(x) = V0_i * (1 + lam * x_i), one coefficient per atom.
-        local_coeffs = [(lambda p, t: p) for _ in range(n_atoms)]
-        local_ops = [qml.PauliZ(w) for w in wires]
-        H_local = qml.dot(local_coeffs, local_ops)
-
-        H = H_interaction + H_drive + H_local
 
         dev = qml.device("default.qubit", wires=n_atoms)
 
         @qml.qnode(dev, interface="jax")
-        def circuit(x, Omega0_MHz, Delta0_MHz, lam):
-            V0_jax = jnp.asarray(V0_np)
-            V_local = V0_jax * (1.0 + lam * x)   # V0*(1 + lam*x), see module docstring
-            local_params = tuple(V_local[i] for i in range(n_atoms))
+        def circuit(x, lam, Omega0_MHz, Delta0_MHz):
+            # H_local's per-atom coefficient: V0_i * (1 + lam(t) * x_i).
+            # lam is captured directly from this function's own argument
+            # (a traced JAX value, differentiable exactly like any other),
+            # not threaded through qml.evolve's params list -- that list
+            # requires every entry to collapse to one homogeneous array,
+            # and (x_i, lam) would mix a scalar with an n_segments-length
+            # vector in one slot, which PennyLane rejects. x_i alone
+            # still goes through qml.evolve's params normally.
+            def make_local_coeff(i):
+                def f(p, t):
+                    lam_t = qml.pulse.pwc((0, T))(lam, t)
+                    return V0_np[i] * (1.0 + lam_t * p)
+                return f
+
+            local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
+            local_ops = [qml.PauliZ(w) for w in wires]
+            H_local = qml.dot(local_coeffs, local_ops)
+            H = H_interaction + H_drive + H_local
+
+            local_params = tuple(x[i] for i in range(n_atoms))
             qml.evolve(H)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
             if measurement_kind == "probability":
                 # Full computational-basis distribution, 2**n_atoms values.
@@ -361,11 +407,11 @@ class NeutralAtomPulseLayer(nn.Module):
             return [qml.expval(qml.PauliZ(w)) for w in wires]
 
         if measurement_kind == "probability":
-            def circuit_stacked(x, Omega0_MHz, Delta0_MHz, lam):
-                return circuit(x, Omega0_MHz, Delta0_MHz, lam)
+            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
+                return circuit(x, lam, Omega0_MHz, Delta0_MHz)
         else:
-            def circuit_stacked(x, Omega0_MHz, Delta0_MHz, lam):
-                return jnp.stack(circuit(x, Omega0_MHz, Delta0_MHz, lam))
+            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
+                return jnp.stack(circuit(x, lam, Omega0_MHz, Delta0_MHz))
 
         return circuit_stacked
 
@@ -378,27 +424,31 @@ class NeutralAtomPulseLayer(nn.Module):
             return 2 ** self.device_cfg.n_atoms
         return self.device_cfg.n_atoms
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Evolve a batch of per-atom local-field inputs under the pulse
-        Hamiltonian.
+    def forward(self, combined: torch.Tensor) -> torch.Tensor:
+        """Evolve a batch of (x, lam) pairs under the pulse Hamiltonian.
 
         Args:
-            x: [batch, n_atoms] local-detuning input (MHz-scale, before
-               the V0(1+lam*x) transform, which happens inside the qnode).
-               Cast to float32 if not already -- a no-op in the common
-               case, since float32 is both torch's default and this
-               layer's required dtype.
+            combined: [batch, n_atoms + n_segments] -- x (first n_atoms
+               columns) and lam (last n_segments columns) packed into one
+               tensor, exactly as LatentToLocalField produces. Cast to
+               float32 if not already -- a no-op in the common case,
+               since float32 is both torch's default and this layer's
+               required dtype.
 
         Returns:
-            [batch, n_atoms] Pauli-Z expectation values.
+            [batch, measurement_dim] Pauli-Z expectations or probabilities.
         """
-        if x.dtype != torch.float32:
-            original_dtype = x.dtype
-            x = x.to(dtype=torch.float32)
+        if combined.dtype != torch.float32:
+            original_dtype = combined.dtype
+            combined = combined.to(dtype=torch.float32)
         else:
             original_dtype = None
+
+        x = combined[:, : self.n_atoms].contiguous()
+        lam = combined[:, self.n_atoms :].contiguous()
+
         out = _NeutralAtomPulseFunction.apply(
-            x, self.Omega0_MHz, self.Delta0_MHz, self.lam, self._jit_forward, self._jit_backward
+            x, lam, self.Omega0_MHz, self.Delta0_MHz, self._jit_forward, self._jit_backward
         )
         if original_dtype is not None:
             # Cast back to the caller's original dtype -- this layer's
@@ -409,18 +459,22 @@ class NeutralAtomPulseLayer(nn.Module):
 
     def extra_repr(self) -> str:
         """Human-readable dump for verification against experimental data --
-        same symbols as standard physics notation (Omega, Delta, lambda),
-        not ML-flavored parameter names.
+        same symbols as standard physics notation (Omega, Delta), not
+        ML-flavored parameter names. lam is not listed here -- it's an
+        encoder output (varies per sample), not a qlayer parameter.
         """
+        def _fmt_vec(t: torch.Tensor) -> str:
+            return "[" + ", ".join(f"{v:.6f}" for v in t.detach().tolist()) + "]"
+
         return (
             f"n_atoms={self.device_cfg.n_atoms}, "
+            f"n_segments={self.device_cfg.n_segments}, "
             f"encoding={self.device_cfg.encoding}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
-            f"Omega0_MHz={self.Omega0_MHz.item():.6f}, "
-            f"Delta0_MHz={self.Delta0_MHz.item():.6f}, "
-            f"lam={self.lam.item():.6f}"
+            f"Omega0_MHz={_fmt_vec(self.Omega0_MHz)}, "
+            f"Delta0_MHz={_fmt_vec(self.Delta0_MHz)}"
         )
 
 
@@ -480,7 +534,9 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             z = posterior.mode()
             latent_dim = z.flatten(1).shape[1]
 
-        self.project_to_quantum = LatentToLocalField(latent_dim, self.device_cfg.n_atoms).to(dummy.device)
+        self.project_to_quantum = LatentToLocalField(
+            latent_dim, self.device_cfg.n_atoms, self.device_cfg.n_segments
+        ).to(dummy.device)
         self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
@@ -488,9 +544,12 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         Flow:
             1. Flatten latent z
-            2. Project to one local-detuning value per atom (x)
+            2. Project to (x, lam) -- the per-atom pattern and the
+               per-segment gate on how strongly it matters at each
+               pulse-shaping window (see LatentToLocalField)
             3. Evolve the Rydberg register (qlayer)
-            4. Project Pauli-Z expectations back to latent dimension
+            4. Project Pauli-Z expectations/probabilities back to latent
+               dimension
             5. Reshape to original latent shape
 
         Raises:
@@ -507,10 +566,10 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         old_shape = z.shape
         z_flat = z.flatten(1)
 
-        x = to_quantum_layer(z_flat)  # [batch, n_atoms]
+        combined = to_quantum_layer(z_flat)  # [batch, n_atoms + n_segments] -- (x, lam)
 
-        x = x.to(self._quantum_torch_device, dtype=torch.float32)
-        readout = self.qlayer(x)
+        combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
+        readout = self.qlayer(combined)
         readout = readout.to(from_quantum_layer.weight.device, dtype=from_quantum_layer.weight.dtype)
 
         z_quantum_flat = from_quantum_layer(readout)
