@@ -42,9 +42,15 @@ lab's experimental-tier access:
 Implementation note: PennyLane's pulse-level ODE solver only supports
 interface="jax", not "torch". This module builds the circuit as a JAX
 qnode and bridges it into the surrounding torch model with a
-torch.autograd.Function using jax.vjp for the backward pass. Requires
-jax<0.11,jaxlib<0.11 (PennyLane 0.45.1 still calls jax.core.is_concrete,
-removed in jax 0.11 -- see CLAUDE_SETUP.md).
+torch.autograd.Function using persistent jax.jit-compiled forward/
+backward functions (see _NeutralAtomPulseFunction), handed off via
+DLPack (zero-copy on-device when both frameworks share a device).
+Runs in float32, not float64 -- deliberately: consumer NVIDIA GPUs
+throttle FP64 throughput 32-64x relative to FP32, which was the actual
+dominant training-speed bottleneck on real hardware (RTX 4060), not
+anything about the bridge itself. Requires jax<0.11,jaxlib<0.11
+(PennyLane 0.45.1 still calls jax.core.is_concrete, removed in jax
+0.11 -- see CLAUDE_SETUP.md).
 """
 
 from __future__ import annotations
@@ -60,8 +66,6 @@ import torch.nn as nn
 import pennylane as qml
 import jax
 import jax.numpy as jnp
-
-jax.config.update("jax_enable_x64", True)
 
 has_quantum_deps = True
 
@@ -174,12 +178,33 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     buffer directly between torch and jax when both tensors already live
     on the same device -- no host-RAM round trip.
 
-    All numerics still happen in float64 (pulse ODE integration is not
-    well behaved in float32) -- callers are expected to hand this
-    float64 tensors already (NeutralAtomPulseLayer.forward does this via
-    process_latent's explicit .to(dtype=torch.float64)); this class
-    asserts rather than silently upcasts, since an implicit upcast would
-    itself require a copy and defeat the point of the zero-copy path.
+    All numerics happen in float32, NOT float64 -- deliberately. jax
+    defaults to float32 unless jax_enable_x64 is explicitly turned on
+    (removed from this module for exactly this reason), and float32 is
+    required for reasonable performance on any consumer NVIDIA GPU:
+    every GeForce/RTX card since the Fermi generation (2010) deliberately
+    throttles FP64 throughput to 1/32-1/64th of FP32 (this is a market-
+    segmentation decision protecting Nvidia's datacenter lineup, not a
+    technical limitation -- confirmed present on Ada Lovelace, which the
+    RTX 4060 this was tested against is). Running the pulse ODE solve in
+    float64 was the actual dominant bottleneck behind slow GPU training
+    -- worse than CPU, since CPUs don't have anywhere near that FP64
+    penalty -- and neither the DLPack fix nor the jax.jit caching fix
+    (both real, both still needed) touched this at all, since neither
+    addresses raw arithmetic throughput.
+    Checked empirically before making this change: jax's default
+    ODE-solver tolerance (rtol=atol=1.4e-8, tuned for float64) does NOT
+    cause the adaptive step controller to misbehave in float32 despite
+    being below float32's ~1.2e-7 precision floor -- it produces stable,
+    sane output rather than stalling or diverging. Not proven optimal,
+    just confirmed not broken; loosening these explicitly (e.g. to 1e-6)
+    remains a reasonable thing to try if numerical behavior looks off in
+    practice.
+    Callers are expected to hand this float32 tensors already
+    (NeutralAtomPulseLayer.forward does this via process_latent's
+    explicit .to(dtype=torch.float32)); this class asserts rather than
+    silently casting, since an implicit cast here would itself require a
+    copy and defeat the point of the zero-copy path.
 
     NOT YET VERIFIED ON GPU. Known rough edges to check if this errors
     on real hardware:
@@ -202,14 +227,14 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
         ctx.lam_device, ctx.lam_dtype = lam.device, lam.dtype
 
         for name, t in (("x", x), ("Omega0_MHz", Omega0_MHz), ("Delta0_MHz", Delta0_MHz), ("lam", lam)):
-            if t.dtype != torch.float64:
+            if t.dtype != torch.float32:
                 raise TypeError(
-                    f"_NeutralAtomPulseFunction requires float64 inputs (pulse ODE "
-                    f"integration is not well behaved in float32), got {name}.dtype="
-                    f"{t.dtype}. Cast before calling, e.g. "
-                    f"tensor.to(dtype=torch.float64) -- an implicit upcast here would "
-                    "itself require a copy and defeat the point of the DLPack "
-                    "zero-copy path."
+                    f"_NeutralAtomPulseFunction requires float32 inputs (float64 "
+                    f"is dramatically slower on consumer GPUs -- see class "
+                    f"docstring), got {name}.dtype={t.dtype}. Cast before "
+                    f"calling, e.g. tensor.to(dtype=torch.float32) -- an "
+                    "implicit cast here would itself require a copy and defeat "
+                    "the point of the DLPack zero-copy path."
                 )
 
         x_jax = jnp.from_dlpack(x.detach().contiguous())
@@ -235,8 +260,8 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        if grad_output.dtype != torch.float64:
-            grad_output = grad_output.to(dtype=torch.float64)
+        if grad_output.dtype != torch.float32:
+            grad_output = grad_output.to(dtype=torch.float32)
         grad_jax = jnp.from_dlpack(grad_output.detach().contiguous())
 
         _, (d_x, d_Omega0, d_Delta0, d_lam) = ctx.jit_backward(
@@ -286,12 +311,12 @@ class NeutralAtomPulseLayer(nn.Module):
 
         # V0_i = C6 / r0^6 per atom -- fixed, from geometry, not trained.
         V0 = device.C6 / (device.r0_um ** 6)
-        self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float64))
+        self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
 
         # Trainable physics parameters (tier 2).
-        self.Omega0_MHz = nn.Parameter(torch.tensor(1.0, dtype=torch.float64))
-        self.Delta0_MHz = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-        self.lam = nn.Parameter(torch.tensor(1e-4, dtype=torch.float64))
+        self.Omega0_MHz = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+        self.Delta0_MHz = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.lam = nn.Parameter(torch.tensor(1e-4, dtype=torch.float32))
 
         self._qnode = self._build_qnode()
         self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, None, None, None))
@@ -331,7 +356,7 @@ class NeutralAtomPulseLayer(nn.Module):
         n_atoms = self.device_cfg.n_atoms
         wires = self.wires
         T = self.device_cfg.evolution_time_us
-        V0_np = np.asarray(self.V0.numpy(), dtype=np.float64)
+        V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
 
         H_interaction = qml.pulse.rydberg_interaction(
             list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
@@ -374,26 +399,22 @@ class NeutralAtomPulseLayer(nn.Module):
         Args:
             x: [batch, n_atoms] local-detuning input (MHz-scale, before
                the V0(1+lam*x) transform, which happens inside the qnode).
-               Cast to float64 here if not already -- callers elsewhere in
-               the codebase (e.g. AnsatzClassifierPipelineBase, shared
-               across every ansatz-style circuit family) reasonably don't
-               know this variant specifically needs float64 for the pulse
-               ODE solve, so this public entry point is where that
-               requirement gets enforced, not pushed onto every caller.
-               A no-op (no copy) when x is already float64, which is the
-               common case -- QuantumVAENeutralAtom.process_latent()
-               already casts explicitly before calling this.
-               _NeutralAtomPulseFunction itself stays strict (raises
-               rather than silently upcasting) since it's the low-level
-               primitive where an unnoticed implicit copy would silently
-               defeat the DLPack zero-copy path this bridges through.
+               Cast to float32 here if not already -- this is now a no-op
+               in the common case, since float32 is both torch's own
+               default and this layer's required dtype (see
+               _NeutralAtomPulseFunction's docstring for why float32,
+               not float64, is required: consumer-GPU FP64 throughput is
+               throttled 32-64x relative to FP32). Kept as a defensive
+               cast/restore round-trip rather than a hard assert, in case
+               a caller is ever running the surrounding model in float64
+               for some other reason.
 
         Returns:
             [batch, n_atoms] Pauli-Z expectation values.
         """
-        if x.dtype != torch.float64:
+        if x.dtype != torch.float32:
             original_dtype = x.dtype
-            x = x.to(dtype=torch.float64)
+            x = x.to(dtype=torch.float32)
         else:
             original_dtype = None
         out = _NeutralAtomPulseFunction.apply(
@@ -401,9 +422,9 @@ class NeutralAtomPulseLayer(nn.Module):
         )
         if original_dtype is not None:
             # Cast back to whatever dtype the caller actually passed in --
-            # e.g. AnsatzClassifierPipelineBase's classifier head is a
-            # plain (float32) nn.Linear; the pulse computation itself
-            # needs float64 internally, but that's this layer's own
+            # e.g. if the surrounding model is running in float64 for some
+            # other reason, this layer's own float32 requirement is an
+            # implementation detail it shouldn't leak to the caller.
             # implementation detail, not something callers elsewhere in
             # the codebase should have to account for in their own
             # dtype. This .to() is a normal on-device dtype cast (and
@@ -514,7 +535,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         x = to_quantum_layer(z_flat)  # [batch, n_atoms]
 
-        x = x.to(self._quantum_torch_device, dtype=torch.float64)
+        x = x.to(self._quantum_torch_device, dtype=torch.float32)
         readout = self.qlayer(x)
         readout = readout.to(from_quantum_layer.weight.device, dtype=from_quantum_layer.weight.dtype)
 
