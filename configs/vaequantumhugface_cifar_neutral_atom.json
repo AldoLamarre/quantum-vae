@@ -7,11 +7,12 @@
     "batch_size":128
   },
   "n_atoms": 8,
+  "n_clusters": 2,
   "measurement_kind": "probability",
   "register_geometry": "chain",
   "atom_spacing_um": 8.0,
   "evolution_time_us": 4.0,
-  "n_segments": 6,
+  "n_segments": 40,
   "model": {
     "in_channels": 3,
     "out_channels": 3,

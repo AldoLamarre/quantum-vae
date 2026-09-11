@@ -55,7 +55,9 @@ Implementation notes:
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass
+from math import comb
 from typing import Callable, List, Literal, Optional, Sequence
 
 import numpy as np
@@ -112,20 +114,72 @@ class NeutralAtomDeviceConfig:
     # evolution window; n_segments has no effect until that changes.
     n_data_injections: int = 1
     encoding: Literal["local_detuning", "geometry"] = "local_detuning"
-    # "expectation": n_atoms real values, one <Z_i> per atom. Hardware-native
-    # (single-shot Z-basis fluorescence detection, averaged), same cost as
-    # measuring probabilities from the underlying shots.
+    # "expectation": n_atoms real values, one <Z_i> per atom -- equivalent
+    # to "correlators" with correlator_order=1, kept as a separate name for
+    # readability and backward compatibility.
+    # "correlators": all Z-operator products up to correlator_order, i.e.
+    # every <Z_i>, <Z_iZ_j> for order=2, plus triples for order=3, etc.
+    # Polynomial in n_atoms (sum_{k=1}^{order} C(n_atoms, k)), not
+    # exponential -- a deliberate middle ground between "expectation" and
+    # "probability". Same underlying single-shot Z-basis measurements as
+    # both; correlators are just products of those same per-shot +-1
+    # outcomes, no extra hardware capability needed.
     # "probability": 2**n_atoms values, the full computational-basis
-    # distribution. Same underlying shots as "expectation" -- richer readout
+    # distribution. Same underlying shots as the above -- richer readout
     # for free at fixed n_atoms, but scales exponentially, not a substitute
-    # for more atoms at scale (2**24 is not a usable linear-layer width).
-    measurement_kind: Literal["expectation", "probability"] = "expectation"
+    # for more atoms/clusters at scale (2**24 is not a usable linear-layer
+    # width).
+    measurement_kind: Literal["expectation", "probability", "correlators"] = "expectation"
+    # Only read when measurement_kind="correlators". Must be between 1 and
+    # n_atoms inclusive (order 1 = plain expectation values; order=n_atoms
+    # is the highest-order correlator possible for this register).
+    correlator_order: int = 1
+    # Number of independent, non-interacting atom clusters -- a tensor
+    # product of n_clusters separate n_atoms-atom registers, all evolving
+    # under the SAME shared Omega0_MHz/Delta0_MHz/lam (this is what "one
+    # physical register, shared global control fields" forces physically:
+    # there is only one Omega(t)/Delta(t)/lam(t) hitting the entire
+    # register). Only x (the per-atom local pattern) differs per cluster.
+    # Classically this costs O(n_clusters) to simulate, not O(4^(n_atoms*
+    # n_clusters)) -- clusters never share a joint state vector. Default 1
+    # reproduces every existing config's exact behavior.
+    n_clusters: int = 1
+    # "global": each cluster's x comes from an unrestricted linear
+    # projection of the ENTIRE flattened latent (today's LatentToLocalField,
+    # just widened and repeated per cluster) -- no assumption that the
+    # latent has spatial structure. "local": partition the latent
+    # spatially and route each region to its own cluster, exploiting that
+    # e.g. a CIFAR latent is genuinely 4x8x8, not just a flat vector --
+    # reserved for later, deliberately unbuilt (NotImplementedError),
+    # since it needs LatentToLocalField to become spatially-aware rather
+    # than a plain linear layer.
+    cluster_routing: Literal["global", "local"] = "global"
 
     def __post_init__(self):
-        if self.measurement_kind not in ("expectation", "probability"):
+        if self.measurement_kind not in ("expectation", "probability", "correlators"):
             raise ValueError(
                 f"measurement_kind='{self.measurement_kind}' is not "
-                "supported. Use 'expectation' or 'probability'."
+                "supported. Use 'expectation', 'probability', or 'correlators'."
+            )
+        if self.measurement_kind == "correlators" and not (1 <= self.correlator_order <= self.n_atoms):
+            raise ValueError(
+                f"correlator_order={self.correlator_order} must be between "
+                f"1 and n_atoms={self.n_atoms} inclusive."
+            )
+        if self.n_clusters < 1:
+            raise ValueError(f"n_clusters={self.n_clusters} must be >= 1.")
+        if self.cluster_routing not in ("global", "local"):
+            raise ValueError(
+                f"cluster_routing='{self.cluster_routing}' is not "
+                "supported. Use 'global' or 'local'."
+            )
+        if self.cluster_routing == "local":
+            raise NotImplementedError(
+                "cluster_routing='local' (spatially partitioning the "
+                "latent across clusters) is not implemented yet -- "
+                "deliberately deferred until basic clustering "
+                "(cluster_routing='global') is validated. Use 'global' "
+                "for now."
             )
         if self.encoding != "local_detuning":
             raise NotImplementedError(
@@ -158,7 +212,10 @@ class NeutralAtomDeviceConfig:
         C6: float = 862690.0,
         evolution_time_us: float = 4.0,
         n_segments: int = 6,
-        measurement_kind: Literal["expectation", "probability"] = "expectation",
+        measurement_kind: Literal["expectation", "probability", "correlators"] = "expectation",
+        correlator_order: int = 1,
+        n_clusters: int = 1,
+        cluster_routing: Literal["global", "local"] = "global",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -172,6 +229,9 @@ class NeutralAtomDeviceConfig:
             evolution_time_us=evolution_time_us,
             n_segments=n_segments,
             measurement_kind=measurement_kind,
+            correlator_order=correlator_order,
+            n_clusters=n_clusters,
+            cluster_routing=cluster_routing,
         )
 
 
@@ -254,27 +314,39 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
 class LatentToLocalField(nn.Module):
     """Maps VAE latent -> (x, lam) packed into one tensor.
 
-    x: n_atoms values, the per-atom local-detuning pattern.
+    x: n_atoms * n_clusters values -- the per-atom local-detuning pattern
+       for every cluster, "global" routing (cluster_routing="global"):
+       an unrestricted linear projection of the entire flattened latent,
+       no assumption that the latent has spatial structure. All clusters'
+       x columns come from this same linear layer, just different output
+       columns -- there is no per-cluster specialization in the mapping
+       itself yet ("local" routing, spatially partitioning the latent
+       across clusters, is reserved for later).
     lam: n_segments values, a per-segment gate on how strongly x matters
          at each pulse-shaping window (the pseudo-reuploading channel).
+         ONE shared lam for every cluster within a sample -- physically
+         forced, since all clusters sit under the same shared time-
+         envelope (see NeutralAtomDeviceConfig.n_clusters).
 
-    Returned as ONE concatenated [batch, n_atoms + n_segments] tensor,
-    not a tuple -- this keeps the single-tensor-in/single-tensor-out
+    Returned as ONE concatenated [batch, n_atoms*n_clusters + n_segments]
+    tensor, not a tuple -- this keeps the single-tensor-in/single-tensor-out
     contract AnsatzClassifierPipelineBase (shared with the gate-model
     classifier) already assumes; NeutralAtomPulseLayer splits it back
     apart internally. Default implementation is a plain linear layer;
     this is the piece intended to be replaced later (e.g. with symmetric
-    attention) without touching anything downstream.
+    attention, or cluster_routing="local"/"attention") without touching
+    anything downstream.
     """
 
-    def __init__(self, latent_dim: int, n_atoms: int, n_segments: int):
+    def __init__(self, latent_dim: int, n_atoms: int, n_segments: int, n_clusters: int = 1):
         super().__init__()
         self.n_atoms = n_atoms
         self.n_segments = n_segments
-        self.proj = nn.Linear(latent_dim, n_atoms + n_segments)
+        self.n_clusters = n_clusters
+        self.proj = nn.Linear(latent_dim, n_atoms * n_clusters + n_segments)
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
-        return self.proj(z_flat)   # [batch, n_atoms + n_segments]
+        return self.proj(z_flat)   # [batch, n_atoms*n_clusters + n_segments]
 
 
 class NeutralAtomPulseLayer(nn.Module):
@@ -318,6 +390,7 @@ class NeutralAtomPulseLayer(nn.Module):
         self.wires = list(range(device.n_atoms))
         self.n_atoms = device.n_atoms
         self.n_segments = device.n_segments
+        self.n_clusters = device.n_clusters
 
         # V0_i = C6 / r0^6 per atom -- fixed, from geometry, not trained.
         V0 = device.C6 / (device.r0_um ** 6)
@@ -353,12 +426,26 @@ class NeutralAtomPulseLayer(nn.Module):
     def _build_qnode(self) -> Callable:
         """Assemble H_interaction + H_drive + H_local exactly as documented
         in the class docstring -- no additional structure hidden here.
+
+        Builds exactly ONE cluster's circuit. Clustering (n_clusters > 1)
+        never appears in this method at all: every cluster is an
+        identical replica of this same single-cluster circuit, and
+        forward() below routes multiple clusters through the SAME
+        jax.vmap by flattening (batch, cluster) into one leading axis
+        before calling it -- confirmed empirically that nesting a second
+        vmap here instead (one over clusters, one over batch) breaks
+        gradients through the closure-captured lam (a real JAX/PennyLane
+        interaction quirk with this ODE-based ParametrizedEvolution
+        backend, not a design choice), so this method's job is only ever
+        "build one cluster's physics," never "know how many clusters
+        exist."
         """
         n_atoms = self.device_cfg.n_atoms
         wires = self.wires
         T = self.device_cfg.evolution_time_us
         V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
         measurement_kind = self.device_cfg.measurement_kind
+        correlator_order = 1 if measurement_kind == "expectation" else self.device_cfg.correlator_order
 
         H_interaction = qml.pulse.rydberg_interaction(
             list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
@@ -373,6 +460,21 @@ class NeutralAtomPulseLayer(nn.Module):
         H_drive = qml.pulse.rydberg_drive(amplitude=amp_fn, phase=0.0, detuning=det_fn, wires=wires)
 
         dev = qml.device("default.qubit", wires=n_atoms)
+
+        def _correlator_ops(order: int) -> list:
+            # All Z-operator products up to `order`: every <Z_i> (order 1),
+            # plus every <Z_iZ_j> pair if order>=2, plus triples if
+            # order>=3, etc. "expectation" is just this at order=1 -- same
+            # ops, same ordering, so it's a genuine special case of this
+            # function, not a separately-maintained code path.
+            ops = []
+            for k in range(1, order + 1):
+                for combo in itertools.combinations(wires, k):
+                    op = qml.PauliZ(combo[0])
+                    for w in combo[1:]:
+                        op = op @ qml.PauliZ(w)
+                    ops.append(op)
+            return ops
 
         @qml.qnode(dev, interface="jax")
         def circuit(x, lam, Omega0_MHz, Delta0_MHz):
@@ -403,8 +505,9 @@ class NeutralAtomPulseLayer(nn.Module):
                 # detection as the expectation-value readout, just reporting
                 # the full outcome histogram instead of only per-atom means.
                 return qml.probs(wires=wires)
-            # n_atoms values, one <Z_i> per atom.
-            return [qml.expval(qml.PauliZ(w)) for w in wires]
+            # "expectation" (order=1) or "correlators" (order>=1): all
+            # Z-operator products up to correlator_order.
+            return [qml.expval(op) for op in _correlator_ops(correlator_order)]
 
         if measurement_kind == "probability":
             def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
@@ -415,31 +518,41 @@ class NeutralAtomPulseLayer(nn.Module):
 
         return circuit_stacked
 
-    @property
-    def measurement_dim(self) -> int:
-        """Width of this layer's output. n_atoms for expectation-value
-        readout, 2**n_atoms for the full probability distribution.
-        """
+    def _per_cluster_measurement_dim(self) -> int:
         if self.device_cfg.measurement_kind == "probability":
             return 2 ** self.device_cfg.n_atoms
-        return self.device_cfg.n_atoms
+        order = 1 if self.device_cfg.measurement_kind == "expectation" else self.device_cfg.correlator_order
+        return sum(comb(self.device_cfg.n_atoms, k) for k in range(1, order + 1))
+
+    @property
+    def measurement_dim(self) -> int:
+        """Total width of this layer's output: n_clusters times whatever
+        a single cluster produces (n_atoms for expectation, a polynomial
+        sum-of-binomials for correlators, or 2**n_atoms for probability).
+        """
+        return self.device_cfg.n_clusters * self._per_cluster_measurement_dim()
 
     def forward(self, combined: torch.Tensor) -> torch.Tensor:
-        """Evolve a batch of (x, lam) pairs under the pulse Hamiltonian.
+        """Evolve a batch of (x, lam) pairs under the pulse Hamiltonian,
+        across all n_clusters independent registers.
 
         Args:
-            combined: [batch, n_atoms + n_segments] -- x (first n_atoms
-               columns) and lam (last n_segments columns) packed into one
-               tensor, exactly as LatentToLocalField produces. Cast to
-               float32 if not already -- a no-op in the common case,
-               since float32 is both torch's default and this layer's
-               required dtype.
+            combined: [batch, n_atoms*n_clusters + n_segments] -- x (first
+               n_atoms*n_clusters columns, cluster-major: cluster 0's
+               n_atoms columns, then cluster 1's, etc.) and lam (last
+               n_segments columns, shared across every cluster within a
+               sample) packed into one tensor, exactly as
+               LatentToLocalField produces. Cast to float32 if not
+               already -- a no-op in the common case, since float32 is
+               both torch's default and this layer's required dtype.
 
         Returns:
-            [batch, measurement_dim] Pauli-Z expectations (measurement_kind=
-            "expectation") or LOG-probabilities (measurement_kind=
-            "probability" -- see the log-transform below for why raw
-            probabilities aren't returned directly).
+            [batch, measurement_dim] readout, all clusters concatenated
+            in the same cluster-major order as the input. Pauli-Z
+            correlators up to correlator_order (measurement_kind=
+            "expectation" or "correlators") or LOG-probabilities
+            (measurement_kind="probability" -- see the log-transform
+            below for why raw probabilities aren't returned directly).
         """
         if combined.dtype != torch.float32:
             original_dtype = combined.dtype
@@ -447,12 +560,35 @@ class NeutralAtomPulseLayer(nn.Module):
         else:
             original_dtype = None
 
-        x = combined[:, : self.n_atoms].contiguous()
-        lam = combined[:, self.n_atoms :].contiguous()
+        batch_size = combined.shape[0]
+        n_clusters = self.n_clusters
+        n_atoms = self.n_atoms
 
-        out = _NeutralAtomPulseFunction.apply(
-            x, lam, self.Omega0_MHz, self.Delta0_MHz, self._jit_forward, self._jit_backward
+        x = combined[:, : n_atoms * n_clusters].contiguous()
+        lam = combined[:, n_atoms * n_clusters :].contiguous()
+
+        # The vmap'd qnode only ever sees a flat collection of
+        # independent simulations -- it has no notion of "cluster" at
+        # all (see _build_qnode's docstring for why a second, nested
+        # vmap over an explicit cluster axis was tried and rejected:
+        # it silently breaks gradients through the closure-captured
+        # lam). Flattening (batch, cluster) into one leading axis here,
+        # entirely in torch before ever crossing into JAX, reuses the
+        # exact single-vmap pattern already validated for the
+        # non-clustered (n_clusters=1) case. lam is the same for every
+        # cluster within a sample, so repeat_interleave duplicates each
+        # sample's lam n_clusters times consecutively, matching x's
+        # cluster-major flat ordering exactly.
+        x_flat = x.reshape(batch_size * n_clusters, n_atoms)
+        lam_flat = lam.repeat_interleave(n_clusters, dim=0)
+
+        out_flat = _NeutralAtomPulseFunction.apply(
+            x_flat, lam_flat, self.Omega0_MHz, self.Delta0_MHz, self._jit_forward, self._jit_backward
         )
+        # [batch*n_clusters, per_cluster_dim] -> [batch, n_clusters*per_cluster_dim],
+        # clusters concatenated in the same cluster-major order as the input.
+        out = out_flat.reshape(batch_size, n_clusters * out_flat.shape[-1])
+
         if self.device_cfg.measurement_kind == "probability":
             # Raw probabilities are constrained to a simplex (>=0, sum to
             # 1) -- early in training the vast majority of the
@@ -471,7 +607,10 @@ class NeutralAtomPulseLayer(nn.Module):
             # the near-zero entries out over a much wider effective
             # range -- standard practice wherever probabilities feed a
             # downstream linear layer. Small epsilon avoids log(0) =
-            # -inf for basis states with negligible amplitude.
+            # -inf for basis states with negligible amplitude. Applied
+            # elementwise, so this is correct regardless of n_clusters --
+            # equivalent to log-transforming each cluster's probability
+            # vector independently before concatenating.
             out = torch.log(out + 1e-8)
         if original_dtype is not None:
             # Cast back to the caller's original dtype -- this layer's
@@ -491,7 +630,12 @@ class NeutralAtomPulseLayer(nn.Module):
 
         return (
             f"n_atoms={self.device_cfg.n_atoms}, "
+            f"n_clusters={self.device_cfg.n_clusters}, "
+            f"cluster_routing={self.device_cfg.cluster_routing}, "
             f"n_segments={self.device_cfg.n_segments}, "
+            f"measurement_kind={self.device_cfg.measurement_kind}"
+            + (f"(order={self.device_cfg.correlator_order})" if self.device_cfg.measurement_kind == "correlators" else "")
+            + f", measurement_dim={self.measurement_dim}, "
             f"encoding={self.device_cfg.encoding}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
@@ -558,7 +702,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             latent_dim = z.flatten(1).shape[1]
 
         self.project_to_quantum = LatentToLocalField(
-            latent_dim, self.device_cfg.n_atoms, self.device_cfg.n_segments
+            latent_dim, self.device_cfg.n_atoms, self.device_cfg.n_segments, self.device_cfg.n_clusters
         ).to(dummy.device)
         self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 

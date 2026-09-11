@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import warnings
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -129,6 +130,12 @@ class TrainerConfigParser:
                 model_kwargs["n_segments"] = int(cfg["n_segments"])
             if "measurement_kind" in cfg:
                 model_kwargs["measurement_kind"] = str(cfg["measurement_kind"])
+            if "correlator_order" in cfg:
+                model_kwargs["correlator_order"] = int(cfg["correlator_order"])
+            if "n_clusters" in cfg:
+                model_kwargs["n_clusters"] = int(cfg["n_clusters"])
+            if "cluster_routing" in cfg:
+                model_kwargs["cluster_routing"] = str(cfg["cluster_routing"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -234,7 +241,8 @@ class TrainerConfigParser:
                 device_keys = (
                     "n_atoms", "register_geometry", "atom_spacing_um",
                     "r0_um", "C6", "evolution_time_us", "n_segments",
-                    "measurement_kind",
+                    "measurement_kind", "correlator_order",
+                    "n_clusters", "cluster_routing",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -395,6 +403,18 @@ class TrainerConfigParser:
         task_dir = "vae" if parsed.task_type == "vae" else "classifier"
         default_out_dir = f"checkpoints/{task_dir}/{family}"
         out_dir = output_dir or t_kwargs.get("output_dir", default_out_dir)
+        # One timestamp per run, applied to the whole output_dir -- so
+        # checkpoints AND reconstruction previews both land under the same
+        # per-run folder, consistently, rather than two different runs of
+        # the same config silently overwriting each other's files. Doesn't
+        # break resuming a *specific* crashed run (point
+        # resume_from_checkpoint at that run's own timestamped folder);
+        # only disables auto-discovering a checkpoint across multiple runs
+        # sharing one un-timestamped folder, which trainer.timestamp_run=false
+        # opts back into for anyone who specifically wants that instead.
+        if bool(t_kwargs.get("timestamp_run", True)):
+            run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            out_dir = str(Path(out_dir) / run_timestamp)
         out_path = Path(out_dir)
         if not out_path.is_absolute():
             out_path = self.project_root / out_path
@@ -423,6 +443,19 @@ class TrainerConfigParser:
             "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
             "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
         }
+
+        # dataloader_drop_last was never read from config at all -- setting
+        # it in a JSON config silently did nothing. HF's own default is
+        # False, which means any dataset whose size isn't an exact multiple
+        # of the batch size produces a differently-shaped final batch every
+        # epoch -- and since this pipeline's pulse layer is jax.jit-compiled
+        # (compilation keys on shape), that one odd-sized batch forces a
+        # full recompile at every epoch boundary. Default kept at False to
+        # match HF's own default and not silently change any existing
+        # config's behavior; set trainer.dataloader_drop_last=true to avoid
+        # the recompile cost.
+        if "dataloader_drop_last" in t_kwargs:
+            kwargs["dataloader_drop_last"] = bool(t_kwargs["dataloader_drop_last"])
 
         if "report_to" in valid_params:
             kwargs["report_to"] = []

@@ -48,6 +48,9 @@ class VAEBackboneConfig:
     evolution_time_us: Optional[float] = None
     n_segments: Optional[int] = None
     measurement_kind: Optional[str] = None
+    correlator_order: Optional[int] = None
+    n_clusters: Optional[int] = None
+    cluster_routing: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,9 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     evolution_time_us = strategy_cfg.get("evolution_time_us", vae_cfg.get("evolution_time_us"))
     n_segments = strategy_cfg.get("n_segments", vae_cfg.get("n_segments"))
     measurement_kind = strategy_cfg.get("measurement_kind", vae_cfg.get("measurement_kind"))
+    correlator_order = strategy_cfg.get("correlator_order", vae_cfg.get("correlator_order"))
+    n_clusters = strategy_cfg.get("n_clusters", vae_cfg.get("n_clusters"))
+    cluster_routing = strategy_cfg.get("cluster_routing", vae_cfg.get("cluster_routing"))
     if strategy == "neutral_atom_vae" and n_atoms is None:
         raise ValueError(
             "vae_backbone.neutral_atom_vae.n_atoms is required when "
@@ -168,6 +174,9 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         evolution_time_us=float(evolution_time_us) if evolution_time_us is not None else None,
         n_segments=int(n_segments) if n_segments is not None else None,
         measurement_kind=str(measurement_kind) if measurement_kind is not None else None,
+        correlator_order=int(correlator_order) if correlator_order is not None else None,
+        n_clusters=int(n_clusters) if n_clusters is not None else None,
+        cluster_routing=str(cluster_routing) if cluster_routing is not None else None,
     )
 
 
@@ -281,6 +290,9 @@ def build_vae_backbone_instance(
             evolution_time_us=backbone_cfg.evolution_time_us or 4.0,
             n_segments=backbone_cfg.n_segments or 6,
             measurement_kind=backbone_cfg.measurement_kind or "expectation",
+            correlator_order=backbone_cfg.correlator_order or 1,
+            n_clusters=backbone_cfg.n_clusters or 1,
+            cluster_routing=backbone_cfg.cluster_routing or "global",
         )
         backbone = QuantumVAENeutralAtom(device_cfg, **_default_vae_model_kwargs(dataset_name))
     else:
