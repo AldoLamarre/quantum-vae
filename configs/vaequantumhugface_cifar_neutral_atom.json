@@ -6,13 +6,13 @@
     "root": "data",
     "batch_size":128
   },
-  "n_atoms": 8,
-  "n_clusters": 2,
+  "n_atoms": 4,
+  "n_clusters": 16,
   "measurement_kind": "probability",
   "register_geometry": "chain",
   "atom_spacing_um": 8.0,
   "evolution_time_us": 4.0,
-  "n_segments": 40,
+  "n_segments": 1,
   "model": {
     "in_channels": 3,
     "out_channels": 3,
@@ -40,7 +40,7 @@
     "noise_after_epoch": 6,
     "noise_std": 0.1,
     "num_train_epochs": 10,
-    "learning_rate": 0.0001
+    "learning_rate": 0.001
   },
   "trainer": {
     "output_dir": "checkpoints/vae/vaequantumhugface_cifar_neutral_atom",
