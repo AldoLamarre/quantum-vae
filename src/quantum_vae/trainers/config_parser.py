@@ -61,10 +61,10 @@ class TrainerConfigParser:
         explicit_task_type = cfg.get("task_type")
         if explicit_task_type is not None:
             task_type = str(explicit_task_type).lower()
-            if task_type not in ("vae", "classifier"):
+            if task_type not in ("vae", "classifier", "latent_diffusion"):
                 raise ValueError(
                     f"Unsupported task_type '{explicit_task_type}' in config. "
-                    "Expected 'vae' or 'classifier'."
+                    "Expected 'vae', 'classifier', or 'latent_diffusion'."
                 )
         else:
             task_type = None
@@ -166,6 +166,46 @@ class TrainerConfigParser:
             if "output" in cfg and isinstance(cfg["output"], dict):
                 default_root = f"checkpoints/vae/{cfg.get('family', cfg.get('model_name', 'run'))}"
                 training_kwargs["output_dir"] = cfg["output"].get("root", default_root)
+
+        elif task_type == "latent_diffusion":
+            model_name = cfg.get("model_name", "latent_diffusion")
+            if isinstance(cfg.get("model"), dict):
+                model_kwargs.update(cfg["model"])
+
+            # The frozen base VAE this diffuser trains on top of -- reuses the
+            # exact same base_checkpoint/registry resolution as the vae branch,
+            # just under a distinctly-named key so both can coexist in one config.
+            base_checkpoint = cfg.get("base_checkpoint")
+            if not base_checkpoint:
+                raise ValueError(
+                    "task_type='latent_diffusion' configs must specify 'base_checkpoint' "
+                    "(a registry key or path to the frozen VAE this diffuser decodes through) "
+                    "and 'base_model_config' (the config used to build that VAE)."
+                )
+            base_model_config = cfg.get("base_model_config")
+            if not base_model_config:
+                raise ValueError(
+                    "task_type='latent_diffusion' configs must specify 'base_model_config' "
+                    "(path to the JSON config that builds the frozen base VAE)."
+                )
+            model_kwargs["base_checkpoint"] = str(base_checkpoint)
+            model_kwargs["base_model_config"] = str(base_model_config)
+
+            if isinstance(cfg.get("data"), dict):
+                data_kwargs.update(cfg["data"])
+            if "latents_cache" not in data_kwargs:
+                raise ValueError(
+                    "task_type='latent_diffusion' configs must specify 'data.latents_cache' "
+                    "(path to a precomputed {latents, labels} .pt file -- see "
+                    "scripts/extract_latents_option_a.py)."
+                )
+            if "batch_size" in data_kwargs:
+                training_kwargs["batch_size"] = data_kwargs["batch_size"]
+
+            if isinstance(cfg.get("training"), dict):
+                training_kwargs.update(cfg["training"])
+            if isinstance(cfg.get("trainer"), dict):
+                training_kwargs.update(cfg["trainer"])
 
         else:
             classifier_cfg = build_classifier_model_config(cfg)
@@ -354,6 +394,35 @@ class TrainerConfigParser:
                     )
             return model
 
+        elif parsed.task_type == "latent_diffusion":
+            model_kwargs = dict(parsed.model_kwargs)
+            variant = str(parsed.model_name).lower()
+
+            if variant == "su2_angles":
+                from src.quantum_vae.diffusion.su2_angles import AngleSlotDenoiser
+
+                return AngleSlotDenoiser(
+                    n_qubits=int(model_kwargs.get("n_qubits", 10)),
+                    n_classes=int(model_kwargs.get("n_classes", 10)),
+                    hidden=int(model_kwargs.get("hidden", 512)),
+                    n_timesteps=int(model_kwargs.get("n_timesteps", 1000)),
+                )
+
+            from src.quantum_vae.diffusion.euclidean import FlatLatentDenoiser
+
+            denoiser = FlatLatentDenoiser(
+                latent_dim=int(model_kwargs.get("latent_dim", 196)),
+                n_classes=int(model_kwargs.get("n_classes", 10)),
+                hidden=int(model_kwargs.get("hidden", 512)),
+                n_timesteps=int(model_kwargs.get("n_timesteps", 1000)),
+            )
+            # Deliberately NOT attaching the base VAE here: nn.Module's
+            # __setattr__ auto-registers any Module-valued attribute as a
+            # trainable submodule, which would silently defeat "frozen" (it'd
+            # get saved into every checkpoint, moved by .to(), etc.).
+            # build_trainer() resolves the frozen base VAE independently.
+            return denoiser
+
         else:
             from src.quantum_vae.models.amplitude_classifier import AmplitudeClassifierPipeline
             from src.quantum_vae.models.classifier_base import ClassifierPipelineConfig
@@ -400,7 +469,7 @@ class TrainerConfigParser:
         t_kwargs = parsed.training_kwargs
 
         family = parsed.raw_config.get("family", parsed.raw_config.get("model_name", parsed.raw_config.get("name", "run")))
-        task_dir = "vae" if parsed.task_type == "vae" else "classifier"
+        task_dir = {"vae": "vae", "latent_diffusion": "diffusion"}.get(parsed.task_type, "classifier")
         default_out_dir = f"checkpoints/{task_dir}/{family}"
         out_dir = output_dir or t_kwargs.get("output_dir", default_out_dir)
         # One timestamp per run, applied to the whole output_dir -- so
@@ -489,6 +558,27 @@ class TrainerConfigParser:
         final_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
         return TrainingArguments(**final_kwargs)
 
+    def build_frozen_base_vae(self, base_checkpoint: str, base_model_config_path: str) -> Any:
+        """Build + freeze the base VAE a latent_diffusion model decodes
+        through, from its OWN config (not the diffusion config) -- so the
+        exact architecture used to produce the cached latents is reproduced
+        exactly. A mismatch here would silently corrupt every generation
+        preview without erroring anywhere."""
+        base_cfg = self.load_config(base_model_config_path)
+        base_cfg.pop("base_checkpoint", None)
+        base_parsed = self.parse(base_cfg)
+        base_model = self.build_model(base_parsed)
+
+        base_checkpoint_path = Path(base_checkpoint)
+        if not base_checkpoint_path.is_absolute() and not base_checkpoint_path.exists():
+            base_checkpoint_path = Path(registered_model_path(base_checkpoint, project_root=self.project_root))
+        base_state = torch.load(base_checkpoint_path, map_location="cpu")
+        base_model.load_state_dict(base_state, strict=True)
+        base_model.eval()
+        for p in base_model.parameters():
+            p.requires_grad_(False)
+        return base_model
+
     def build_trainer(
         self,
         config_source: Union[str, Path, Dict[str, Any]],
@@ -528,6 +618,57 @@ class TrainerConfigParser:
                 reconstruction_every_n_epochs=int(parsed.training_kwargs.get("reconstruction_every_n_epochs", 10)),
                 reconstruction_num_images=int(parsed.training_kwargs.get("reconstruction_num_images", 8)),
                 save_test_reconstructions=bool(parsed.training_kwargs.get("save_test_reconstructions", True)),
+                **trainer_kwargs,
+            )
+        elif parsed.task_type == "latent_diffusion":
+            from src.quantum_vae.trainers.latent_diffusion_trainer import LatentDiffusionTrainer
+            from src.quantum_vae.trainers.latent_diffusion_data import (
+                LatentCacheDataset,
+                latent_diffusion_collator,
+            )
+
+            variant = str(parsed.model_name).lower()
+            if variant == "su2_angles":
+                from src.quantum_vae.diffusion.su2_angles import SU2HeatKernelSchedule
+                diffusion_schedule = SU2HeatKernelSchedule(
+                    n_qubits=int(parsed.model_kwargs.get("n_qubits", 10)),
+                    n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
+                )
+            else:
+                from src.quantum_vae.diffusion.euclidean import GaussianDiffusionSchedule
+                diffusion_schedule = GaussianDiffusionSchedule(
+                    n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
+                )
+
+            cache_path = parsed.data_kwargs["latents_cache"]
+            cache_path_resolved = Path(cache_path)
+            if not cache_path_resolved.is_absolute():
+                cache_path_resolved = self.project_root / cache_path_resolved
+            if train_dataset is None:
+                train_dataset = LatentCacheDataset(str(cache_path_resolved))
+            if eval_dataset is None:
+                eval_dataset = train_dataset
+
+            base_vae = self.build_frozen_base_vae(
+                parsed.model_kwargs["base_checkpoint"],
+                parsed.model_kwargs["base_model_config"],
+            )
+
+            return LatentDiffusionTrainer(
+                model=model,
+                diffusion=diffusion_schedule,
+                args=training_args,
+                data_collator=latent_diffusion_collator,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                cfg_dropout_prob=float(parsed.training_kwargs.get("cfg_dropout_prob", 0.1)),
+                base_vae=base_vae,
+                latent_mean=train_dataset.mean,
+                latent_std=train_dataset.std,
+                latent_shape=tuple(parsed.model_kwargs.get("latent_shape", (4, 7, 7))),
+                preview_every_n_epochs=int(parsed.training_kwargs.get("preview_every_n_epochs", 10)),
+                preview_digit=int(parsed.training_kwargs.get("preview_digit", 3)),
+                preview_num_images=int(parsed.training_kwargs.get("preview_num_images", 8)),
                 **trainer_kwargs,
             )
         else:
