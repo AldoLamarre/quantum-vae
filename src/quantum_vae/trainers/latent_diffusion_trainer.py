@@ -130,6 +130,31 @@ class LatentDiffusionTrainer(BaseHFQuantumTrainer):
         loss = torch.mean((prediction - target) ** 2)
         return (loss, {"prediction": prediction}) if return_outputs else loss
 
+    def prediction_step(
+        self,
+        model: LatentDenoiserBase,
+        inputs: Union[Dict[str, Any], Any],
+        prediction_loss_only: bool,
+        ignore_keys=None,
+    ):
+        """HF's default prediction_step calls model(**inputs) directly --
+        unpacking the raw batch dict ({"latent", "label"}) straight into
+        the model's forward(), which expects (x_noisy, t, y) instead. That
+        mismatch is exactly what compute_loss exists to translate for
+        training; the same translation has to happen here too, or
+        evaluation crashes with a TypeError the moment eval_strategy is
+        anything other than "no". Reuses compute_loss's own logic directly
+        rather than duplicating it.
+
+        Returns (loss, None, None): there are no per-sample logits/labels
+        in the classification-metrics sense for a diffusion denoiser, so
+        those two positions are left as None, a supported convention for
+        loss-only evaluation.
+        """
+        with torch.no_grad():
+            loss = self.compute_loss(model, inputs)
+        return (loss.detach(), None, None)
+
     def _save_generation_preview(self, tag: str, epoch: int) -> None:
         """Sample new digits through the trained denoiser, decode them with
         the frozen base VAE (quantum circuit included), and save a grid --

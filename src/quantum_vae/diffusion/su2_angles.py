@@ -69,21 +69,29 @@ def _heat_kernel_log_deriv(
     phi/sigma_sq values (mixed regimes within one batch, one call).
     """
     # --- Eq. 11 branch: spectral sum, differentiated via autograd ---
-    phi_grad = phi.detach().clone().requires_grad_(True)
-    m = torch.arange(1, n_terms + 1, device=phi.device, dtype=phi.dtype)
-    # broadcast m over phi's shape: (..., 1) * (n_terms,) -> (..., n_terms)
-    m_phi = m * phi_grad.unsqueeze(-1)
-    sigma_sq_b = sigma_sq.unsqueeze(-1)
-    coeffs = m * torch.exp(-0.5 * (m**2 - 1) * sigma_sq_b)
-    # sin(m*phi)/sin(phi): safe since this branch is only trusted away from
-    # phi ~ 0 (the phi-near-0 case is handled by the eq14/eq15 branch below
-    # regardless of sigma_sq, via the final torch.where).
-    sin_phi = torch.sin(phi_grad).unsqueeze(-1)
-    safe_sin_phi = torch.where(sin_phi.abs() > 1e-6, sin_phi, torch.ones_like(sin_phi))
-    terms = coeffs * torch.sin(m_phi) / safe_sin_phi
-    kernel = terms.sum(-1)
-    log_kernel = torch.log(torch.clamp(kernel, min=1e-30))
-    (spectral_deriv,) = torch.autograd.grad(log_kernel.sum(), phi_grad, create_graph=False)
+    # Explicit enable_grad: this needs its own local gradient (of the
+    # spectral sum w.r.t. phi) regardless of the caller's autograd context.
+    # Callers legitimately compute this loss inside torch.no_grad() during
+    # evaluation (see LatentDiffusionTrainer.prediction_step), which would
+    # otherwise silently disable the autograd.grad call below -- the exact
+    # same failure mode diffusion.su2_math.xyz_from_quat was fixed for.
+    with torch.enable_grad():
+        phi_grad = phi.detach().clone().requires_grad_(True)
+        m = torch.arange(1, n_terms + 1, device=phi.device, dtype=phi.dtype)
+        # broadcast m over phi's shape: (..., 1) * (n_terms,) -> (..., n_terms)
+        m_phi = m * phi_grad.unsqueeze(-1)
+        sigma_sq_b = sigma_sq.unsqueeze(-1)
+        coeffs = m * torch.exp(-0.5 * (m**2 - 1) * sigma_sq_b)
+        # sin(m*phi)/sin(phi): safe since this branch is only trusted away from
+        # phi ~ 0 (the phi-near-0 case is handled by the eq14/eq15 branch below
+        # regardless of sigma_sq, via the final torch.where).
+        sin_phi = torch.sin(phi_grad).unsqueeze(-1)
+        safe_sin_phi = torch.where(sin_phi.abs() > 1e-6, sin_phi, torch.ones_like(sin_phi))
+        terms = coeffs * torch.sin(m_phi) / safe_sin_phi
+        kernel = terms.sum(-1)
+        log_kernel = torch.log(torch.clamp(kernel, min=1e-30))
+        (spectral_deriv,) = torch.autograd.grad(log_kernel.sum(), phi_grad, create_graph=False)
+    spectral_deriv = spectral_deriv.detach()
 
     # --- Eq. 14/15 branch: local approximation for small sigma^2 ---
     safe_phi = torch.where(phi.abs() > small_phi_threshold, phi, torch.ones_like(phi))
