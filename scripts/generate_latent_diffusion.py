@@ -78,14 +78,10 @@ def main() -> None:
     y = torch.full((args.n_samples,), args.digit, dtype=torch.long)
 
     with torch.no_grad():
-        flat_dim = 1
-        for d in latent_shape:
-            flat_dim *= d
-        latent_norm = schedule.sample(model, (args.n_samples, flat_dim), y, "cpu", guidance_scale=args.guidance_scale)
+        latent_norm = schedule.sample(model, (args.n_samples, *latent_shape), y, "cpu", guidance_scale=args.guidance_scale)
         latent = latent_norm * cache.std + cache.mean
-        z = latent.reshape(args.n_samples, *latent_shape)
 
-        z_quantum = base_vae.process_latent(z)
+        z_quantum = base_vae.process_latent(latent)
         images = base_vae.decode(z_quantum).sample
 
     out_dir = Path(args.output)

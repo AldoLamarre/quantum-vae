@@ -139,17 +139,13 @@ class LatentDiffusionTrainer(BaseHFQuantumTrainer):
 
         self.model.eval()
         with torch.no_grad():
-            flat_dim = 1
-            for d in self.latent_shape:
-                flat_dim *= d
             latent_norm = self.diffusion.sample(
-                self.model, (self.preview_num_images, flat_dim), y, device, guidance_scale=2.0
+                self.model, (self.preview_num_images, *self.latent_shape), y, device, guidance_scale=2.0
             )
             latent = latent_norm * self.latent_std.to(device) + self.latent_mean.to(device)
-            z = latent.reshape(self.preview_num_images, *self.latent_shape)
 
             self.base_vae.to(device)
-            z_quantum = self.base_vae.process_latent(z)
+            z_quantum = self.base_vae.process_latent(latent)
             images = self.base_vae.decode(z_quantum).sample
         self.model.train()
 

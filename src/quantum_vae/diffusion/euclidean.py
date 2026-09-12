@@ -1,45 +1,69 @@
-"""Option A: DDPM diffusion over the frozen VAE's flat pre-quantum latent
-(z_flat). No manifold structure here -- this space is just a continuous
-vector space (shaped by the VAE's KL regularization toward something
+"""Option A: DDPM diffusion over the frozen VAE's spatial pre-quantum latent
+(shape [batch, 4, 7, 7]). No manifold structure here -- this space is just
+a continuous tensor (shaped by the VAE's KL regularization toward something
 roughly Gaussian), so standard Euclidean diffusion applies directly, the
-same way Stable Diffusion's latent-space diffusion does.
+same way Stable Diffusion's own latent diffusion does.
 
-Uses diffusers.DDPMScheduler for the actual noise-schedule math (betas,
-alphas_cumprod, add_noise, reverse step) rather than reimplementing it --
-this project already depends on diffusers for AutoencoderKL, and the
-scheduler math is exactly the well-tested, standard DDPM formulation with
-no need for a custom version here.
+Recycles diffusers' own components rather than reinventing them:
+- diffusers.DDPMScheduler for the noise-schedule math (betas, alphas_cumprod,
+  add_noise, reverse step)
+- diffusers.UNet2DModel for the denoiser network, operating directly on the
+  latent's natural (4, 7, 7) spatial shape with built-in timestep/class
+  conditioning -- not a from-scratch MLP on a flattened 196-dim vector.
 """
 from __future__ import annotations
 
 from typing import Tuple
 
 import torch
-from torch import nn
-from diffusers import DDPMScheduler
+from diffusers import DDPMScheduler, UNet2DModel
 
 from .base import LatentDenoiserBase, LatentDiffusionScheduleBase
 
 
-class FlatLatentDenoiser(LatentDenoiserBase):
-    """MLP predicting the noise added to a flat latent vector."""
+class LatentUNetDenoiser(LatentDenoiserBase):
+    """Thin wrapper around diffusers.UNet2DModel operating on the VAE's
+    natural (channels, height, width) latent shape.
 
-    def __init__(self, latent_dim: int = 196, n_classes: int = 10, hidden: int = 512, n_timesteps: int = 1000):
-        super().__init__(n_classes=n_classes, hidden=hidden, n_timesteps=n_timesteps)
-        self.latent_dim = latent_dim
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, hidden),
-            nn.SiLU(),
-            nn.Linear(hidden, latent_dim),
+    No spatial down/up-sampling stages: at (4, 7, 7), the latent is already
+    small enough that a UNet with real downsampling stages hits a classic
+    problem -- 7 is odd, so downsampling and upsampling by 2 don't invert
+    cleanly, producing mismatched skip-connection shapes. A single
+    non-downsampling stage (plain ResNet blocks at full resolution) avoids
+    that entirely, which is appropriate at this scale anyway -- there isn't
+    much multi-scale structure to gain from downsampling a 7x7 map further.
+    """
+
+    def __init__(
+        self,
+        latent_shape: Tuple[int, int, int] = (4, 7, 7),
+        n_classes: int = 10,
+        hidden_channels: int = 64,
+        n_timesteps: int = 1000,
+    ):
+        super().__init__(n_classes=n_classes, n_timesteps=n_timesteps)
+        channels, height, width = latent_shape
+        if height != width:
+            raise ValueError(f"LatentUNetDenoiser expects a square latent, got {height}x{width}.")
+        self.latent_shape = latent_shape
+
+        self.unet = UNet2DModel(
+            sample_size=height,
+            in_channels=channels,
+            out_channels=channels,
+            down_block_types=("DownBlock2D",),
+            up_block_types=("UpBlock2D",),
+            block_out_channels=(hidden_channels,),
+            layers_per_block=2,
+            norm_num_groups=min(8, hidden_channels),
+            add_attention=False,
+            # +1 reserved slot for the "unconditional" token used by
+            # classifier-free guidance (see LatentDenoiserBase).
+            num_class_embeds=n_classes + 1,
         )
 
     def forward(self, x_noisy: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        cond = self.time_embed(t) + self.class_embed(y)
-        return self.net(torch.cat([x_noisy, cond], dim=-1))
+        return self.unet(x_noisy, t, class_labels=y).sample
 
 
 class GaussianDiffusionSchedule(LatentDiffusionScheduleBase):
@@ -84,7 +108,7 @@ class GaussianDiffusionSchedule(LatentDiffusionScheduleBase):
     @torch.no_grad()
     def sample(
         self,
-        model: FlatLatentDenoiser,
+        model: LatentUNetDenoiser,
         shape: Tuple[int, ...],
         y: torch.Tensor,
         device: torch.device,

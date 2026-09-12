@@ -404,16 +404,18 @@ class TrainerConfigParser:
                 return AngleSlotDenoiser(
                     n_qubits=int(model_kwargs.get("n_qubits", 10)),
                     n_classes=int(model_kwargs.get("n_classes", 10)),
-                    hidden=int(model_kwargs.get("hidden", 512)),
+                    hidden=int(model_kwargs.get("hidden", 256)),
                     n_timesteps=int(model_kwargs.get("n_timesteps", 1000)),
+                    n_layers=int(model_kwargs.get("n_layers", 4)),
+                    n_heads=int(model_kwargs.get("n_heads", 4)),
                 )
 
-            from src.quantum_vae.diffusion.euclidean import FlatLatentDenoiser
+            from src.quantum_vae.diffusion.euclidean import LatentUNetDenoiser
 
-            denoiser = FlatLatentDenoiser(
-                latent_dim=int(model_kwargs.get("latent_dim", 196)),
+            denoiser = LatentUNetDenoiser(
+                latent_shape=tuple(model_kwargs.get("latent_shape", (4, 7, 7))),
                 n_classes=int(model_kwargs.get("n_classes", 10)),
-                hidden=int(model_kwargs.get("hidden", 512)),
+                hidden_channels=int(model_kwargs.get("hidden_channels", 64)),
                 n_timesteps=int(model_kwargs.get("n_timesteps", 1000)),
             )
             # Deliberately NOT attaching the base VAE here: nn.Module's

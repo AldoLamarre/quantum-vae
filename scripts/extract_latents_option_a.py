@@ -18,7 +18,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 import sys
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path("/home/claude/quantum-vae")
 sys.path.insert(0, str(ROOT))
 
 from src.quantum_vae.trainers.config_parser import TrainerConfigParser
@@ -38,7 +38,7 @@ def load_idx_mnist(images_path: Path, labels_path: Path):
 
 
 def main():
-    cfg = json.load(open(ROOT / "configs/vaequantumhugface_mnist_pretraining_data_reupload11.json"))
+    cfg = json.load(open(ROOT / "configs/paper/vaequantumhugface_mnist_pretraining_data_reupload11.json"))
     parser = TrainerConfigParser()
     parsed = parser.parse(cfg)
     model = parser.build_model(parsed)
@@ -49,14 +49,9 @@ def main():
     model.load_state_dict(sd, strict=True)
     model.eval()
 
-    mnist_dir_candidates = [
-        ROOT / "data" / "MNIST" / "raw",
-        ROOT / "mnist_raw",
-    ]
-    mnist_dir = next((p for p in mnist_dir_candidates if p.exists()), mnist_dir_candidates[0])
     x_train, y_train = load_idx_mnist(
-        mnist_dir / "train-images-idx3-ubyte",
-        mnist_dir / "train-labels-idx1-ubyte",
+        Path("/home/claude/mnist_raw/train-images-idx3-ubyte"),
+        Path("/home/claude/mnist_raw/train-labels-idx1-ubyte"),
     )
     loader = DataLoader(TensorDataset(x_train, y_train), batch_size=256, shuffle=False)
 
@@ -66,16 +61,19 @@ def main():
         for x, y in loader:
             posterior = model.encode(x).latent_dist
             z = posterior.mode()          # deterministic, matches sample_posterior=False used elsewhere
-            z_flat = z.flatten(1)         # [batch, 196] -- Option A target
-            all_latents.append(z_flat)
+            # Kept as (batch, 4, 7, 7) -- the VAE's natural latent shape --
+            # rather than flattened to 196. A UNet2D denoiser (see
+            # diffusion.euclidean) operates directly on this spatial tensor,
+            # the same way Stable Diffusion's own latent diffusion does.
+            all_latents.append(z)
             all_labels.append(y)
 
     latents = torch.cat(all_latents, dim=0)
     labels = torch.cat(all_labels, dim=0)
     print("latents shape:", latents.shape, "mean:", latents.mean().item(), "std:", latents.std().item())
 
-    out_dir = ROOT / "diffusion_data"
-    out_dir.mkdir(exist_ok=True, parents=True)
+    out_dir = Path("/home/claude/diffusion_data")
+    out_dir.mkdir(exist_ok=True)
     torch.save({"latents": latents, "labels": labels}, out_dir / "mnist_latents_option_a.pt")
     print("saved", out_dir / "mnist_latents_option_a.pt")
 

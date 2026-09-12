@@ -25,10 +25,12 @@ class LatentCacheDataset(Dataset):
         data = torch.load(path, map_location="cpu")
         self.latents = data["latents"]
         self.labels = data["labels"]
-        # Normalize to roughly unit variance -- keeps the noise schedule
-        # well-matched to the data scale, standard practice for latent diffusion.
-        self.mean = self.latents.mean(0, keepdim=True)
-        self.std = self.latents.std(0, keepdim=True)
+        # Per-channel normalization (mean/std over batch, height, width) --
+        # standard practice for a conv denoiser, unlike a single global
+        # scalar which would ignore that different channels can have very
+        # different scales.
+        self.mean = self.latents.mean(dim=(0, 2, 3), keepdim=True)
+        self.std = self.latents.std(dim=(0, 2, 3), keepdim=True)
         self.latents_norm = (self.latents - self.mean) / self.std
 
     def __len__(self) -> int:
