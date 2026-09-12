@@ -4,7 +4,7 @@
   "dataset": "mnist",
   "model_name": "euclidean",
   "base_checkpoint": "mnist_datareupload_compat",
-  "base_model_config": "configs/paper/vaequantumhugface_mnist_pretraining_data_reupload11.json",
+  "base_model_config": "configs/vaequantumhugface_mnist_pretraining_data_reupload11.json",
   "data": {
     "latents_cache": "diffusion_data/mnist_latents_option_a.pt",
     "batch_size": 256
