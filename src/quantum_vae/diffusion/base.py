@@ -28,25 +28,28 @@ class LatentDenoiserBase(nn.Module, ABC):
     """Predicts a training target (see LatentDiffusionScheduleBase) from a
     noisy latent, the diffusion timestep, and a class label.
 
-    Subclasses provide the actual network architecture; this base class only
-    fixes the shared conditioning pattern (timestep + class embeddings) and
-    the reserved "unconditional" token used for classifier-free guidance.
+    Fixes only the shared contract: how many classes exist, how many
+    diffusion timesteps, and the reserved "unconditional" token used for
+    classifier-free guidance. Deliberately does NOT prescribe how timestep/
+    class conditioning is implemented internally -- a wrapped pretrained
+    architecture (e.g. diffusers.UNet2DModel, which handles both internally
+    and expects raw `timestep`/`class_labels` in forward()) and a
+    from-scratch MLP (which needs its own explicit embedding layers) look
+    different enough internally that forcing one embedding pattern here
+    would fit one and get in the way of the other.
     """
 
-    def __init__(self, n_classes: int, hidden: int, n_timesteps: int):
+    def __init__(self, n_classes: int, n_timesteps: int):
         super().__init__()
         self.n_classes = n_classes
         self.n_timesteps = n_timesteps
         self.unconditional_token = n_classes  # reserved index, never a real label
 
-        self.time_embed = nn.Embedding(n_timesteps, hidden)
-        self.class_embed = nn.Embedding(n_classes + 1, hidden)
-
     @abstractmethod
     def forward(self, x_noisy: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Predict the training target for this noisy input. Shape of both
-        input and output is variant-specific (flat vector for Euclidean,
-        per-slot tangent vectors for SU(2) angles)."""
+        input and output is variant-specific (spatial latent tensor for
+        Euclidean, per-slot tangent vectors for SU(2) angles)."""
         raise NotImplementedError
 
 
