@@ -550,6 +550,20 @@ class TrainerConfigParser:
         if parsed.task_type == "vae":
             kwargs["batch_eval_metrics"] = bool(t_kwargs.get("batch_eval_metrics", True))
 
+        # For latent_diffusion runs: HF's Trainer defaults to
+        # remove_unused_columns=True, which inspects the MODEL's forward()
+        # signature (x_noisy, t, y for our denoisers) and silently strips
+        # any batch dict keys that don't match those argument names --
+        # before the data_collator even runs. Our datasets intentionally
+        # use different key names ("latent", "label") since compute_loss
+        # does its own translation into the denoiser's actual forward args
+        # (adding noise, building the diffusion timestep, etc.), so this
+        # default would strip the very keys our collator needs and fail
+        # with a bare KeyError deep in the dataloader, not a clear error
+        # pointing at the actual cause.
+        if parsed.task_type == "latent_diffusion":
+            kwargs["remove_unused_columns"] = False
+
         dropped = [k for k in kwargs if k not in valid_params]
         if dropped:
             warnings.warn(

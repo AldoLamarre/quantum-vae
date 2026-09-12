@@ -1,14 +1,32 @@
 """Generate samples from a trained latent diffusion model:
 
     python scripts/generate_latent_diffusion.py \
-        --config configs/paper/vaequantumhugface_mnist_latent_diffusion.json \
-        --checkpoint checkpoints/diffusion/vaequantumhugface_mnist_latent_diffusion/<run>/pytorch_model.bin \
+        --config configs/vaequantumhugface_mnist_latent_diffusion.json \
+        --checkpoint checkpoints/diffusion/.../pytorch_model.bin \
+        --digit 3 --n-samples 8
+
+    python scripts/generate_latent_diffusion.py \
+        --config configs/vaequantumhugface_mnist_su2_angle_diffusion.json \
+        --checkpoint checkpoints/diffusion/.../pytorch_model.bin \
         --digit 3 --n-samples 8
 
 Rebuilds the denoiser + schedule + frozen base VAE the same way
 train_latent_diffusion.py does (via TrainerConfigParser), loads trained
 denoiser weights, samples, and decodes through the frozen base VAE's real
 quantum circuit -- the only place in this script that touches PennyLane.
+
+Two structurally different decode paths depending on variant (mirrors
+LatentDiffusionTrainer._save_generation_preview, which this was copied
+from and should be kept in sync with):
+- "euclidean": samples a pre-quantum classical latent -> base_vae's normal
+  process_latent() path.
+- "su2_angles": samples quaternions directly -> decomposed to (x,y,z) via
+  su2_math.xyz_from_quat -> fed straight into the frozen qlayer +
+  project_from_quantum, bypassing process_latent entirely (there's no
+  classical latent here -- the diffuser generated the gate angles
+  themselves).
+
+Uses CUDA automatically if available (falls back to CPU otherwise).
 """
 from __future__ import annotations
 
@@ -25,7 +43,6 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.quantum_vae.trainers.config_parser import TrainerConfigParser
-from src.quantum_vae.trainers.latent_diffusion_data import LatentCacheDataset
 
 
 def main() -> None:
@@ -36,7 +53,11 @@ def main() -> None:
     parser.add_argument("--n-samples", type=int, default=8)
     parser.add_argument("--guidance-scale", type=float, default=2.0)
     parser.add_argument("--output", type=str, default="generated")
+    parser.add_argument("--device", type=str, default=None, help="cuda / cpu -- auto-detected if omitted")
     args = parser.parse_args()
+
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     config_path = Path(args.config)
     if not config_path.is_absolute():
@@ -52,42 +73,57 @@ def main() -> None:
         state = state["state_dict"]
     model.load_state_dict(state, strict=True)
     model.eval()
-
-    variant = str(parsed.model_name).lower()
-    if variant == "su2_angles":
-        from src.quantum_vae.diffusion.su2_angles import SU2HeatKernelSchedule
-        schedule = SU2HeatKernelSchedule(
-            n_qubits=int(parsed.model_kwargs.get("n_qubits", 10)),
-            n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
-        )
-    else:
-        from src.quantum_vae.diffusion.euclidean import GaussianDiffusionSchedule
-        schedule = GaussianDiffusionSchedule(n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)))
+    model.to(device)
 
     base_vae = cfg_parser.build_frozen_base_vae(
         parsed.model_kwargs["base_checkpoint"],
         parsed.model_kwargs["base_model_config"],
     )
+    base_vae.to(device)
 
+    variant = str(parsed.model_name).lower()
     cache_path = Path(parsed.data_kwargs["latents_cache"])
     if not cache_path.is_absolute():
         cache_path = ROOT / cache_path
-    cache = LatentCacheDataset(str(cache_path))
-
+    y = torch.full((args.n_samples,), args.digit, dtype=torch.long, device=device)
     latent_shape = tuple(parsed.model_kwargs.get("latent_shape", (4, 7, 7)))
-    y = torch.full((args.n_samples,), args.digit, dtype=torch.long)
 
     with torch.no_grad():
-        latent_norm = schedule.sample(model, (args.n_samples, *latent_shape), y, "cpu", guidance_scale=args.guidance_scale)
-        latent = latent_norm * cache.std + cache.mean
+        if variant == "su2_angles":
+            from src.quantum_vae.diffusion.su2_angles import SU2HeatKernelSchedule
+            from src.quantum_vae.diffusion.su2_math import xyz_from_quat
 
-        z_quantum = base_vae.process_latent(latent)
-        images = base_vae.decode(z_quantum).sample
+            schedule = SU2HeatKernelSchedule(
+                n_qubits=int(parsed.model_kwargs.get("n_qubits", 10)),
+                n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
+            ).to(device)
+            n_qubits = int(parsed.model_kwargs.get("n_qubits", 10))
+
+            quats = schedule.sample(model, (args.n_samples, n_qubits), y, device, guidance_scale=args.guidance_scale)
+            angles = xyz_from_quat(quats)  # (n_samples, n_qubits, 3)
+            quantum_input = angles.reshape(args.n_samples, -1)  # (n_samples, n_qubits*3)
+
+            quantum_output = base_vae.qlayer(quantum_input)
+            z_quantum_flat = base_vae.project_from_quantum(quantum_output)
+            z_quantum = z_quantum_flat.reshape(args.n_samples, *latent_shape)
+            images = base_vae.decode(z_quantum).sample
+        else:
+            from src.quantum_vae.diffusion.euclidean import GaussianDiffusionSchedule
+            from src.quantum_vae.trainers.latent_diffusion_data import LatentCacheDataset
+
+            schedule = GaussianDiffusionSchedule(n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000))).to(device)
+            cache = LatentCacheDataset(str(cache_path))
+
+            latent_norm = schedule.sample(model, (args.n_samples, *latent_shape), y, device, guidance_scale=args.guidance_scale)
+            latent = latent_norm * cache.std.to(device) + cache.mean.to(device)
+
+            z_quantum = base_vae.process_latent(latent)
+            images = base_vae.decode(z_quantum).sample
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     for i in range(args.n_samples):
-        save_image(torch.clamp(images[i], 0, 1), out_dir / f"digit{args.digit}_sample{i}.png")
+        save_image(torch.clamp(images[i].cpu(), 0, 1), out_dir / f"digit{args.digit}_sample{i}.png")
     print(f"saved {args.n_samples} samples of digit {args.digit} to {out_dir}")
 
 
