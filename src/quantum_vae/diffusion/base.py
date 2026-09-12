@@ -75,9 +75,13 @@ class LatentDiffusionScheduleBase(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def sample_noise(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-        """Draw the variant-specific noise used by q_sample (flat Gaussian
-        vector for Euclidean; per-slot tangent-space Gaussian for SU(2))."""
+    def sample_noise(self, x0: torch.Tensor) -> torch.Tensor:
+        """Draw the variant-specific noise used by q_sample, shaped
+        according to x0 (NOT necessarily x0.shape itself -- e.g. for SU(2)
+        angle diffusion, x0 is (..., 4) quaternions but the tangent-space
+        noise is (..., 3); each schedule derives its own correct noise
+        shape from x0's shape/device rather than being handed a shape
+        tuple that implicitly assumes noise and data share a shape)."""
         raise NotImplementedError
 
     @abstractmethod

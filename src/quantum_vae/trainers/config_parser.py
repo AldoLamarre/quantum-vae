@@ -624,30 +624,38 @@ class TrainerConfigParser:
             )
         elif parsed.task_type == "latent_diffusion":
             from src.quantum_vae.trainers.latent_diffusion_trainer import LatentDiffusionTrainer
-            from src.quantum_vae.trainers.latent_diffusion_data import (
-                LatentCacheDataset,
-                latent_diffusion_collator,
-            )
 
             variant = str(parsed.model_name).lower()
             if variant == "su2_angles":
                 from src.quantum_vae.diffusion.su2_angles import SU2HeatKernelSchedule
+                from src.quantum_vae.trainers.su2_angle_data import (
+                    QuaternionCacheDataset,
+                    quaternion_diffusion_collator,
+                )
                 diffusion_schedule = SU2HeatKernelSchedule(
                     n_qubits=int(parsed.model_kwargs.get("n_qubits", 10)),
                     n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
                 )
+                dataset_cls = QuaternionCacheDataset
+                collator = quaternion_diffusion_collator
             else:
                 from src.quantum_vae.diffusion.euclidean import GaussianDiffusionSchedule
+                from src.quantum_vae.trainers.latent_diffusion_data import (
+                    LatentCacheDataset,
+                    latent_diffusion_collator,
+                )
                 diffusion_schedule = GaussianDiffusionSchedule(
                     n_timesteps=int(parsed.model_kwargs.get("n_timesteps", 1000)),
                 )
+                dataset_cls = LatentCacheDataset
+                collator = latent_diffusion_collator
 
             cache_path = parsed.data_kwargs["latents_cache"]
             cache_path_resolved = Path(cache_path)
             if not cache_path_resolved.is_absolute():
                 cache_path_resolved = self.project_root / cache_path_resolved
             if train_dataset is None:
-                train_dataset = LatentCacheDataset(str(cache_path_resolved))
+                train_dataset = dataset_cls(str(cache_path_resolved))
             if eval_dataset is None:
                 eval_dataset = train_dataset
 
@@ -660,14 +668,16 @@ class TrainerConfigParser:
                 model=model,
                 diffusion=diffusion_schedule,
                 args=training_args,
-                data_collator=latent_diffusion_collator,
+                data_collator=collator,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
+                variant=variant,
                 cfg_dropout_prob=float(parsed.training_kwargs.get("cfg_dropout_prob", 0.1)),
                 base_vae=base_vae,
-                latent_mean=train_dataset.mean,
-                latent_std=train_dataset.std,
+                latent_mean=getattr(train_dataset, "mean", None),
+                latent_std=getattr(train_dataset, "std", None),
                 latent_shape=tuple(parsed.model_kwargs.get("latent_shape", (4, 7, 7))),
+                n_qubits=int(parsed.model_kwargs.get("n_qubits", 10)),
                 preview_every_n_epochs=int(parsed.training_kwargs.get("preview_every_n_epochs", 10)),
                 preview_digit=int(parsed.training_kwargs.get("preview_digit", 3)),
                 preview_num_images=int(parsed.training_kwargs.get("preview_num_images", 8)),

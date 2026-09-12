@@ -170,9 +170,12 @@ class SU2HeatKernelSchedule(LatentDiffusionScheduleBase):
         self.sigma_sq_cumulative = self.sigma_sq_cumulative.to(device)
         return self
 
-    def sample_noise(self, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-        """shape: (batch, n_qubits, 3) -- one tangent vector per slot."""
-        return torch.randn(shape, device=device)
+    def sample_noise(self, x0: torch.Tensor) -> torch.Tensor:
+        """x0: (batch, n_qubits, 4) quaternions -> noise: (batch, n_qubits,
+        3) tangent vectors -- deliberately NOT the same shape as x0, since
+        quaternions are 4-dim but their tangent space (su(2)) is 3-dim."""
+        tangent_shape = (*x0.shape[:-1], 3)
+        return torch.randn(tangent_shape, device=x0.device)
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
         """x0: (batch, n_qubits, 4) clean quaternions. noise: (batch,

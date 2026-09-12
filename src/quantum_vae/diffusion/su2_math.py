@@ -129,15 +129,22 @@ def xyz_from_quat(
     q_target_detached = q_target.detach()
 
     for _ in range(n_steps):
-        q_pred = quat_from_xyz(angles[..., 0], angles[..., 1], angles[..., 2])
-        # SU(2) double-covers the rotation this circuit implements, so q
-        # and -q represent the same physical gate -- fit to whichever sign
-        # is closer rather than penalizing a spurious global-phase mismatch.
-        diff_pos = torch.sum((q_pred - q_target_detached) ** 2, dim=-1)
-        diff_neg = torch.sum((q_pred + q_target_detached) ** 2, dim=-1)
-        loss = torch.minimum(diff_pos, diff_neg).mean()
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
+        with torch.enable_grad():
+            # Explicit enable_grad: this function does its own small,
+            # self-contained optimization regardless of the caller's
+            # autograd context. Callers legitimately wrap the surrounding
+            # sampling loop in torch.no_grad() (e.g.
+            # LatentDiffusionTrainer._save_generation_preview), which would
+            # otherwise silently disable the gradients this fit needs.
+            q_pred = quat_from_xyz(angles[..., 0], angles[..., 1], angles[..., 2])
+            # SU(2) double-covers the rotation this circuit implements, so q
+            # and -q represent the same physical gate -- fit to whichever sign
+            # is closer rather than penalizing a spurious global-phase mismatch.
+            diff_pos = torch.sum((q_pred - q_target_detached) ** 2, dim=-1)
+            diff_neg = torch.sum((q_pred + q_target_detached) ** 2, dim=-1)
+            loss = torch.minimum(diff_pos, diff_neg).mean()
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
 
     return angles.detach()
