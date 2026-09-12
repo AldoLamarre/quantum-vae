@@ -6,6 +6,10 @@ MODELS_DIR = "models"
 CHECKPOINTS_DIR = "checkpoints"
 
 REGISTERED_MODELS = {
+    "mnist_datareupload_compat": {
+        "managed": "models/autoencoders/mnist/mnist_datareupload_compat.pt",
+        "legacy": ["mnist_datareupload_compat.pt", "models/mnist_datareupload_compat.pt"],
+    },
     "mnist_pennylane_vae_five": {
         "managed": "models/autoencoders/mnist/variationalautoencodertestpennylane_five.pt",
         "legacy": ["variationalautoencodertestpennylane five.pt"],
