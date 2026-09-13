@@ -136,6 +136,8 @@ class TrainerConfigParser:
                 model_kwargs["n_clusters"] = int(cfg["n_clusters"])
             if "cluster_routing" in cfg:
                 model_kwargs["cluster_routing"] = str(cfg["cluster_routing"])
+            if "omega_delta_source" in cfg:
+                model_kwargs["omega_delta_source"] = str(cfg["omega_delta_source"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -282,7 +284,7 @@ class TrainerConfigParser:
                     "n_atoms", "register_geometry", "atom_spacing_um",
                     "r0_um", "C6", "evolution_time_us", "n_segments",
                     "measurement_kind", "correlator_order",
-                    "n_clusters", "cluster_routing",
+                    "n_clusters", "cluster_routing", "omega_delta_source",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

@@ -34,6 +34,16 @@ Parameter tiers:
       hardware cannot modulate the field's amplitude in time within one
       shot; only the global drive Omega0(t)/Delta0(t) can be time-shaped).
 
+Hardware amplitude limits (Aquila, in units of 2*pi MHz -- see
+AQUILA_OMEGA_MAX_MHZ / AQUILA_DELTA_MAX_MHZ / AQUILA_LOCAL_DETUNING_MAX_MHZ
+below): Omega0_MHz in [0, 2.5], Delta0_MHz (global detuning) in
+[-20, 20], and the per-atom local field V_i(x) in [-25, 25]. Enforced by
+smooth (tanh/sigmoid) reparameterization rather than a hard clamp, so
+gradients keep flowing even when a raw value is pushed past the bound --
+see NeutralAtomPulseLayer.forward for Omega0/Delta0, _build_qnode for
+V_i(x). This applies regardless of omega_delta_source ("trainable" or
+"encoder"): either way, what reaches the physics is bounded.
+
 Hardware scope:
     - encoding="local_detuning" (Path A) only. Path B (data modulating
       interatomic distance / interaction strength instead of a per-atom
@@ -82,6 +92,12 @@ has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
 
+# Aquila (QuEra) hardware amplitude limits, in units of 2*pi MHz. Fixed
+# physical constants, not tunable config -- see module docstring.
+AQUILA_OMEGA_MAX_MHZ = 2.5  # global Rabi frequency: one-sided, >= 0
+AQUILA_DELTA_MAX_MHZ = 20.0  # global detuning: symmetric, [-20, 20]
+AQUILA_LOCAL_DETUNING_MAX_MHZ = 25.0  # per-atom local field magnitude
+
 
 def _build_register(
     n_atoms: int,
@@ -115,14 +131,18 @@ class NeutralAtomDeviceConfig:
     C6: float
     evolution_time_us: float
     n_segments: int
-    # NOTE: not yet wired to anything. Reserved for future piecewise-constant
-    # shaping of the global Omega(t)/Delta(t) drive (standard, baseline
-    # hardware capability -- unrelated to data re-uploading, which
-    # n_data_injections governs and which is disabled below). Right now
-    # Omega0_MHz/Delta0_MHz are single constant scalars for the whole
-    # evolution window; n_segments has no effect until that changes.
     n_data_injections: int = 1
     encoding: Literal["local_detuning", "geometry"] = "local_detuning"
+    # Only Omega(t)/Delta(t) are physically variable on the target
+    # (Aquila-class) hardware -- there is no per-atom time-varying local
+    # field. "trainable": Omega0_MHz/Delta0_MHz are ordinary global model
+    # weights, one shared pulse shape for every sample (original design).
+    # "encoder": Omega0_MHz/Delta0_MHz are produced per-sample by
+    # LatentToLocalField instead, giving the model a second, per-sample
+    # data channel now that lam can no longer carry that role. Both
+    # remain within the real constraint: only Omega_k/Delta_k (shared
+    # across the whole register, not per-atom) ever vary.
+    omega_delta_source: Literal["trainable", "encoder"] = "trainable"
     # "expectation": n_atoms real values, one <Z_i> per atom -- equivalent
     # to "correlators" with correlator_order=1, kept as a separate name for
     # readability and backward compatibility.
@@ -165,6 +185,11 @@ class NeutralAtomDeviceConfig:
     cluster_routing: Literal["global", "local"] = "global"
 
     def __post_init__(self):
+        if self.omega_delta_source not in ("trainable", "encoder"):
+            raise ValueError(
+                f"omega_delta_source='{self.omega_delta_source}' is not "
+                "supported. Use 'trainable' or 'encoder'."
+            )
         if self.measurement_kind not in ("expectation", "probability", "correlators"):
             raise ValueError(
                 f"measurement_kind='{self.measurement_kind}' is not "
@@ -225,6 +250,7 @@ class NeutralAtomDeviceConfig:
         correlator_order: int = 1,
         n_clusters: int = 1,
         cluster_routing: Literal["global", "local"] = "global",
+        omega_delta_source: Literal["trainable", "encoder"] = "trainable",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -241,6 +267,7 @@ class NeutralAtomDeviceConfig:
             correlator_order=correlator_order,
             n_clusters=n_clusters,
             cluster_routing=cluster_routing,
+            omega_delta_source=omega_delta_source,
         )
 
 
@@ -321,7 +348,7 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
 
 
 class LatentToLocalField(nn.Module):
-    """Maps VAE latent -> (x, lam) packed into one tensor.
+    """Maps VAE latent -> (x, lam[, omega_seg, delta_seg]) packed into one tensor.
 
     x: n_atoms * n_clusters values -- the per-atom local-detuning pattern
        for every cluster, "global" routing (cluster_routing="global"):
@@ -336,26 +363,45 @@ class LatentToLocalField(nn.Module):
          within a sample -- physically forced, since all clusters sit
          under the same shared time-envelope (see
          NeutralAtomDeviceConfig.n_clusters).
+    omega_seg, delta_seg: present only when omega_delta_source="encoder"
+         -- n_segments values each, the per-sample Omega(t)/Delta(t)
+         pulse shape (in place of NeutralAtomPulseLayer's own trainable
+         Omega0_MHz/Delta0_MHz). This is the one channel the target
+         hardware actually allows to vary per shot, so it's the intended
+         way to add expressivity back once lam is fixed at one constant
+         scalar. ONE shared pair for every cluster within a sample, same
+         reasoning as lam.
 
-    Returned as ONE concatenated [batch, n_atoms*n_clusters + 1]
-    tensor, not a tuple -- this keeps the single-tensor-in/single-tensor-out
-    contract AnsatzClassifierPipelineBase (shared with the gate-model
-    classifier) already assumes; NeutralAtomPulseLayer splits it back
-    apart internally. Default implementation is a plain linear layer;
-    this is the piece intended to be replaced later (e.g. with symmetric
-    attention, or cluster_routing="local"/"attention") without touching
-    anything downstream.
+    Returned as ONE concatenated tensor, not a tuple -- this keeps the
+    single-tensor-in/single-tensor-out contract AnsatzClassifierPipelineBase
+    (shared with the gate-model classifier) already assumes;
+    NeutralAtomPulseLayer splits it back apart internally. Default
+    implementation is a plain linear layer; this is the piece intended to
+    be replaced later (e.g. with symmetric attention, or
+    cluster_routing="local"/"attention") without touching anything
+    downstream.
     """
 
-    def __init__(self, latent_dim: int, n_atoms: int, n_segments: int, n_clusters: int = 1):
+    def __init__(
+        self,
+        latent_dim: int,
+        n_atoms: int,
+        n_segments: int,
+        n_clusters: int = 1,
+        omega_delta_source: Literal["trainable", "encoder"] = "trainable",
+    ):
         super().__init__()
         self.n_atoms = n_atoms
-        self.n_segments = n_segments  # kept for signature compat; unused (lam is a single scalar)
+        self.n_segments = n_segments
         self.n_clusters = n_clusters
-        self.proj = nn.Linear(latent_dim, n_atoms * n_clusters + 1)
+        self.omega_delta_source = omega_delta_source
+        out_dim = n_atoms * n_clusters + 1
+        if omega_delta_source == "encoder":
+            out_dim += 2 * n_segments  # omega_seg, delta_seg
+        self.proj = nn.Linear(latent_dim, out_dim)
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
-        return self.proj(z_flat)   # [batch, n_atoms*n_clusters + 1]
+        return self.proj(z_flat)
 
 
 class NeutralAtomPulseLayer(nn.Module):
@@ -366,9 +412,14 @@ class NeutralAtomPulseLayer(nn.Module):
         H_local(x, lam) = sum_i V0_i * (1 + lam * x_i) * n_i
 
     Omega0(t) and Delta0(t) are piecewise-constant over n_segments
-    windows, each with its own independently trained value
-    (Omega0_MHz[k], Delta0_MHz[k]) -- pure pulse shaping, shared across
-    every sample.
+    windows. Source controlled by device.omega_delta_source:
+        - "trainable" (default): Omega0_MHz[k]/Delta0_MHz[k] are ordinary
+          trainable weights, one shared pulse shape for every sample.
+        - "encoder": Omega0_MHz[k]/Delta0_MHz[k] come from the ENCODER
+          instead (LatentToLocalField's output), a different pulse shape
+          per sample. This is the only channel real local-addressing
+          hardware lets vary per shot at all, so it's how the model
+          regains per-sample expressivity now that lam is fixed.
 
     lam is constant for the whole evolution window: it comes from the
     ENCODER (LatentToLocalField's output), one scalar per sample, not
@@ -377,14 +428,25 @@ class NeutralAtomPulseLayer(nn.Module):
     on the target hardware within a single shot; only the global drive
     Omega0(t)/Delta0(t) can be.
 
-    Trainable: Omega0_MHz, Delta0_MHz (each n_segments-length vectors).
-    NOT trainable here: lam -- it's an encoder output, passed into
-    forward() alongside x, not a qlayer parameter.
+    Whatever the source, raw Omega0_MHz/Delta0_MHz are soft-bounded to
+    Aquila's physical amplitude limits before reaching the physics
+    (AQUILA_OMEGA_MAX_MHZ, AQUILA_DELTA_MAX_MHZ -- see forward's
+    Omega0_bounded/Delta0_bounded), via sigmoid/tanh rather than a hard
+    clamp so gradients keep flowing past the bound. V_i(x) is bounded
+    the same way inside _build_qnode (AQUILA_LOCAL_DETUNING_MAX_MHZ).
+
+    Trainable when omega_delta_source="trainable": Omega0_MHz, Delta0_MHz
+    (each n_segments-length vectors). NOT trainable here in either mode:
+    lam -- always an encoder output, passed into forward() alongside x,
+    never a qlayer parameter.
     Not trainable: device (NeutralAtomDeviceConfig, tier-1 constants).
 
     Named `qlayer` when attached to the VAE (mirroring
     QuantumVAEDataReupload) so AnsatzVAEBase.quantum_trainable_parameters
-    picks up Omega0_MHz/Delta0_MHz automatically.
+    picks up Omega0_MHz/Delta0_MHz automatically when they're trainable
+    parameters here (omega_delta_source="trainable"); when they're
+    encoder-sourced instead, they're trained as part of
+    LatentToLocalField like any other encoder weight.
     """
 
     def __init__(self, device: NeutralAtomDeviceConfig):
@@ -394,20 +456,29 @@ class NeutralAtomPulseLayer(nn.Module):
         self.n_atoms = device.n_atoms
         self.n_segments = device.n_segments
         self.n_clusters = device.n_clusters
+        self.omega_delta_source = device.omega_delta_source
 
         # V0_i = C6 / r0^6 per atom -- fixed, from geometry, not trained.
         V0 = device.C6 / (device.r0_um ** 6)
         self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
 
         # Trainable physics parameters (tier 2): per-segment pulse shape,
-        # shared across every sample. lam is NOT here -- see class docstring.
-        self.Omega0_MHz = nn.Parameter(torch.ones(device.n_segments, dtype=torch.float32))
-        self.Delta0_MHz = nn.Parameter(torch.zeros(device.n_segments, dtype=torch.float32))
+        # shared across every sample. Only built when trainable here --
+        # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
+        # forward() instead. lam is NOT here either way -- see class docstring.
+        if self.omega_delta_source == "trainable":
+            self.Omega0_MHz = nn.Parameter(torch.ones(device.n_segments, dtype=torch.float32))
+            self.Delta0_MHz = nn.Parameter(torch.zeros(device.n_segments, dtype=torch.float32))
+        else:
+            self.Omega0_MHz = None
+            self.Delta0_MHz = None
 
         self._qnode = self._build_qnode()
-        # x and lam are both batched (one pair per sample); Omega0/Delta0
-        # are shared, the same pulse shape applied to every sample in the batch.
-        self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, 0, None, None))
+        # x and lam are always batched (one pair per sample). Omega0/Delta0
+        # are batched too when encoder-sourced (a different pulse shape per
+        # sample); shared (one pulse shape for the whole batch) otherwise.
+        omega_delta_axis = 0 if self.omega_delta_source == "encoder" else None
+        self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, 0, omega_delta_axis, omega_delta_axis))
 
         # Persistent, jit-compiled forward/backward, built once and never
         # recreated so the compiled XLA executable is reused across calls.
@@ -499,7 +570,13 @@ class NeutralAtomPulseLayer(nn.Module):
             # global phase and is dropped, leaving -pi * V_i on Z_i.
             def make_local_coeff(i):
                 def f(p, t):
-                    return -np.pi * V0_np[i] * (1.0 + lam * p)
+                    v_i = V0_np[i] * (1.0 + lam * p)
+                    # Soft-bound to Aquila's local-detuning magnitude
+                    # limit (tanh saturates smoothly at the physical
+                    # bound instead of a hard clamp, keeping gradients
+                    # flowing when v_i is pushed past it).
+                    v_i = AQUILA_LOCAL_DETUNING_MAX_MHZ * jnp.tanh(v_i / AQUILA_LOCAL_DETUNING_MAX_MHZ)
+                    return -np.pi * v_i
                 return f
 
             local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
@@ -547,15 +624,19 @@ class NeutralAtomPulseLayer(nn.Module):
         across all n_clusters independent registers.
 
         Args:
-            combined: [batch, n_atoms*n_clusters + 1] -- x (first
+            combined: [batch, n_atoms*n_clusters + 1] (omega_delta_source=
+               "trainable") or [batch, n_atoms*n_clusters + 1 + 2*n_segments]
+               (omega_delta_source="encoder") -- x (first
                n_atoms*n_clusters columns, cluster-major: cluster 0's
-               n_atoms columns, then cluster 1's, etc.) and lam (last
+               n_atoms columns, then cluster 1's, etc.), lam (next
                column, one scalar per sample, shared across every
-               cluster within that sample) packed into one tensor,
-               exactly as LatentToLocalField produces. Cast to float32
-               if not already -- a no-op in the common case, since
-               float32 is both torch's default and this layer's
-               required dtype.
+               cluster within that sample), and, only in "encoder" mode,
+               omega_seg/delta_seg (the last 2*n_segments columns, same
+               per-sample-shared-across-clusters convention as lam)
+               packed into one tensor, exactly as LatentToLocalField
+               produces. Cast to float32 if not already -- a no-op in
+               the common case, since float32 is both torch's default
+               and this layer's required dtype.
 
         Returns:
             [batch, measurement_dim] readout, all clusters concatenated
@@ -575,8 +656,9 @@ class NeutralAtomPulseLayer(nn.Module):
         n_clusters = self.n_clusters
         n_atoms = self.n_atoms
 
+        n_segments = self.n_segments
         x = combined[:, : n_atoms * n_clusters].contiguous()
-        lam = combined[:, n_atoms * n_clusters :].squeeze(-1).contiguous()
+        lam = combined[:, n_atoms * n_clusters : n_atoms * n_clusters + 1].squeeze(-1).contiguous()
 
         # The vmap'd qnode only ever sees a flat collection of
         # independent simulations -- it has no notion of "cluster" at
@@ -586,15 +668,34 @@ class NeutralAtomPulseLayer(nn.Module):
         # lam). Flattening (batch, cluster) into one leading axis here,
         # entirely in torch before ever crossing into JAX, reuses the
         # exact single-vmap pattern already validated for the
-        # non-clustered (n_clusters=1) case. lam is the same for every
-        # cluster within a sample, so repeat_interleave duplicates each
-        # sample's lam scalar n_clusters times consecutively, matching
-        # x's cluster-major flat ordering exactly.
+        # non-clustered (n_clusters=1) case. lam (and, in "encoder" mode,
+        # omega_seg/delta_seg) is the same for every cluster within a
+        # sample, so repeat_interleave duplicates each one n_clusters
+        # times consecutively, matching x's cluster-major flat ordering.
         x_flat = x.reshape(batch_size * n_clusters, n_atoms)
         lam_flat = lam.repeat_interleave(n_clusters, dim=0)
 
+        if self.omega_delta_source == "encoder":
+            offset = n_atoms * n_clusters + 1
+            omega_seg = combined[:, offset : offset + n_segments].contiguous()
+            delta_seg = combined[:, offset + n_segments : offset + 2 * n_segments].contiguous()
+            Omega0_MHz = omega_seg.repeat_interleave(n_clusters, dim=0)
+            Delta0_MHz = delta_seg.repeat_interleave(n_clusters, dim=0)
+        else:
+            Omega0_MHz = self.Omega0_MHz
+            Delta0_MHz = self.Delta0_MHz
+
+        # Soft-bound to Aquila's global drive limits (tanh/sigmoid
+        # saturate smoothly at the physical bound instead of a hard
+        # clamp, keeping gradients flowing past it). Applied here so it
+        # covers both omega_delta_source modes uniformly -- a raw
+        # trainable parameter or a raw encoder output, either way what
+        # reaches the physics is bounded.
+        Omega0_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz)
+        Delta0_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz)
+
         out_flat = _NeutralAtomPulseFunction.apply(
-            x_flat, lam_flat, self.Omega0_MHz, self.Delta0_MHz, self._jit_forward, self._jit_backward
+            x_flat, lam_flat, Omega0_bounded, Delta0_bounded, self._jit_forward, self._jit_backward
         )
         # [batch*n_clusters, per_cluster_dim] -> [batch, n_clusters*per_cluster_dim],
         # clusters concatenated in the same cluster-major order as the input.
@@ -633,11 +734,26 @@ class NeutralAtomPulseLayer(nn.Module):
     def extra_repr(self) -> str:
         """Human-readable dump for verification against experimental data --
         same symbols as standard physics notation (Omega, Delta), not
-        ML-flavored parameter names. lam is not listed here -- it's an
-        encoder output (varies per sample), not a qlayer parameter.
+        ML-flavored parameter names. Values shown are the physically
+        bounded ones actually used by the physics (see forward's
+        Omega0_bounded/Delta0_bounded), not the raw underlying weights.
+        lam is not listed here -- it's an encoder output (varies per
+        sample), not a qlayer parameter. When omega_delta_source=
+        "encoder", Omega0_MHz/Delta0_MHz are also encoder outputs
+        (varies per sample) and have no fixed values to print here.
         """
         def _fmt_vec(t: torch.Tensor) -> str:
             return "[" + ", ".join(f"{v:.6f}" for v in t.detach().tolist()) + "]"
+
+        if self.omega_delta_source == "trainable":
+            omega_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(self.Omega0_MHz)
+            delta_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(self.Delta0_MHz)
+            omega_delta_str = (
+                f"Omega0_MHz={_fmt_vec(omega_bounded)}, "
+                f"Delta0_MHz={_fmt_vec(delta_bounded)}"
+            )
+        else:
+            omega_delta_str = "Omega0_MHz=<encoder output>, Delta0_MHz=<encoder output>"
 
         return (
             f"n_atoms={self.device_cfg.n_atoms}, "
@@ -648,11 +764,11 @@ class NeutralAtomPulseLayer(nn.Module):
             + (f"(order={self.device_cfg.correlator_order})" if self.device_cfg.measurement_kind == "correlators" else "")
             + f", measurement_dim={self.measurement_dim}, "
             f"encoding={self.device_cfg.encoding}, "
+            f"omega_delta_source={self.omega_delta_source}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
-            f"Omega0_MHz={_fmt_vec(self.Omega0_MHz)}, "
-            f"Delta0_MHz={_fmt_vec(self.Delta0_MHz)}"
+            + omega_delta_str
         )
 
 
@@ -661,8 +777,9 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
     Strategy:
         1. Encode input -> latent z via HF AutoencoderKL encoder
-        2. Project z to one local-detuning value per atom (x) and one
-           global scale (lam)
+        2. Project z to one local-detuning value per atom (x), one
+           global scale (lam), and, when device.omega_delta_source=
+           "encoder", a per-sample Omega(t)/Delta(t) pulse shape too
         3. Evolve the Rydberg register under interaction + global drive +
            V0(1+lam*x) local field, lam constant for the fixed time
            window (qlayer)
@@ -688,10 +805,14 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         self.project_from_quantum: Optional[nn.Linear] = None
 
     def _infer_quantum_torch_device(self) -> torch.device:
+        # qlayer has no nn.Parameters at all when
+        # device.omega_delta_source="encoder" (Omega0_MHz/Delta0_MHz are
+        # then encoder outputs, not qlayer parameters) -- fall back to
+        # its V0 buffer, which always exists, rather than assuming CPU.
         try:
             return next(self.qlayer.parameters()).device
         except StopIteration:
-            return torch.device("cpu")
+            return self.qlayer.V0.device
 
     def to(self, *args, **kwargs):
         module = super().to(*args, **kwargs)
@@ -715,7 +836,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             latent_dim = z.flatten(1).shape[1]
 
         self.project_to_quantum = LatentToLocalField(
-            latent_dim, self.device_cfg.n_atoms, self.device_cfg.n_segments, self.device_cfg.n_clusters
+            latent_dim,
+            self.device_cfg.n_atoms,
+            self.device_cfg.n_segments,
+            self.device_cfg.n_clusters,
+            omega_delta_source=self.device_cfg.omega_delta_source,
         ).to(dummy.device)
         self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
@@ -724,9 +849,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         Flow:
             1. Flatten latent z
-            2. Project to (x, lam) -- the per-atom pattern and a single
-               per-sample scalar gate on how strongly it matters overall
-               (see LatentToLocalField)
+            2. Project to (x, lam[, omega_seg, delta_seg]) -- the
+               per-atom pattern, a single per-sample scalar gate on how
+               strongly it matters overall, and (when
+               device.omega_delta_source="encoder") a per-sample
+               Omega(t)/Delta(t) pulse shape (see LatentToLocalField)
             3. Evolve the Rydberg register (qlayer)
             4. Project Pauli-Z expectations/probabilities back to latent
                dimension
@@ -746,7 +873,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         old_shape = z.shape
         z_flat = z.flatten(1)
 
-        combined = to_quantum_layer(z_flat)  # [batch, n_atoms + 1] -- (x, lam)
+        combined = to_quantum_layer(z_flat)  # (x, lam[, omega_seg, delta_seg]) -- see LatentToLocalField
 
         combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
         readout = self.qlayer(combined)
