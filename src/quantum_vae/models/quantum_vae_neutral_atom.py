@@ -27,9 +27,12 @@ Parameter tiers:
       register_um, r0_um, C6, evolution_time_us, n_segments. Set once,
       never trained, never touched by the classical encoder.
     - Trainable physics parameters (NeutralAtomPulseLayer): Omega0_MHz,
-      Delta0_MHz, lam. Few, global, learned like ordinary model weights.
-    - Per-sample input x (LatentToLocalField's output): computed fresh
-      every forward pass. Not a parameter -- this is the model's input.
+      Delta0_MHz. Few, global, learned like ordinary model weights.
+    - Per-sample input x and lam (LatentToLocalField's output): computed
+      fresh every forward pass. Not parameters -- lam is a single scalar
+      per sample, constant for the whole evolution window (local-detuning
+      hardware cannot modulate the field's amplitude in time within one
+      shot; only the global drive Omega0(t)/Delta0(t) can be time-shaped).
 
 Hardware scope:
     - encoding="local_detuning" (Path A) only. Path B (data modulating
@@ -144,7 +147,7 @@ class NeutralAtomDeviceConfig:
     # product of n_clusters separate n_atoms-atom registers, all evolving
     # under the SAME shared Omega0_MHz/Delta0_MHz/lam (this is what "one
     # physical register, shared global control fields" forces physically:
-    # there is only one Omega(t)/Delta(t)/lam(t) hitting the entire
+    # there is only one Omega(t)/Delta(t)/lam hitting the entire
     # register). Only x (the per-atom local pattern) differs per cluster.
     # Classically this costs O(n_clusters) to simulate, not O(4^(n_atoms*
     # n_clusters)) -- clusters never share a joint state vector. Default 1
@@ -328,13 +331,13 @@ class LatentToLocalField(nn.Module):
        columns -- there is no per-cluster specialization in the mapping
        itself yet ("local" routing, spatially partitioning the latent
        across clusters, is reserved for later).
-    lam: n_segments values, a per-segment gate on how strongly x matters
-         at each pulse-shaping window (the pseudo-reuploading channel).
-         ONE shared lam for every cluster within a sample -- physically
-         forced, since all clusters sit under the same shared time-
-         envelope (see NeutralAtomDeviceConfig.n_clusters).
+    lam: one value, a global scale on how strongly x matters, constant
+         for the whole evolution window. ONE shared lam for every cluster
+         within a sample -- physically forced, since all clusters sit
+         under the same shared time-envelope (see
+         NeutralAtomDeviceConfig.n_clusters).
 
-    Returned as ONE concatenated [batch, n_atoms*n_clusters + n_segments]
+    Returned as ONE concatenated [batch, n_atoms*n_clusters + 1]
     tensor, not a tuple -- this keeps the single-tensor-in/single-tensor-out
     contract AnsatzClassifierPipelineBase (shared with the gate-model
     classifier) already assumes; NeutralAtomPulseLayer splits it back
@@ -347,38 +350,32 @@ class LatentToLocalField(nn.Module):
     def __init__(self, latent_dim: int, n_atoms: int, n_segments: int, n_clusters: int = 1):
         super().__init__()
         self.n_atoms = n_atoms
-        self.n_segments = n_segments
+        self.n_segments = n_segments  # kept for signature compat; unused (lam is a single scalar)
         self.n_clusters = n_clusters
-        self.proj = nn.Linear(latent_dim, n_atoms * n_clusters + n_segments)
+        self.proj = nn.Linear(latent_dim, n_atoms * n_clusters + 1)
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
-        return self.proj(z_flat)   # [batch, n_atoms*n_clusters + n_segments]
+        return self.proj(z_flat)   # [batch, n_atoms*n_clusters + 1]
 
 
 class NeutralAtomPulseLayer(nn.Module):
     """Trainable neutral-atom pulse program: H_interaction + H_drive + H_local.
 
-    H(t) = H_interaction + H_drive(t) + H_local(x, lam, t)
+    H(t) = H_interaction + H_drive(t) + H_local(x, lam)
         H_drive(t) = Omega0(t)/2 * sum_i sigma_x_i - Delta0(t) * sum_i n_i
-        H_local(x, lam, t) = sum_i V0_i * (1 + lam(t) * x_i) * n_i
+        H_local(x, lam) = sum_i V0_i * (1 + lam * x_i) * n_i
 
     Omega0(t) and Delta0(t) are piecewise-constant over n_segments
     windows, each with its own independently trained value
     (Omega0_MHz[k], Delta0_MHz[k]) -- pure pulse shaping, shared across
-    every sample, no different in kind from your collaborator's own
-    slide-12 pulse schedule.
+    every sample.
 
-    lam(t) is also piecewise-constant over the same n_segments windows,
-    but lam itself comes from the ENCODER (LatentToLocalField's output),
-    not from a trainable parameter here -- the same x gets re-exposed to
-    a different, per-sample lam_k at each window, structurally the pulse
-    analogue of gate-model data re-uploading ("encode -> trainable layer
-    -> encode -> trainable layer -> ..."), except what varies per
-    repetition is the (per-sample) weight on x, not x itself. x's
-    spatial pattern across atoms never changes -- only its shared,
-    time-varying, per-sample scale does, which is what keeps this legal
-    under local detuning's hardware constraint (spatial pattern fixed
-    for the whole program, only the shared envelope may vary in time).
+    lam is constant for the whole evolution window: it comes from the
+    ENCODER (LatentToLocalField's output), one scalar per sample, not
+    from a trainable parameter here. It cannot vary with t -- the
+    local-detuning field's amplitude is not independently time-shapeable
+    on the target hardware within a single shot; only the global drive
+    Omega0(t)/Delta0(t) can be.
 
     Trainable: Omega0_MHz, Delta0_MHz (each n_segments-length vectors).
     NOT trainable here: lam -- it's an encoder output, passed into
@@ -484,14 +481,13 @@ class NeutralAtomPulseLayer(nn.Module):
 
         @qml.qnode(dev, interface="jax")
         def circuit(x, lam, Omega0_MHz, Delta0_MHz):
-            # H_local's per-atom coefficient: V0_i * (1 + lam(t) * x_i).
-            # lam is captured directly from this function's own argument
-            # (a traced JAX value, differentiable exactly like any other),
-            # not threaded through qml.evolve's params list -- that list
-            # requires every entry to collapse to one homogeneous array,
-            # and (x_i, lam) would mix a scalar with an n_segments-length
-            # vector in one slot, which PennyLane rejects. x_i alone
-            # still goes through qml.evolve's params normally.
+            # H_local's per-atom coefficient: V0_i * (1 + lam * x_i). lam
+            # is constant for the whole evolution (a per-sample scalar,
+            # not a function of t) and is captured directly from this
+            # function's own argument (a traced JAX value, differentiable
+            # like any other), rather than threaded through qml.evolve's
+            # params list alongside x. x_i alone still goes through
+            # qml.evolve's params normally.
             # H_local = sum_i 2*pi * V_i(x) * n_i, matching the conventions
             # rydberg_interaction and rydberg_drive already use:
             #   - coefficients are MHz and carry an explicit 2*pi to reach
@@ -503,8 +499,7 @@ class NeutralAtomPulseLayer(nn.Module):
             # global phase and is dropped, leaving -pi * V_i on Z_i.
             def make_local_coeff(i):
                 def f(p, t):
-                    lam_t = qml.pulse.pwc((0, T))(lam, t)
-                    return -np.pi * V0_np[i] * (1.0 + lam_t * p)
+                    return -np.pi * V0_np[i] * (1.0 + lam * p)
                 return f
 
             local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
@@ -552,14 +547,15 @@ class NeutralAtomPulseLayer(nn.Module):
         across all n_clusters independent registers.
 
         Args:
-            combined: [batch, n_atoms*n_clusters + n_segments] -- x (first
+            combined: [batch, n_atoms*n_clusters + 1] -- x (first
                n_atoms*n_clusters columns, cluster-major: cluster 0's
                n_atoms columns, then cluster 1's, etc.) and lam (last
-               n_segments columns, shared across every cluster within a
-               sample) packed into one tensor, exactly as
-               LatentToLocalField produces. Cast to float32 if not
-               already -- a no-op in the common case, since float32 is
-               both torch's default and this layer's required dtype.
+               column, one scalar per sample, shared across every
+               cluster within that sample) packed into one tensor,
+               exactly as LatentToLocalField produces. Cast to float32
+               if not already -- a no-op in the common case, since
+               float32 is both torch's default and this layer's
+               required dtype.
 
         Returns:
             [batch, measurement_dim] readout, all clusters concatenated
@@ -580,7 +576,7 @@ class NeutralAtomPulseLayer(nn.Module):
         n_atoms = self.n_atoms
 
         x = combined[:, : n_atoms * n_clusters].contiguous()
-        lam = combined[:, n_atoms * n_clusters :].contiguous()
+        lam = combined[:, n_atoms * n_clusters :].squeeze(-1).contiguous()
 
         # The vmap'd qnode only ever sees a flat collection of
         # independent simulations -- it has no notion of "cluster" at
@@ -592,8 +588,8 @@ class NeutralAtomPulseLayer(nn.Module):
         # exact single-vmap pattern already validated for the
         # non-clustered (n_clusters=1) case. lam is the same for every
         # cluster within a sample, so repeat_interleave duplicates each
-        # sample's lam n_clusters times consecutively, matching x's
-        # cluster-major flat ordering exactly.
+        # sample's lam scalar n_clusters times consecutively, matching
+        # x's cluster-major flat ordering exactly.
         x_flat = x.reshape(batch_size * n_clusters, n_atoms)
         lam_flat = lam.repeat_interleave(n_clusters, dim=0)
 
@@ -665,9 +661,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
     Strategy:
         1. Encode input -> latent z via HF AutoencoderKL encoder
-        2. Project z to one local-detuning value per atom (x)
+        2. Project z to one local-detuning value per atom (x) and one
+           global scale (lam)
         3. Evolve the Rydberg register under interaction + global drive +
-           V0(1+lam*x) local field for a fixed time window (qlayer)
+           V0(1+lam*x) local field, lam constant for the fixed time
+           window (qlayer)
         4. Project the resulting per-atom Pauli-Z expectations back to
            the latent dimension
         5. Decode from latent via HF decoder
@@ -726,9 +724,9 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         Flow:
             1. Flatten latent z
-            2. Project to (x, lam) -- the per-atom pattern and the
-               per-segment gate on how strongly it matters at each
-               pulse-shaping window (see LatentToLocalField)
+            2. Project to (x, lam) -- the per-atom pattern and a single
+               per-sample scalar gate on how strongly it matters overall
+               (see LatentToLocalField)
             3. Evolve the Rydberg register (qlayer)
             4. Project Pauli-Z expectations/probabilities back to latent
                dimension
@@ -748,7 +746,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         old_shape = z.shape
         z_flat = z.flatten(1)
 
-        combined = to_quantum_layer(z_flat)  # [batch, n_atoms + n_segments] -- (x, lam)
+        combined = to_quantum_layer(z_flat)  # [batch, n_atoms + 1] -- (x, lam)
 
         combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
         readout = self.qlayer(combined)

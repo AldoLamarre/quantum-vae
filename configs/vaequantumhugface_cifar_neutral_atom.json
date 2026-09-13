@@ -6,13 +6,13 @@
     "root": "data",
     "batch_size":128
   },
-  "n_atoms": 4,
-  "n_clusters": 16,
+  "n_atoms": 8,
+  "n_clusters": 1,
   "measurement_kind": "probability",
   "register_geometry": "chain",
   "atom_spacing_um": 8.0,
   "evolution_time_us": 4.0,
-  "n_segments": 1,
+  "n_segments": 8,
   "model": {
     "in_channels": 3,
     "out_channels": 3,
@@ -35,7 +35,8 @@
   },
   "training": {
     "image_range": "0_1",
-    "loss_type": "lpips",
+    "loss_type": "l1",
+    "perceptual_weight": 1000,
     "kl_weight": 1e-08,
     "noise_after_epoch": 6,
     "noise_std": 0.1,
