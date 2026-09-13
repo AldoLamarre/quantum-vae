@@ -10,6 +10,12 @@ Physical picture
     H_drive(t)    = Omega0/2 * sum_i sigma_x_i - Delta0 * sum_i n_i
     H_local(x)    = sum_i V_i(x) * n_i,  V_i(x) = V0_i * (1 + lam * x_i)
 
+All three terms follow PennyLane's Rydberg conventions: coefficients are
+given in MHz and multiplied by 2*pi to reach angular frequency, and
+n_i = (I_i - Z_i) / 2. H_local is built by hand rather than via
+rydberg_drive (which only exposes a global detuning), so it applies
+those factors explicitly -- see _build_qnode.
+
 H_local's functional form is the standard linearization of the Rydberg
 van der Waals interaction under a small positional perturbation delta_r
 (V(delta_r) = V0 * (1 - (6/r0) * delta_r), V0 = C6/r0^6): the
@@ -486,10 +492,19 @@ class NeutralAtomPulseLayer(nn.Module):
             # and (x_i, lam) would mix a scalar with an n_segments-length
             # vector in one slot, which PennyLane rejects. x_i alone
             # still goes through qml.evolve's params normally.
+            # H_local = sum_i 2*pi * V_i(x) * n_i, matching the conventions
+            # rydberg_interaction and rydberg_drive already use:
+            #   - coefficients are MHz and carry an explicit 2*pi to reach
+            #     angular frequency (rydberg_interaction applies the same
+            #     factor to C6/R^6),
+            #   - n_i = (I_i - Z_i) / 2.
+            # Expanding: 2*pi * V_i * n_i = pi * V_i * I_i - pi * V_i * Z_i.
+            # The identity part is a c-number, so it contributes only a
+            # global phase and is dropped, leaving -pi * V_i on Z_i.
             def make_local_coeff(i):
                 def f(p, t):
                     lam_t = qml.pulse.pwc((0, T))(lam, t)
-                    return V0_np[i] * (1.0 + lam_t * p)
+                    return -np.pi * V0_np[i] * (1.0 + lam_t * p)
                 return f
 
             local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
