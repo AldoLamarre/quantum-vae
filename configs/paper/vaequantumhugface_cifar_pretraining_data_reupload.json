@@ -30,7 +30,8 @@
   },
   "training": {
     "image_range": "0_1",
-    "loss_type": "lpips",
+    "loss_type": "l1",
+    "perceptual_weight": 0.001,
     "kl_weight": 1e-08,
     "noise_after_epoch": 6,
     "noise_std": 0.1,

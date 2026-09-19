@@ -33,6 +33,10 @@ Parameter tiers:
       per sample, constant for the whole evolution window (local-detuning
       hardware cannot modulate the field's amplitude in time within one
       shot; only the global drive Omega0(t)/Delta0(t) can be time-shaped).
+      The value actually used is lam_pulseqpu + lam_encoder: a fixed,
+      non-trainable floor (NeutralAtomPulseLayer.lam_pulseqpu) added to
+      the encoder's raw output at forward time, so x's effect on the
+      circuit is never zero at initialization.
 
 Hardware amplitude limits (Aquila, in units of 2*pi MHz -- see
 AQUILA_OMEGA_MAX_MHZ / AQUILA_DELTA_MAX_MHZ / AQUILA_LOCAL_DETUNING_MAX_MHZ
@@ -173,6 +177,13 @@ class NeutralAtomDeviceConfig:
     # n_clusters)) -- clusters never share a joint state vector. Default 1
     # reproduces every existing config's exact behavior.
     n_clusters: int = 1
+    # Diagnostic/ablation switch. True (default): Omega0/Delta0/V_i(x) are
+    # soft-bounded to the Aquila limits via sigmoid/tanh (see class
+    # docstring). False: skip the bound entirely, raw values used as-is --
+    # for isolating whether the bound itself is responsible for a training
+    # regression, not a supported deployment mode (values are no longer
+    # guaranteed physical).
+    bound_pulse_params: bool = True
     # "global": each cluster's x comes from an unrestricted linear
     # projection of the ENTIRE flattened latent (today's LatentToLocalField,
     # just widened and repeated per cluster) -- no assumption that the
@@ -251,6 +262,7 @@ class NeutralAtomDeviceConfig:
         n_clusters: int = 1,
         cluster_routing: Literal["global", "local"] = "global",
         omega_delta_source: Literal["trainable", "encoder"] = "trainable",
+        bound_pulse_params: bool = True,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -268,6 +280,7 @@ class NeutralAtomDeviceConfig:
             n_clusters=n_clusters,
             cluster_routing=cluster_routing,
             omega_delta_source=omega_delta_source,
+            bound_pulse_params=bound_pulse_params,
         )
 
 
@@ -462,12 +475,29 @@ class NeutralAtomPulseLayer(nn.Module):
         V0 = device.C6 / (device.r0_um ** 6)
         self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
 
+        # Fixed, non-trainable floor added to lam at forward time so the
+        # encoder's contribution is never exactly zero at init (avoids a
+        # zero-init deadlock between x and lam). Non-trainable so it can't
+        # be cancelled by lam_encoder's own bias drifting to offset it.
+        self.register_buffer("lam_pulseqpu", torch.tensor(1e-4, dtype=torch.float32))
+
         # Trainable physics parameters (tier 2): per-segment pulse shape,
         # shared across every sample. Only built when trainable here --
         # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
         # forward() instead. lam is NOT here either way -- see class docstring.
         if self.omega_delta_source == "trainable":
-            self.Omega0_MHz = nn.Parameter(torch.ones(device.n_segments, dtype=torch.float32))
+            omega0_target = 1.0
+            if device.bound_pulse_params:
+                # Raw init is the logit of (target / AQUILA_OMEGA_MAX_MHZ),
+                # so the bounded value (AQUILA_OMEGA_MAX_MHZ * sigmoid(raw))
+                # starts at target=1.0, matching the pre-clamp default
+                # instead of jumping to ~1.83 at raw=1.0.
+                omega0_p = omega0_target / AQUILA_OMEGA_MAX_MHZ
+                omega0_init = float(np.log(omega0_p / (1.0 - omega0_p)))
+            else:
+                # No sigmoid downstream -- init directly at the target.
+                omega0_init = omega0_target
+            self.Omega0_MHz = nn.Parameter(torch.full((device.n_segments,), omega0_init, dtype=torch.float32))
             self.Delta0_MHz = nn.Parameter(torch.zeros(device.n_segments, dtype=torch.float32))
         else:
             self.Omega0_MHz = None
@@ -518,6 +548,7 @@ class NeutralAtomPulseLayer(nn.Module):
         wires = self.wires
         T = self.device_cfg.evolution_time_us
         V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
+        bound_pulse_params = self.device_cfg.bound_pulse_params
         measurement_kind = self.device_cfg.measurement_kind
         correlator_order = 1 if measurement_kind == "expectation" else self.device_cfg.correlator_order
 
@@ -571,11 +602,12 @@ class NeutralAtomPulseLayer(nn.Module):
             def make_local_coeff(i):
                 def f(p, t):
                     v_i = V0_np[i] * (1.0 + lam * p)
-                    # Soft-bound to Aquila's local-detuning magnitude
-                    # limit (tanh saturates smoothly at the physical
-                    # bound instead of a hard clamp, keeping gradients
-                    # flowing when v_i is pushed past it).
-                    v_i = AQUILA_LOCAL_DETUNING_MAX_MHZ * jnp.tanh(v_i / AQUILA_LOCAL_DETUNING_MAX_MHZ)
+                    if bound_pulse_params:
+                        # Soft-bound to Aquila's local-detuning magnitude
+                        # limit (tanh saturates smoothly at the physical
+                        # bound instead of a hard clamp, keeping gradients
+                        # flowing when v_i is pushed past it).
+                        v_i = AQUILA_LOCAL_DETUNING_MAX_MHZ * jnp.tanh(v_i / AQUILA_LOCAL_DETUNING_MAX_MHZ)
                     return -np.pi * v_i
                 return f
 
@@ -674,6 +706,7 @@ class NeutralAtomPulseLayer(nn.Module):
         # times consecutively, matching x's cluster-major flat ordering.
         x_flat = x.reshape(batch_size * n_clusters, n_atoms)
         lam_flat = lam.repeat_interleave(n_clusters, dim=0)
+        lam_flat = lam_flat + self.lam_pulseqpu
 
         if self.omega_delta_source == "encoder":
             offset = n_atoms * n_clusters + 1
@@ -685,14 +718,18 @@ class NeutralAtomPulseLayer(nn.Module):
             Omega0_MHz = self.Omega0_MHz
             Delta0_MHz = self.Delta0_MHz
 
-        # Soft-bound to Aquila's global drive limits (tanh/sigmoid
-        # saturate smoothly at the physical bound instead of a hard
-        # clamp, keeping gradients flowing past it). Applied here so it
-        # covers both omega_delta_source modes uniformly -- a raw
-        # trainable parameter or a raw encoder output, either way what
-        # reaches the physics is bounded.
-        Omega0_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz)
-        Delta0_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz)
+        if self.device_cfg.bound_pulse_params:
+            # Soft-bound to Aquila's global drive limits (tanh/sigmoid
+            # saturate smoothly at the physical bound instead of a hard
+            # clamp, keeping gradients flowing past it). Applied here so
+            # it covers both omega_delta_source modes uniformly -- a raw
+            # trainable parameter or a raw encoder output, either way
+            # what reaches the physics is bounded.
+            Omega0_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz)
+            Delta0_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz)
+        else:
+            Omega0_bounded = Omega0_MHz
+            Delta0_bounded = Delta0_MHz
 
         out_flat = _NeutralAtomPulseFunction.apply(
             x_flat, lam_flat, Omega0_bounded, Delta0_bounded, self._jit_forward, self._jit_backward
@@ -746,8 +783,12 @@ class NeutralAtomPulseLayer(nn.Module):
             return "[" + ", ".join(f"{v:.6f}" for v in t.detach().tolist()) + "]"
 
         if self.omega_delta_source == "trainable":
-            omega_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(self.Omega0_MHz)
-            delta_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(self.Delta0_MHz)
+            if self.device_cfg.bound_pulse_params:
+                omega_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(self.Omega0_MHz)
+                delta_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(self.Delta0_MHz)
+            else:
+                omega_bounded = self.Omega0_MHz
+                delta_bounded = self.Delta0_MHz
             omega_delta_str = (
                 f"Omega0_MHz={_fmt_vec(omega_bounded)}, "
                 f"Delta0_MHz={_fmt_vec(delta_bounded)}"
@@ -765,6 +806,7 @@ class NeutralAtomPulseLayer(nn.Module):
             + f", measurement_dim={self.measurement_dim}, "
             f"encoding={self.device_cfg.encoding}, "
             f"omega_delta_source={self.omega_delta_source}, "
+            f"bound_pulse_params={self.device_cfg.bound_pulse_params}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "

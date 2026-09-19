@@ -8,7 +8,7 @@
   },
   "n_atoms": 8,
   "register_geometry": "chain",
-  "atom_spacing_um": 8.0,
+  "atom_spacing_um": 10.0,
   "evolution_time_us": 4.0,
   "n_segments": 6,
   "model": {

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+from safetensors.torch import load_file
 
 import torch
 from transformers import TrainingArguments
@@ -138,6 +139,8 @@ class TrainerConfigParser:
                 model_kwargs["cluster_routing"] = str(cfg["cluster_routing"])
             if "omega_delta_source" in cfg:
                 model_kwargs["omega_delta_source"] = str(cfg["omega_delta_source"])
+            if "bound_pulse_params" in cfg:
+                model_kwargs["bound_pulse_params"] = bool(cfg["bound_pulse_params"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -284,7 +287,8 @@ class TrainerConfigParser:
                     "n_atoms", "register_geometry", "atom_spacing_um",
                     "r0_um", "C6", "evolution_time_us", "n_segments",
                     "measurement_kind", "correlator_order",
-                    "n_clusters", "cluster_routing", "omega_delta_source",
+                    "n_clusters", "cluster_routing",
+                    "omega_delta_source", "bound_pulse_params",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -376,7 +380,7 @@ class TrainerConfigParser:
                         "Fix the path/registry key, or remove base_checkpoint/checkpoint from the "
                         "config to train from scratch."
                     )
-                state = torch.load(checkpoint_path, map_location="cpu")
+                state = load_file(str(checkpoint_path))
                 if isinstance(state, dict):
                     if isinstance(state.get("state_dict"), dict):
                         state = state["state_dict"]

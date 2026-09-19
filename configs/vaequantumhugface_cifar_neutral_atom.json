@@ -7,10 +7,10 @@
     "batch_size":128
   },
   "n_atoms": 8,
-  "n_clusters": 1,
+  "n_clusters": 4,
   "measurement_kind": "probability",
   "register_geometry": "chain",
-  "atom_spacing_um": 8.0,
+  "atom_spacing_um": 10.0,
   "evolution_time_us": 4.0,
   "n_segments": 8,
   "model": {
@@ -36,21 +36,22 @@
   "training": {
     "image_range": "0_1",
     "loss_type": "l1",
-    "perceptual_weight": 1000,
+    "perceptual_weight": 1,
     "kl_weight": 1e-08,
     "noise_after_epoch": 6,
     "noise_std": 0.1,
-    "num_train_epochs": 10,
-    "learning_rate": 0.001
+    "num_train_epochs": 20,
+    "learning_rate": 0.0001
   },
   "trainer": {
     "output_dir": "checkpoints/vae/vaequantumhugface_cifar_neutral_atom",
     "overwrite_output_dir": false,
     "logging_strategy": "steps",
-    "logging_steps": 25,
+    "logging_steps": 5,
     "save_strategy": "epoch",
     "save_total_limit": 2,
     "evaluation_strategy": "epoch",
-    "load_best_model_at_end": true
+    "load_best_model_at_end": true,
+    "dataloader_drop_last": true
   }
 }
