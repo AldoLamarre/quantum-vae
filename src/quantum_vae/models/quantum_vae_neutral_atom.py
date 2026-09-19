@@ -177,6 +177,13 @@ class NeutralAtomDeviceConfig:
     # n_clusters)) -- clusters never share a joint state vector. Default 1
     # reproduces every existing config's exact behavior.
     n_clusters: int = 1
+    # Diagnostic/ablation switch. True (default): Omega0/Delta0/V_i(x) are
+    # soft-bounded to the Aquila limits via sigmoid/tanh (see class
+    # docstring). False: skip the bound entirely, raw values used as-is --
+    # for isolating whether the bound itself is responsible for a training
+    # regression, not a supported deployment mode (values are no longer
+    # guaranteed physical).
+    bound_pulse_params: bool = True
     # "global": each cluster's x comes from an unrestricted linear
     # projection of the ENTIRE flattened latent (today's LatentToLocalField,
     # just widened and repeated per cluster) -- no assumption that the
@@ -491,6 +498,12 @@ class NeutralAtomPulseLayer(nn.Module):
         # V0_i = C6 / r0^6 per atom -- fixed, from geometry, not trained.
         V0 = device.C6 / (device.r0_um ** 6)
         self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
+
+        # Fixed, non-trainable floor added to lam at forward time so the
+        # encoder's contribution is never exactly zero at init (avoids a
+        # zero-init deadlock between x and lam). Non-trainable so it can't
+        # be cancelled by lam_encoder's own bias drifting to offset it.
+        self.register_buffer("lam_pulseqpu", torch.tensor(1e-4, dtype=torch.float32))
 
         # Trainable physics parameters (tier 2): per-segment pulse shape,
         # shared across every sample. Only built when trainable here --
@@ -822,6 +835,7 @@ class NeutralAtomPulseLayer(nn.Module):
             + f", measurement_dim={self.measurement_dim}, "
             f"encoding={self.device_cfg.encoding}, "
             f"omega_delta_source={self.omega_delta_source}, "
+            f"bound_pulse_params={self.device_cfg.bound_pulse_params}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
