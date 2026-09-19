@@ -141,6 +141,17 @@ class TrainerConfigParser:
                 model_kwargs["omega_delta_source"] = str(cfg["omega_delta_source"])
             if "bound_pulse_params" in cfg:
                 model_kwargs["bound_pulse_params"] = bool(cfg["bound_pulse_params"])
+            if "ode_rtol" in cfg:
+                model_kwargs["ode_rtol"] = float(cfg["ode_rtol"]) if cfg["ode_rtol"] is not None else None
+            if "ode_atol" in cfg:
+                model_kwargs["ode_atol"] = float(cfg["ode_atol"]) if cfg["ode_atol"] is not None else None
+            if "post_quantum_norm" in cfg:
+                pqn = cfg["post_quantum_norm"]
+                # Accept false/null/"off"/"none" as the explicit off-switch,
+                # since "batchnorm_gated" is now the default.
+                model_kwargs["post_quantum_norm"] = (
+                    None if pqn in (False, None, "off", "none") else str(pqn)
+                )
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -289,6 +300,7 @@ class TrainerConfigParser:
                     "measurement_kind", "correlator_order",
                     "n_clusters", "cluster_routing",
                     "omega_delta_source", "bound_pulse_params",
+                    "ode_rtol", "ode_atol", "post_quantum_norm",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -380,7 +392,7 @@ class TrainerConfigParser:
                         "Fix the path/registry key, or remove base_checkpoint/checkpoint from the "
                         "config to train from scratch."
                     )
-                state = load_file(str(checkpoint_path))
+                state = torch.load(checkpoint_path, map_location="cpu")
                 if isinstance(state, dict):
                     if isinstance(state.get("state_dict"), dict):
                         state = state["state_dict"]

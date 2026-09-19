@@ -177,13 +177,6 @@ class NeutralAtomDeviceConfig:
     # n_clusters)) -- clusters never share a joint state vector. Default 1
     # reproduces every existing config's exact behavior.
     n_clusters: int = 1
-    # Diagnostic/ablation switch. True (default): Omega0/Delta0/V_i(x) are
-    # soft-bounded to the Aquila limits via sigmoid/tanh (see class
-    # docstring). False: skip the bound entirely, raw values used as-is --
-    # for isolating whether the bound itself is responsible for a training
-    # regression, not a supported deployment mode (values are no longer
-    # guaranteed physical).
-    bound_pulse_params: bool = True
     # "global": each cluster's x comes from an unrestricted linear
     # projection of the ENTIRE flattened latent (today's LatentToLocalField,
     # just widened and repeated per cluster) -- no assumption that the
@@ -194,6 +187,24 @@ class NeutralAtomDeviceConfig:
     # since it needs LatentToLocalField to become spatially-aware rather
     # than a plain linear layer.
     cluster_routing: Literal["global", "local"] = "global"
+    # ODE solver tolerance passed to qml.evolve. None (default) reproduces
+    # today's behavior -- jax/diffrax's own default (1.4e-8), tuned for
+    # float64 despite this module running in float32. Looser values trade
+    # accuracy for real wall-clock speedup per training step; measured
+    # empirically (see quantum-vae-review.md) to stay well above 99.9%
+    # probability conservation for this Hamiltonian at the current
+    # atom_spacing_um/lam operating regime, though this should be
+    # re-checked periodically as lam and per-segment pulse shape diverge
+    # further over training.
+    ode_rtol: Optional[float] = None
+    ode_atol: Optional[float] = None
+    # Post-quantum-readout normalization, applied in process_latent() right
+    # before reshaping back to latent shape. "batchnorm_gated" (default):
+    # BatchNorm1d blended in via a learnable, zero-initialized gate -- the
+    # gate starts at 0 so this begins as an identity and only contributes
+    # once training finds it useful. Set to None to disable and reproduce
+    # pre-normalization behavior.
+    post_quantum_norm: Optional[Literal["batchnorm_gated"]] = "batchnorm_gated"
 
     def __post_init__(self):
         if self.omega_delta_source not in ("trainable", "encoder"):
@@ -263,6 +274,9 @@ class NeutralAtomDeviceConfig:
         cluster_routing: Literal["global", "local"] = "global",
         omega_delta_source: Literal["trainable", "encoder"] = "trainable",
         bound_pulse_params: bool = True,
+        ode_rtol: Optional[float] = None,
+        ode_atol: Optional[float] = None,
+        post_quantum_norm: Optional[Literal["batchnorm_gated"]] = "batchnorm_gated",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -281,6 +295,9 @@ class NeutralAtomDeviceConfig:
             cluster_routing=cluster_routing,
             omega_delta_source=omega_delta_source,
             bound_pulse_params=bound_pulse_params,
+            ode_rtol=ode_rtol,
+            ode_atol=ode_atol,
+            post_quantum_norm=post_quantum_norm,
         )
 
 
@@ -475,12 +492,6 @@ class NeutralAtomPulseLayer(nn.Module):
         V0 = device.C6 / (device.r0_um ** 6)
         self.register_buffer("V0", torch.full((device.n_atoms,), float(V0), dtype=torch.float32))
 
-        # Fixed, non-trainable floor added to lam at forward time so the
-        # encoder's contribution is never exactly zero at init (avoids a
-        # zero-init deadlock between x and lam). Non-trainable so it can't
-        # be cancelled by lam_encoder's own bias drifting to offset it.
-        self.register_buffer("lam_pulseqpu", torch.tensor(1e-4, dtype=torch.float32))
-
         # Trainable physics parameters (tier 2): per-segment pulse shape,
         # shared across every sample. Only built when trainable here --
         # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
@@ -547,6 +558,11 @@ class NeutralAtomPulseLayer(nn.Module):
         n_atoms = self.device_cfg.n_atoms
         wires = self.wires
         T = self.device_cfg.evolution_time_us
+        ode_kwargs = {}
+        if self.device_cfg.ode_rtol is not None:
+            ode_kwargs["rtol"] = self.device_cfg.ode_rtol
+        if self.device_cfg.ode_atol is not None:
+            ode_kwargs["atol"] = self.device_cfg.ode_atol
         V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
         bound_pulse_params = self.device_cfg.bound_pulse_params
         measurement_kind = self.device_cfg.measurement_kind
@@ -617,7 +633,7 @@ class NeutralAtomPulseLayer(nn.Module):
             H = H_interaction + H_drive + H_local
 
             local_params = tuple(x[i] for i in range(n_atoms))
-            qml.evolve(H)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
+            qml.evolve(H, **ode_kwargs)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
             if measurement_kind == "probability":
                 # Full computational-basis distribution, 2**n_atoms values.
                 # Hardware-native: the same single-shot Z-basis fluorescence
@@ -806,7 +822,6 @@ class NeutralAtomPulseLayer(nn.Module):
             + f", measurement_dim={self.measurement_dim}, "
             f"encoding={self.device_cfg.encoding}, "
             f"omega_delta_source={self.omega_delta_source}, "
-            f"bound_pulse_params={self.device_cfg.bound_pulse_params}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
@@ -845,6 +860,8 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         self.project_to_quantum: Optional[LatentToLocalField] = None
         self.project_from_quantum: Optional[nn.Linear] = None
+        self.post_quantum_bn: Optional[nn.BatchNorm1d] = None
+        self.post_quantum_gate: Optional[nn.Parameter] = None
 
     def _infer_quantum_torch_device(self) -> torch.device:
         # qlayer has no nn.Parameters at all when
@@ -886,6 +903,10 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         ).to(dummy.device)
         self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
+        if self.device_cfg.post_quantum_norm == "batchnorm_gated":
+            self.post_quantum_bn = nn.BatchNorm1d(latent_dim).to(dummy.device)
+            self.post_quantum_gate = nn.Parameter(torch.zeros(1, device=dummy.device))
+
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """Process latent through the neutral-atom pulse program.
 
@@ -899,7 +920,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             3. Evolve the Rydberg register (qlayer)
             4. Project Pauli-Z expectations/probabilities back to latent
                dimension
-            5. Reshape to original latent shape
+            5. Optionally blend in a per-channel BatchNorm (see
+               device.post_quantum_norm), gated by a learnable scalar
+               initialized to zero so it starts as an identity and only
+               contributes once training finds it useful.
+            6. Reshape to original latent shape
 
         Raises:
             RuntimeError: If initialize_projections() hasn't been called yet.
@@ -922,6 +947,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         readout = readout.to(from_quantum_layer.weight.device, dtype=from_quantum_layer.weight.dtype)
 
         z_quantum_flat = from_quantum_layer(readout)
+
+        if self.post_quantum_bn is not None:
+            normed = self.post_quantum_bn(z_quantum_flat)
+            z_quantum_flat = z_quantum_flat + self.post_quantum_gate * (normed - z_quantum_flat)
+
         return z_quantum_flat.reshape(old_shape)
 
     def get_latent(
