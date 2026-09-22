@@ -42,3 +42,4 @@ from .script_utils import (
     latent_outer_product,
     split_train_val,
 )
+from .grad_profiling import GradNormProfilerCallback

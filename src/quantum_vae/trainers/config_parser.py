@@ -152,6 +152,14 @@ class TrainerConfigParser:
                 model_kwargs["post_quantum_norm"] = (
                     None if pqn in (False, None, "off", "none") else str(pqn)
                 )
+            if "skip_quantum_projection" in cfg:
+                model_kwargs["skip_quantum_projection"] = bool(cfg["skip_quantum_projection"])
+            if "projection_kind" in cfg:
+                model_kwargs["projection_kind"] = str(cfg["projection_kind"])
+            if "graph_d_model" in cfg:
+                model_kwargs["graph_d_model"] = int(cfg["graph_d_model"])
+            if "pulse_init_noise_std" in cfg:
+                model_kwargs["pulse_init_noise_std"] = float(cfg["pulse_init_noise_std"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -301,6 +309,8 @@ class TrainerConfigParser:
                     "n_clusters", "cluster_routing",
                     "omega_delta_source", "bound_pulse_params",
                     "ode_rtol", "ode_atol", "post_quantum_norm",
+                    "skip_quantum_projection", "projection_kind", "graph_d_model",
+                    "pulse_init_noise_std",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -637,6 +647,16 @@ class TrainerConfigParser:
             perceptual_weight = float(parsed.training_kwargs.get("perceptual_weight", 0.0))
             noise_after_epoch = parsed.training_kwargs.get("noise_after_epoch")
             noise_std = float(parsed.training_kwargs.get("noise_std", 0.1))
+
+            # Auto-attach gradient-norm profiling for the graph-based
+            # quantum interface -- no separate config flag, keyed off the
+            # model's own projection_kind.
+            callbacks = list(trainer_kwargs.pop("callbacks", None) or [])
+            device_cfg = getattr(model, "device_cfg", None)
+            if getattr(device_cfg, "projection_kind", None) == "graph":
+                from src.quantum_vae.utils.grad_profiling import GradNormProfilerCallback
+                callbacks.append(GradNormProfilerCallback(model))
+
             return QuantumVAETrainer(
                 model=model,
                 args=training_args,
@@ -652,6 +672,7 @@ class TrainerConfigParser:
                 reconstruction_every_n_epochs=int(parsed.training_kwargs.get("reconstruction_every_n_epochs", 10)),
                 reconstruction_num_images=int(parsed.training_kwargs.get("reconstruction_num_images", 8)),
                 save_test_reconstructions=bool(parsed.training_kwargs.get("save_test_reconstructions", True)),
+                callbacks=callbacks,
                 **trainer_kwargs,
             )
         elif parsed.task_type == "latent_diffusion":

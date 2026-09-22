@@ -79,6 +79,7 @@ Implementation notes:
 from __future__ import annotations
 
 import itertools
+import warnings
 from dataclasses import dataclass
 from math import comb
 from typing import Callable, List, Literal, Optional, Sequence
@@ -212,6 +213,31 @@ class NeutralAtomDeviceConfig:
     # once training finds it useful. Set to None to disable and reproduce
     # pre-normalization behavior.
     post_quantum_norm: Optional[Literal["batchnorm_gated"]] = "batchnorm_gated"
+    # When True, process_latent() skips project_from_quantum entirely and
+    # reshapes the quantum measurement directly into latent shape (padded
+    # with zeros if measurement_dim < latent_dim), mirroring the
+    # amplitude-encoding model's parameter-free pass-through. A warning is
+    # emitted when padding is applied, so a dimension mismatch is never
+    # silent. Raises in initialize_projections() if measurement_dim >
+    # latent_dim -- truncating would discard already-computed correlators;
+    # conditioning a decoder on the excess instead is a separate, unbuilt
+    # feature.
+    skip_quantum_projection: bool = False
+    # "linear" (default): LatentToLocalField / nn.Linear, unchanged.
+    # "graph": hypergraph message-passing projections (see
+    # gnn_hypergraph_interface.py) in place of both. Requires
+    # n_clusters=1, omega_delta_source="trainable", and
+    # measurement_kind != "probability" -- see __post_init__.
+    projection_kind: Literal["linear", "graph"] = "linear"
+    # Hidden width for the graph projections. Only read when
+    # projection_kind="graph".
+    graph_d_model: int = 24
+    # Std of Gaussian noise added per-segment to Omega0_MHz/Delta0_MHz at
+    # init (only when omega_delta_source="trainable"). 0.0 (default)
+    # reproduces today's fully symmetric init (all segments identical,
+    # Delta0 at exactly zero). A small nonzero value breaks that symmetry
+    # up front instead of relying on training to do it from noise alone.
+    pulse_init_noise_std: float = 0.0
 
     def __post_init__(self):
         if self.omega_delta_source not in ("trainable", "encoder"):
@@ -253,6 +279,30 @@ class NeutralAtomDeviceConfig:
                 "-> per-pair combination rule was never validated -- it "
                 "is deliberately left unbuilt, not silently approximated."
             )
+        if self.projection_kind not in ("linear", "graph"):
+            raise ValueError(
+                f"projection_kind='{self.projection_kind}' is not "
+                "supported. Use 'linear' or 'graph'."
+            )
+        if self.projection_kind == "graph":
+            if self.n_clusters != 1:
+                raise NotImplementedError(
+                    "projection_kind='graph' requires n_clusters=1 -- the "
+                    "graph projections do not yet have a per-cluster "
+                    "output routing."
+                )
+            if self.omega_delta_source != "trainable":
+                raise NotImplementedError(
+                    "projection_kind='graph' requires "
+                    "omega_delta_source='trainable' -- the graph "
+                    "projections do not produce omega_seg/delta_seg."
+                )
+            if self.measurement_kind == "probability":
+                raise ValueError(
+                    "projection_kind='graph' does not support "
+                    "measurement_kind='probability' -- correlator "
+                    "hyperedges are not defined for a probability readout."
+                )
         if self.n_data_injections != 1:
             raise NotImplementedError(
                 f"n_data_injections={self.n_data_injections} is not "
@@ -284,6 +334,10 @@ class NeutralAtomDeviceConfig:
         ode_rtol: Optional[float] = None,
         ode_atol: Optional[float] = None,
         post_quantum_norm: Optional[Literal["batchnorm_gated"]] = "batchnorm_gated",
+        skip_quantum_projection: bool = False,
+        projection_kind: Literal["linear", "graph"] = "linear",
+        graph_d_model: int = 24,
+        pulse_init_noise_std: float = 0.0,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -305,6 +359,10 @@ class NeutralAtomDeviceConfig:
             ode_rtol=ode_rtol,
             ode_atol=ode_atol,
             post_quantum_norm=post_quantum_norm,
+            skip_quantum_projection=skip_quantum_projection,
+            projection_kind=projection_kind,
+            graph_d_model=graph_d_model,
+            pulse_init_noise_std=pulse_init_noise_std,
         )
 
 
@@ -521,8 +579,19 @@ class NeutralAtomPulseLayer(nn.Module):
             else:
                 # No sigmoid downstream -- init directly at the target.
                 omega0_init = omega0_target
-            self.Omega0_MHz = nn.Parameter(torch.full((device.n_segments,), omega0_init, dtype=torch.float32))
-            self.Delta0_MHz = nn.Parameter(torch.zeros(device.n_segments, dtype=torch.float32))
+            noise_std = device.pulse_init_noise_std
+            omega0_vals = torch.full((device.n_segments,), omega0_init, dtype=torch.float32)
+            delta0_vals = torch.zeros(device.n_segments, dtype=torch.float32)
+            if noise_std > 0.0:
+                # Break the fully symmetric init: without this, all
+                # segments start identical (Omega0) or at exactly zero
+                # (Delta0), so early training has to generate
+                # segment-to-segment asymmetry from noise alone before the
+                # pulse can become genuinely time-varying.
+                omega0_vals = omega0_vals + torch.randn(device.n_segments) * noise_std
+                delta0_vals = delta0_vals + torch.randn(device.n_segments) * noise_std
+            self.Omega0_MHz = nn.Parameter(omega0_vals)
+            self.Delta0_MHz = nn.Parameter(delta0_vals)
         else:
             self.Omega0_MHz = None
             self.Delta0_MHz = None
@@ -836,6 +905,7 @@ class NeutralAtomPulseLayer(nn.Module):
             f"encoding={self.device_cfg.encoding}, "
             f"omega_delta_source={self.omega_delta_source}, "
             f"bound_pulse_params={self.device_cfg.bound_pulse_params}, "
+            f"skip_quantum_projection={self.device_cfg.skip_quantum_projection}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
@@ -872,10 +942,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         self.n_qubits = device.n_atoms  # alias: consumed by AnsatzClassifierPipelineBase._measurement_dim()
         self._quantum_torch_device = self._infer_quantum_torch_device()
 
-        self.project_to_quantum: Optional[LatentToLocalField] = None
-        self.project_from_quantum: Optional[nn.Linear] = None
+        self.project_to_quantum: Optional[nn.Module] = None
+        self.project_from_quantum: Optional[nn.Module] = None
         self.post_quantum_bn: Optional[nn.BatchNorm1d] = None
         self.post_quantum_gate: Optional[nn.Parameter] = None
+        self.quantum_pad: int = 0
 
     def _infer_quantum_torch_device(self) -> torch.device:
         # qlayer has no nn.Parameters at all when
@@ -908,14 +979,69 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             z = posterior.mode()
             latent_dim = z.flatten(1).shape[1]
 
-        self.project_to_quantum = LatentToLocalField(
-            latent_dim,
-            self.device_cfg.n_atoms,
-            self.device_cfg.n_segments,
-            self.device_cfg.n_clusters,
-            omega_delta_source=self.device_cfg.omega_delta_source,
-        ).to(dummy.device)
-        self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
+        if self.device_cfg.projection_kind == "graph":
+            # Imported lazily: torch_geometric is only required for
+            # projection_kind="graph", not a hard dependency of this module.
+            from .gnn_hypergraph_interface import GraphLatentToLocalField
+            if z.dim() != 4:
+                raise ValueError(
+                    f"projection_kind='graph' requires a spatial [B,C,H,W] "
+                    f"latent (got shape {tuple(z.shape)}) -- the atom-token "
+                    "extractor cross-attends into the latent grid."
+                )
+            effective_order = (
+                1 if self.device_cfg.measurement_kind == "expectation"
+                else self.device_cfg.correlator_order
+            )
+            self.project_to_quantum = GraphLatentToLocalField(
+                self.device_cfg.n_atoms,
+                effective_order,
+                latent_channels=z.shape[1],
+                d_model=self.device_cfg.graph_d_model,
+                measurement_kind=self.device_cfg.measurement_kind,
+            ).to(dummy.device)
+        else:
+            self.project_to_quantum = LatentToLocalField(
+                latent_dim,
+                self.device_cfg.n_atoms,
+                self.device_cfg.n_segments,
+                self.device_cfg.n_clusters,
+                omega_delta_source=self.device_cfg.omega_delta_source,
+            ).to(dummy.device)
+
+        if self.device_cfg.skip_quantum_projection:
+            measurement_dim = self.qlayer.measurement_dim
+            if measurement_dim > latent_dim:
+                raise ValueError(
+                    f"skip_quantum_projection=True requires measurement_dim "
+                    f"({measurement_dim}) <= latent_dim ({latent_dim}) -- "
+                    "truncating would discard already-computed correlators. "
+                    "Reduce n_atoms/correlator_order/n_clusters, or disable "
+                    "skip_quantum_projection to use a learned projection instead."
+                )
+            self.quantum_pad = latent_dim - measurement_dim
+            if self.quantum_pad > 0:
+                warnings.warn(
+                    f"skip_quantum_projection: measurement_dim={measurement_dim} "
+                    f"< latent_dim={latent_dim}, padding with {self.quantum_pad} zeros.",
+                    stacklevel=2,
+                )
+            self.project_from_quantum = None
+        elif self.device_cfg.projection_kind == "graph":
+            from .gnn_hypergraph_interface import GraphQuantumToDecoderVector
+            effective_order = (
+                1 if self.device_cfg.measurement_kind == "expectation"
+                else self.device_cfg.correlator_order
+            )
+            self.project_from_quantum = GraphQuantumToDecoderVector(
+                self.device_cfg.n_atoms,
+                effective_order,
+                out_dim=latent_dim,
+                d_model=self.device_cfg.graph_d_model,
+                measurement_kind=self.device_cfg.measurement_kind,
+            ).to(dummy.device)
+        else:
+            self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
         if self.device_cfg.post_quantum_norm == "batchnorm_gated":
             self.post_quantum_bn = nn.BatchNorm1d(latent_dim).to(dummy.device)
@@ -932,8 +1058,11 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                device.omega_delta_source="encoder") a per-sample
                Omega(t)/Delta(t) pulse shape (see LatentToLocalField)
             3. Evolve the Rydberg register (qlayer)
-            4. Project Pauli-Z expectations/probabilities back to latent
-               dimension
+            4. Either project Pauli-Z expectations/probabilities back to
+               latent dimension (default), or, when
+               device.skip_quantum_projection=True, skip that learned
+               projection and reshape the (zero-padded, if needed)
+               measurement directly into latent shape instead.
             5. Optionally blend in a per-channel BatchNorm (see
                device.post_quantum_norm), gated by a learnable scalar
                initialized to zero so it starts as an identity and only
@@ -943,30 +1072,66 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         Raises:
             RuntimeError: If initialize_projections() hasn't been called yet.
         """
-        if self.project_to_quantum is None or self.project_from_quantum is None:
+        skip_projection = self.device_cfg.skip_quantum_projection
+        if self.project_to_quantum is None or (not skip_projection and self.project_from_quantum is None):
             raise RuntimeError(
                 "Projections not initialized. Call initialize_projections() "
                 "before process_latent()"
             )
         to_quantum_layer = self.project_to_quantum
-        from_quantum_layer = self.project_from_quantum
 
         old_shape = z.shape
         z_flat = z.flatten(1)
 
-        combined = to_quantum_layer(z_flat)  # (x, lam[, omega_seg, delta_seg]) -- see LatentToLocalField
+        if self.device_cfg.projection_kind == "graph":
+            x, lam, _ = to_quantum_layer(z)  # spatial latent in, unflattened
+            combined = torch.cat([x, lam.unsqueeze(-1)], dim=-1)
+        else:
+            combined = to_quantum_layer(z_flat)  # (x, lam[, omega_seg, delta_seg])
 
         combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
         readout = self.qlayer(combined)
-        readout = readout.to(from_quantum_layer.weight.device, dtype=from_quantum_layer.weight.dtype)
 
-        z_quantum_flat = from_quantum_layer(readout)
+        if skip_projection:
+            readout = readout.to(z.device, dtype=z.dtype)
+            if self.quantum_pad > 0:
+                readout = nn.functional.pad(readout, (0, self.quantum_pad))
+            z_quantum_flat = readout
+        else:
+            from_quantum_layer = self.project_from_quantum
+            ref_param = next(from_quantum_layer.parameters())
+            readout = readout.to(ref_param.device, dtype=ref_param.dtype)
+            z_quantum_flat = from_quantum_layer(readout)
 
         if self.post_quantum_bn is not None:
             normed = self.post_quantum_bn(z_quantum_flat)
             z_quantum_flat = z_quantum_flat + self.post_quantum_gate * (normed - z_quantum_flat)
 
         return z_quantum_flat.reshape(old_shape)
+
+    def get_pre_quantum_features(
+        self,
+        sample: torch.FloatTensor,
+        sample_posterior: bool = True,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        """Override of AnsatzVAEBase.get_pre_quantum_features: that base
+        method calls project_to_quantum(z.flatten(1)) directly, which
+        assumes the linear-projection contract (flat input, one combined
+        tensor out). projection_kind="graph" needs the spatial latent and
+        returns (x, lam, attn) instead -- packed here the same way
+        process_latent() does, so callers see the same combined-tensor
+        contract either way.
+        """
+        if self.device_cfg.projection_kind != "graph":
+            return super().get_pre_quantum_features(sample, sample_posterior, generator)
+
+        posterior = self.encode(sample).latent_dist
+        z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
+        if self.project_to_quantum is None or self.project_from_quantum is None:
+            self.initialize_projections(sample)
+        x, lam, _ = self.project_to_quantum(z)
+        return torch.cat([x, lam.unsqueeze(-1)], dim=-1)
 
     def get_latent(
         self,
@@ -976,7 +1141,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
     ) -> torch.Tensor:
         posterior = self.encode(sample).latent_dist
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
-        if self.project_to_quantum is None or self.project_from_quantum is None:
+        if self.project_to_quantum is None:
             self.initialize_projections(sample)
         return self.process_latent(z)
 
