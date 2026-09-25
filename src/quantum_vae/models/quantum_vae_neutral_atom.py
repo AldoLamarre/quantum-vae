@@ -238,6 +238,21 @@ class NeutralAtomDeviceConfig:
     # Delta0 at exactly zero). A small nonzero value breaks that symmetry
     # up front instead of relying on training to do it from noise alone.
     pulse_init_noise_std: float = 0.0
+    # Only read when projection_kind="graph". False (default) reproduces
+    # today's behavior: each hyperedge's embedding comes from its scalar
+    # correlator value alone (a single shared weight column, so every
+    # hyperedge's embedding sits on one line in d_model-space regardless of
+    # width -- attention in the graph layers can't tell hyperedges apart by
+    # which atoms they cover, only by value). True concatenates each
+    # hyperedge's member atoms' fixed Fourier position features (from the
+    # register's real coordinates) to the scalar value first, and adds the
+    # same per-atom features to project_to_quantum's atom queries -- see
+    # gnn_hypergraph_interface.py.
+    use_fourier_hyperedge_pos: bool = False
+    # Per-atom width of the Fourier position features above. Must be a
+    # multiple of 2 (chain register) or 4 (grid register). Only read when
+    # use_fourier_hyperedge_pos=True.
+    fourier_atom_dim: int = 4
 
     def __post_init__(self):
         if self.omega_delta_source not in ("trainable", "encoder"):
@@ -303,6 +318,12 @@ class NeutralAtomDeviceConfig:
                     "measurement_kind='probability' -- correlator "
                     "hyperedges are not defined for a probability readout."
                 )
+        if self.use_fourier_hyperedge_pos and self.projection_kind != "graph":
+            raise ValueError(
+                "use_fourier_hyperedge_pos=True requires projection_kind='graph'."
+            )
+        if self.fourier_atom_dim < 1:
+            raise ValueError(f"fourier_atom_dim={self.fourier_atom_dim} must be >= 1.")
         if self.n_data_injections != 1:
             raise NotImplementedError(
                 f"n_data_injections={self.n_data_injections} is not "
@@ -338,6 +359,8 @@ class NeutralAtomDeviceConfig:
         projection_kind: Literal["linear", "graph"] = "linear",
         graph_d_model: int = 24,
         pulse_init_noise_std: float = 0.0,
+        use_fourier_hyperedge_pos: bool = False,
+        fourier_atom_dim: int = 4,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -363,6 +386,8 @@ class NeutralAtomDeviceConfig:
             projection_kind=projection_kind,
             graph_d_model=graph_d_model,
             pulse_init_noise_std=pulse_init_noise_std,
+            use_fourier_hyperedge_pos=use_fourier_hyperedge_pos,
+            fourier_atom_dim=fourier_atom_dim,
         )
 
 
@@ -568,12 +593,12 @@ class NeutralAtomPulseLayer(nn.Module):
         # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
         # forward() instead. lam is NOT here either way -- see class docstring.
         if self.omega_delta_source == "trainable":
-            omega0_target = 1.0
+            omega0_target = 1.0  # baseline value; must stay > 0, Omega=0 has no dynamics
             if device.bound_pulse_params:
                 # Raw init is the logit of (target / AQUILA_OMEGA_MAX_MHZ),
                 # so the bounded value (AQUILA_OMEGA_MAX_MHZ * sigmoid(raw))
-                # starts at target=1.0, matching the pre-clamp default
-                # instead of jumping to ~1.83 at raw=1.0.
+                # starts at target, matching the pre-clamp default instead
+                # of jumping to a different value at raw=target.
                 omega0_p = omega0_target / AQUILA_OMEGA_MAX_MHZ
                 omega0_init = float(np.log(omega0_p / (1.0 - omega0_p)))
             else:
@@ -947,6 +972,13 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         self.post_quantum_bn: Optional[nn.BatchNorm1d] = None
         self.post_quantum_gate: Optional[nn.Parameter] = None
         self.quantum_pad: int = 0
+        # Raw circuit readout (Pauli-Z correlators, pre-projection,
+        # pre-batchnorm) from the most recent process_latent() call.
+        # Side channel for callers that want to regularize the actual
+        # quantum measurement rather than the post-processed z_quantum
+        # (e.g. QuantumVAETrainer's VICReg terms). Not part of the
+        # forward()/process_latent() return contract.
+        self._last_quantum_readout: Optional[torch.Tensor] = None
 
     def _infer_quantum_torch_device(self) -> torch.device:
         # qlayer has no nn.Parameters at all when
@@ -999,6 +1031,8 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 latent_channels=z.shape[1],
                 d_model=self.device_cfg.graph_d_model,
                 measurement_kind=self.device_cfg.measurement_kind,
+                register_um=self.device_cfg.register_um,
+                use_fourier_pos=self.device_cfg.use_fourier_hyperedge_pos,
             ).to(dummy.device)
         else:
             self.project_to_quantum = LatentToLocalField(
@@ -1039,6 +1073,9 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 out_dim=latent_dim,
                 d_model=self.device_cfg.graph_d_model,
                 measurement_kind=self.device_cfg.measurement_kind,
+                register_um=self.device_cfg.register_um,
+                use_fourier_pos=self.device_cfg.use_fourier_hyperedge_pos,
+                fourier_atom_dim=self.device_cfg.fourier_atom_dim,
             ).to(dummy.device)
         else:
             self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
@@ -1091,6 +1128,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
         readout = self.qlayer(combined)
+        self._last_quantum_readout = readout
 
         if skip_projection:
             readout = readout.to(z.device, dtype=z.dtype)

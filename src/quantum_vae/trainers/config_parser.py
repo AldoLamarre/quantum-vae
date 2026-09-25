@@ -160,6 +160,10 @@ class TrainerConfigParser:
                 model_kwargs["graph_d_model"] = int(cfg["graph_d_model"])
             if "pulse_init_noise_std" in cfg:
                 model_kwargs["pulse_init_noise_std"] = float(cfg["pulse_init_noise_std"])
+            if "use_fourier_hyperedge_pos" in cfg:
+                model_kwargs["use_fourier_hyperedge_pos"] = bool(cfg["use_fourier_hyperedge_pos"])
+            if "fourier_atom_dim" in cfg:
+                model_kwargs["fourier_atom_dim"] = int(cfg["fourier_atom_dim"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -310,7 +314,8 @@ class TrainerConfigParser:
                     "omega_delta_source", "bound_pulse_params",
                     "ode_rtol", "ode_atol", "post_quantum_norm",
                     "skip_quantum_projection", "projection_kind", "graph_d_model",
-                    "pulse_init_noise_std",
+                    "pulse_init_noise_std", "use_fourier_hyperedge_pos",
+                    "fourier_atom_dim",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -519,6 +524,12 @@ class TrainerConfigParser:
             out_path = self.project_root / out_path
         out_path.mkdir(parents=True, exist_ok=True)
 
+        # Copy the resolved config into the run folder so a checkpoint can
+        # always be traced back to the config/hyperparameters that produced
+        # it, without relying on filenames or memory.
+        with open(out_path / "run_config.json", "w") as f:
+            json.dump(parsed.raw_config, f, indent=2)
+
         epochs = int(t_kwargs.get("num_train_epochs", t_kwargs.get("epochs", 1)))
         lr = float(t_kwargs.get("learning_rate", 1e-4))
         train_bs = int(t_kwargs.get("per_device_train_batch_size", t_kwargs.get("batch_size", 32)))
@@ -647,6 +658,9 @@ class TrainerConfigParser:
             perceptual_weight = float(parsed.training_kwargs.get("perceptual_weight", 0.0))
             noise_after_epoch = parsed.training_kwargs.get("noise_after_epoch")
             noise_std = float(parsed.training_kwargs.get("noise_std", 0.1))
+            vicreg_variance_weight = float(parsed.training_kwargs.get("vicreg_variance_weight", 0.0))
+            vicreg_covariance_weight = float(parsed.training_kwargs.get("vicreg_covariance_weight", 0.0))
+            vicreg_target_std = float(parsed.training_kwargs.get("vicreg_target_std", 1.0))
 
             # Auto-attach gradient-norm profiling for the graph-based
             # quantum interface -- no separate config flag, keyed off the
@@ -672,6 +686,9 @@ class TrainerConfigParser:
                 reconstruction_every_n_epochs=int(parsed.training_kwargs.get("reconstruction_every_n_epochs", 10)),
                 reconstruction_num_images=int(parsed.training_kwargs.get("reconstruction_num_images", 8)),
                 save_test_reconstructions=bool(parsed.training_kwargs.get("save_test_reconstructions", True)),
+                vicreg_variance_weight=vicreg_variance_weight,
+                vicreg_covariance_weight=vicreg_covariance_weight,
+                vicreg_target_std=vicreg_target_std,
                 callbacks=callbacks,
                 **trainer_kwargs,
             )

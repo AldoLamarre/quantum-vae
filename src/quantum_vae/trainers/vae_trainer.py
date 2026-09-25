@@ -14,6 +14,8 @@ from torchvision.utils import make_grid, save_image
 from .base import BaseHFQuantumTrainer
 from .data_collators import VAEDataCollator
 from .evaluation import IncrementalVAEMetrics, extract_input_images, normalize_image_range
+from src.quantum_vae.losses.vicreg import variance_loss as vicreg_variance_loss
+from src.quantum_vae.losses.vicreg import covariance_loss as vicreg_covariance_loss
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
@@ -48,6 +50,9 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         reconstruction_every_n_epochs: int = 10,
         reconstruction_num_images: int = 8,
         save_test_reconstructions: bool = True,
+        vicreg_variance_weight: float = 0.0,
+        vicreg_covariance_weight: float = 0.0,
+        vicreg_target_std: float = 1.0,
         **kwargs,
     ):
         if data_collator is None:
@@ -56,6 +61,19 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.kl_weight = float(kl_weight)
         self.loss_type = str(loss_type).lower()
         self.perceptual_weight = float(perceptual_weight)
+        # VICReg-style regularizer (src/quantum_vae/losses/vicreg.py) on
+        # the model's raw quantum circuit readout (model._last_quantum_
+        # readout -- Pauli-Z correlators, pre-projection, pre-batchnorm),
+        # not on z_quantum. Variance + covariance terms only -- no
+        # invariance term, since there's no paired-view setup here;
+        # reconstruction loss already supervises that role. Direct
+        # gradient toward a non-collapsed, decorrelated quantum readout,
+        # instead of relying solely on the diluted signal that
+        # backpropagates through the decoder and reconstruction loss.
+        # Both weights default to 0.0 (disabled, matches prior behavior).
+        self.vicreg_variance_weight = float(vicreg_variance_weight)
+        self.vicreg_covariance_weight = float(vicreg_covariance_weight)
+        self.vicreg_target_std = float(vicreg_target_std)
         self.noise_after_epoch = noise_after_epoch
         self.noise_std = float(noise_std)
         self.image_range = self._normalize_image_range(image_range)
@@ -296,6 +314,23 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                 recon_loss = recon_loss + self.perceptual_weight * perceptual_term
 
             loss = recon_loss + self.kl_weight * kl_div
+
+            # Regularize the raw quantum circuit readout (Pauli-Z
+            # correlators), not z_quantum -- see losses/vicreg.py and the
+            # __init__ comment above for why. Only models exposing this
+            # side channel (currently QuantumVAENeutralAtom) are affected;
+            # absent on other variants, so this is a no-op there.
+            quantum_readout = getattr(model, "_last_quantum_readout", None)
+            if (
+                isinstance(quantum_readout, torch.Tensor)
+                and (self.vicreg_variance_weight > 0 or self.vicreg_covariance_weight > 0)
+            ):
+                readout_flat = quantum_readout.flatten(1)
+                loss = (
+                    loss
+                    + self.vicreg_variance_weight * vicreg_variance_loss(readout_flat, self.vicreg_target_std)
+                    + self.vicreg_covariance_weight * vicreg_covariance_loss(readout_flat)
+                )
 
         outputs = {
             "loss": loss,
