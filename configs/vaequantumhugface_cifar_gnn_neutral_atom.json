@@ -21,6 +21,11 @@
   "pulse_init_noise_std": 0.05,
   "use_fourier_hyperedge_pos": true,
   "fourier_atom_dim": 4,
+  "lam_offset": 1.0,
+  "lam_span": 0.5,
+  "atom_token_mode": "spatial",
+  "graph_residual": true,
+  "post_quantum_gate_init": 0.0,
   "model": {
     "in_channels": 3,
     "out_channels": 3,
@@ -48,7 +53,7 @@
     "kl_weight": 1e-08,
     "noise_after_epoch": 6,
     "noise_std": 0.1,
-    "num_train_epochs": 20,
+    "num_train_epochs": 40,
     "learning_rate": 0.0001
   },
   "trainer": {

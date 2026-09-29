@@ -164,6 +164,20 @@ class TrainerConfigParser:
                 model_kwargs["use_fourier_hyperedge_pos"] = bool(cfg["use_fourier_hyperedge_pos"])
             if "fourier_atom_dim" in cfg:
                 model_kwargs["fourier_atom_dim"] = int(cfg["fourier_atom_dim"])
+            if "lam_offset" in cfg:
+                model_kwargs["lam_offset"] = float(cfg["lam_offset"])
+            if "lam_span" in cfg:
+                model_kwargs["lam_span"] = float(cfg["lam_span"]) if cfg["lam_span"] is not None else None
+            if "atom_token_mode" in cfg:
+                model_kwargs["atom_token_mode"] = str(cfg["atom_token_mode"])
+            if "graph_residual" in cfg:
+                model_kwargs["graph_residual"] = bool(cfg["graph_residual"])
+            if "post_quantum_gate_init" in cfg:
+                model_kwargs["post_quantum_gate_init"] = float(cfg["post_quantum_gate_init"])
+            if "pre_quantum_norm" in cfg:
+                model_kwargs["pre_quantum_norm"] = cfg["pre_quantum_norm"]
+            if "pre_quantum_gain" in cfg:
+                model_kwargs["pre_quantum_gain"] = float(cfg["pre_quantum_gain"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -315,7 +329,9 @@ class TrainerConfigParser:
                     "ode_rtol", "ode_atol", "post_quantum_norm",
                     "skip_quantum_projection", "projection_kind", "graph_d_model",
                     "pulse_init_noise_std", "use_fourier_hyperedge_pos",
-                    "fourier_atom_dim",
+                    "fourier_atom_dim", "lam_offset", "lam_span",
+                    "atom_token_mode", "graph_residual", "post_quantum_gate_init",
+                    "pre_quantum_norm", "pre_quantum_gain",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

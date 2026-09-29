@@ -34,9 +34,10 @@ Parameter tiers:
       hardware cannot modulate the field's amplitude in time within one
       shot; only the global drive Omega0(t)/Delta0(t) can be time-shaped).
       The value actually used is lam_pulseqpu + lam_encoder: a fixed,
-      non-trainable floor (NeutralAtomPulseLayer.lam_pulseqpu) added to
-      the encoder's raw output at forward time, so x's effect on the
-      circuit is never zero at initialization.
+      non-trainable offset (NeutralAtomPulseLayer.lam_pulseqpu, set by
+      lam_offset) added to the encoder's raw output at forward time, so
+      x's effect on the circuit is never zero at initialization. With
+      lam_span set, lam = lam_pulseqpu + lam_span * tanh(lam_encoder).
 
 Hardware amplitude limits (Aquila, in units of 2*pi MHz -- see
 AQUILA_OMEGA_MAX_MHZ / AQUILA_DELTA_MAX_MHZ / AQUILA_LOCAL_DETUNING_MAX_MHZ
@@ -253,8 +254,52 @@ class NeutralAtomDeviceConfig:
     # multiple of 2 (chain register) or 4 (grid register). Only read when
     # use_fourier_hyperedge_pos=True.
     fourier_atom_dim: int = 4
+    # lam = lam_offset + lam_span * tanh(lam_encoder) when lam_span is set,
+    # otherwise lam_offset + lam_encoder. lam_offset > lam_span keeps lam
+    # bounded away from zero.
+    lam_offset: float = 1e-4
+    lam_span: Optional[float] = None
+    # Graph projections only. "attention": learned queries cross-attend the
+    # latent grid. "spatial": each atom reads the latent region at its
+    # register position.
+    atom_token_mode: Literal["attention", "spatial"] = "attention"
+    # Graph projections only: residual connection around each hypergraph layer.
+    graph_residual: bool = False
+    # Initial value of the post-quantum BatchNorm gate (0.0 = identity at init).
+    post_quantum_gate_init: float = 0.0
+    # Graph projections only. "batchnorm": normalize the x logits across the
+    # batch and rescale by pre_quantum_gain (fixed) before the sigmoid.
+    pre_quantum_norm: Optional[str] = None
+    pre_quantum_gain: float = 0.4
 
     def __post_init__(self):
+        if self.lam_span is not None:
+            if self.lam_span <= 0.0:
+                raise ValueError(f"lam_span={self.lam_span} must be > 0.")
+            if self.lam_offset <= self.lam_span:
+                raise ValueError(
+                    f"lam_offset={self.lam_offset} must exceed lam_span={self.lam_span} "
+                    "so lam cannot reach zero."
+                )
+        if self.atom_token_mode not in ("attention", "spatial"):
+            raise ValueError(
+                f"atom_token_mode='{self.atom_token_mode}' is not supported. "
+                "Use 'attention' or 'spatial'."
+            )
+        if self.projection_kind != "graph" and (
+            self.atom_token_mode != "attention" or self.graph_residual
+        ):
+            raise ValueError(
+                "atom_token_mode='spatial' and graph_residual=True require projection_kind='graph'."
+            )
+        if self.pre_quantum_norm not in (None, "batchnorm"):
+            raise ValueError(
+                f"pre_quantum_norm='{self.pre_quantum_norm}' is not supported. Use None or 'batchnorm'."
+            )
+        if self.pre_quantum_norm is not None and self.projection_kind != "graph":
+            raise ValueError("pre_quantum_norm requires projection_kind='graph'.")
+        if self.pre_quantum_gain <= 0.0:
+            raise ValueError(f"pre_quantum_gain={self.pre_quantum_gain} must be > 0.")
         if self.omega_delta_source not in ("trainable", "encoder"):
             raise ValueError(
                 f"omega_delta_source='{self.omega_delta_source}' is not "
@@ -361,6 +406,13 @@ class NeutralAtomDeviceConfig:
         pulse_init_noise_std: float = 0.0,
         use_fourier_hyperedge_pos: bool = False,
         fourier_atom_dim: int = 4,
+        lam_offset: float = 1e-4,
+        lam_span: Optional[float] = None,
+        atom_token_mode: Literal["attention", "spatial"] = "attention",
+        graph_residual: bool = False,
+        post_quantum_gate_init: float = 0.0,
+        pre_quantum_norm: Optional[str] = None,
+        pre_quantum_gain: float = 0.4,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -388,6 +440,13 @@ class NeutralAtomDeviceConfig:
             pulse_init_noise_std=pulse_init_noise_std,
             use_fourier_hyperedge_pos=use_fourier_hyperedge_pos,
             fourier_atom_dim=fourier_atom_dim,
+            lam_offset=lam_offset,
+            lam_span=lam_span,
+            atom_token_mode=atom_token_mode,
+            graph_residual=graph_residual,
+            post_quantum_gate_init=post_quantum_gate_init,
+            pre_quantum_norm=pre_quantum_norm,
+            pre_quantum_gain=pre_quantum_gain,
         )
 
 
@@ -586,7 +645,8 @@ class NeutralAtomPulseLayer(nn.Module):
         # encoder's contribution is never exactly zero at init (avoids a
         # zero-init deadlock between x and lam). Non-trainable so it can't
         # be cancelled by lam_encoder's own bias drifting to offset it.
-        self.register_buffer("lam_pulseqpu", torch.tensor(1e-4, dtype=torch.float32))
+        self.register_buffer("lam_pulseqpu", torch.tensor(device.lam_offset, dtype=torch.float32))
+        self.lam_span = device.lam_span
 
         # Trainable physics parameters (tier 2): per-segment pulse shape,
         # shared across every sample. Only built when trainable here --
@@ -829,7 +889,11 @@ class NeutralAtomPulseLayer(nn.Module):
         # times consecutively, matching x's cluster-major flat ordering.
         x_flat = x.reshape(batch_size * n_clusters, n_atoms)
         lam_flat = lam.repeat_interleave(n_clusters, dim=0)
-        lam_flat = lam_flat + self.lam_pulseqpu
+        if self.lam_span is not None:
+            # Bounded to [lam_offset - lam_span, lam_offset + lam_span].
+            lam_flat = self.lam_pulseqpu + self.lam_span * torch.tanh(lam_flat)
+        else:
+            lam_flat = lam_flat + self.lam_pulseqpu
 
         if self.omega_delta_source == "encoder":
             offset = n_atoms * n_clusters + 1
@@ -933,6 +997,8 @@ class NeutralAtomPulseLayer(nn.Module):
             f"skip_quantum_projection={self.device_cfg.skip_quantum_projection}, "
             f"n_data_injections={self.device_cfg.n_data_injections}, "
             f"r0_um={self.device_cfg.r0_um}, "
+            f"lam_offset={self.device_cfg.lam_offset}, "
+            f"lam_span={self.device_cfg.lam_span}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
             + omega_delta_str
         )
@@ -1033,6 +1099,10 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 measurement_kind=self.device_cfg.measurement_kind,
                 register_um=self.device_cfg.register_um,
                 use_fourier_pos=self.device_cfg.use_fourier_hyperedge_pos,
+                atom_token_mode=self.device_cfg.atom_token_mode,
+                residual=self.device_cfg.graph_residual,
+                pre_quantum_norm=self.device_cfg.pre_quantum_norm,
+                pre_quantum_gain=self.device_cfg.pre_quantum_gain,
             ).to(dummy.device)
         else:
             self.project_to_quantum = LatentToLocalField(
@@ -1076,13 +1146,16 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 register_um=self.device_cfg.register_um,
                 use_fourier_pos=self.device_cfg.use_fourier_hyperedge_pos,
                 fourier_atom_dim=self.device_cfg.fourier_atom_dim,
+                residual=self.device_cfg.graph_residual,
             ).to(dummy.device)
         else:
             self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
 
         if self.device_cfg.post_quantum_norm == "batchnorm_gated":
             self.post_quantum_bn = nn.BatchNorm1d(latent_dim).to(dummy.device)
-            self.post_quantum_gate = nn.Parameter(torch.zeros(1, device=dummy.device))
+            self.post_quantum_gate = nn.Parameter(
+                torch.full((1,), float(self.device_cfg.post_quantum_gate_init), device=dummy.device)
+            )
 
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
         """Process latent through the neutral-atom pulse program.

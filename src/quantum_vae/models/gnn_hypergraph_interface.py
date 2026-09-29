@@ -8,10 +8,11 @@ same enumeration order as _correlator_ops in quantum_vae_neutral_atom.py.
 Batched via block-diagonal graph construction (no Python loop over batch).
 """
 import itertools
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.nn import HypergraphConv
 from torch_geometric.nn.aggr import AttentionalAggregation
 
@@ -153,6 +154,39 @@ class LatentToAtomTokens(nn.Module):
         return atom_tokens, attn_weights
 
 
+def register_grid_index(register_um: Sequence[Sequence[float]]):
+    """(n_rows, n_cols, row_idx, col_idx) placing each atom on the grid
+    spanned by the register's distinct y and x coordinates.
+    """
+    coords = torch.as_tensor(register_um, dtype=torch.float32)
+    xs = torch.unique(coords[:, 0])
+    ys = torch.unique(coords[:, 1])
+    col_idx = torch.argmin((coords[:, 0:1] - xs.unsqueeze(0)).abs(), dim=1)
+    row_idx = torch.argmin((coords[:, 1:2] - ys.unsqueeze(0)).abs(), dim=1)
+    return len(ys), len(xs), row_idx, col_idx
+
+
+class LatentToAtomPatches(nn.Module):
+    """Each atom reads the latent region at its register position: the
+    latent grid is average-pooled to the register's (rows, cols) layout,
+    and each atom takes its own cell. Gives atoms distinct inputs from
+    initialization, unlike learned-query cross-attention.
+    """
+
+    def __init__(self, register_um: Sequence[Sequence[float]], latent_channels: int, d_model: int):
+        super().__init__()
+        self.n_rows, self.n_cols, row_idx, col_idx = register_grid_index(register_um)
+        self.register_buffer("row_idx", row_idx)
+        self.register_buffer("col_idx", col_idx)
+        self.norm_tokens = nn.LayerNorm(latent_channels)
+        self.proj = nn.Linear(latent_channels, d_model)
+
+    def forward(self, z_spatial: torch.Tensor):
+        pooled = F.adaptive_avg_pool2d(z_spatial, (self.n_rows, self.n_cols))
+        tokens = pooled[:, :, self.row_idx, self.col_idx].transpose(1, 2)  # [B, n_atoms, C]
+        return self.proj(self.norm_tokens(tokens)), None
+
+
 class GraphLatentToLocalField(nn.Module):
     """Cross-attention extraction + hypergraph message passing, producing
     x_i (per-atom local-detuning weight, in [0, 1]) and lam (pooled global
@@ -163,16 +197,31 @@ class GraphLatentToLocalField(nn.Module):
     def __init__(self, n_atoms: int, correlator_order: int, latent_channels: int,
                  d_model: int = 24, measurement_kind: str = "correlators",
                  register_um: Sequence[Sequence[float]] = None,
-                 use_fourier_pos: bool = False):
+                 use_fourier_pos: bool = False, atom_token_mode: str = "attention",
+                 residual: bool = False, pre_quantum_norm: Optional[str] = None,
+                 pre_quantum_gain: float = 0.4):
         super().__init__()
         validate_measurement_kind(measurement_kind)
         self.n_atoms = n_atoms
-        atom_pos = None
-        if use_fourier_pos:
+        self.residual = residual
+        # Optional batch normalization of the x logits: fixes the across-sample
+        # spread of each atom's local field to pre_quantum_gain before the sigmoid.
+        if pre_quantum_norm not in (None, "batchnorm"):
+            raise ValueError(f"pre_quantum_norm='{pre_quantum_norm}' is not supported.")
+        self.x_norm = nn.BatchNorm1d(n_atoms, affine=False) if pre_quantum_norm == "batchnorm" else None
+        self.pre_quantum_gain = float(pre_quantum_gain)
+        self.x_shift = nn.Parameter(torch.zeros(n_atoms)) if self.x_norm is not None else None
+        if atom_token_mode == "spatial":
             if register_um is None:
-                raise ValueError("use_fourier_pos=True requires register_um.")
-            atom_pos = fourier_atom_features(register_um, d_model)
-        self.extractor = LatentToAtomTokens(n_atoms, latent_channels, d_model, atom_pos=atom_pos)
+                raise ValueError("atom_token_mode='spatial' requires register_um.")
+            self.extractor = LatentToAtomPatches(register_um, latent_channels, d_model)
+        else:
+            atom_pos = None
+            if use_fourier_pos:
+                if register_um is None:
+                    raise ValueError("use_fourier_pos=True requires register_um.")
+                atom_pos = fourier_atom_features(register_um, d_model)
+            self.extractor = LatentToAtomTokens(n_atoms, latent_channels, d_model, atom_pos=atom_pos)
         self.hyperedge_index, self.subsets = build_hyperedge_index(n_atoms, correlator_order)
         self.n_hyperedges = len(self.subsets)
         self.hconv1 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
@@ -200,12 +249,17 @@ class GraphLatentToLocalField(nn.Module):
         h = atom_tokens.reshape(B * self.n_atoms, -1)
 
         attr1 = self.hyperedge_pool(h[batched_node_idx], batched_edge_idx, dim_size=n_edges_total)
-        h = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=attr1))
+        out = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=attr1))
+        h = h + out if self.residual else out
         attr2 = self.hyperedge_pool(h[batched_node_idx], batched_edge_idx, dim_size=n_edges_total)
-        h = torch.relu(self.hconv2(h, batched_index, hyperedge_attr=attr2))
+        out = torch.relu(self.hconv2(h, batched_index, hyperedge_attr=attr2))
+        h = h + out if self.residual else out
 
         h = h.reshape(B, self.n_atoms, -1)
-        x = torch.sigmoid(self.x_layer(h)).squeeze(-1)
+        x_logit = self.x_layer(h).squeeze(-1)
+        if self.x_norm is not None:
+            x_logit = self.pre_quantum_gain * self.x_norm(x_logit) + self.x_shift
+        x = torch.sigmoid(x_logit)
 
         q = self.lam_pool_query.unsqueeze(0).expand(B, -1, -1)
         pooled, _ = self.lam_pool_attn(q, h, h)
@@ -238,10 +292,12 @@ class GraphQuantumToDecoderVector(nn.Module):
     def __init__(self, n_atoms: int, correlator_order: int, out_dim: int,
                  d_model: int = 24, measurement_kind: str = "correlators",
                  register_um: Sequence[Sequence[float]] = None,
-                 use_fourier_pos: bool = False, fourier_atom_dim: int = 4):
+                 use_fourier_pos: bool = False, fourier_atom_dim: int = 4,
+                 residual: bool = False):
         super().__init__()
         validate_measurement_kind(measurement_kind)
         self.n_atoms = n_atoms
+        self.residual = residual
         self.hyperedge_index, self.subsets = build_hyperedge_index(n_atoms, correlator_order)
         self.n_hyperedges = len(self.subsets)
 
@@ -296,8 +352,10 @@ class GraphQuantumToDecoderVector(nn.Module):
         h = hyperedge_attr.reshape(B, self.n_hyperedges, -1)[:, :self.n_atoms, :]
         h = h.reshape(B * self.n_atoms, -1)
 
-        h = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=hyperedge_attr))
-        h = torch.relu(self.hconv2(h, batched_index, hyperedge_attr=hyperedge_attr))
+        out = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=hyperedge_attr))
+        h = h + out if self.residual else out
+        out = torch.relu(self.hconv2(h, batched_index, hyperedge_attr=hyperedge_attr))
+        h = h + out if self.residual else out
 
         h = h.reshape(B, self.n_atoms, -1)
         q = self.pool_query.unsqueeze(0).expand(B, -1, -1)
