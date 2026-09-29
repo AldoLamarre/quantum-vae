@@ -214,6 +214,9 @@ class IncrementalVAEMetrics:
         recon_disp = to_display_0_1(recon_clamped, self.image_range)
         target_disp = to_display_0_1(target_clamped, self.image_range)
         device = recon_disp.device
+        # Per-batch values are averaged here; do not accumulate metric state.
+        self._ssim_metric.reset()
+        self._lpips_metric.reset()
         ssim_value = float(self._ssim_metric.to(device)(recon_disp, target_disp).item())
 
         recon_lpips, target_lpips = recon_clamped, target_clamped

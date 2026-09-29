@@ -144,6 +144,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         if self.lpips_loss is None:
             raise RuntimeError("LPIPS loss is not initialized.")
         metric = self.lpips_loss.to(target_images.device)
+        metric.reset()  # used as a loss; do not accumulate state
         recon_lpips = self._clamp_to_image_range(reconstruction).float()
         target_lpips = self._clamp_to_image_range(target_images).float()
         # torchmetrics' LPIPS is VGG-backed and strictly requires 3-channel
