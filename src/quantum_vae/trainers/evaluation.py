@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+import math
+import warnings
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
@@ -44,6 +46,35 @@ def to_display_0_1(tensor: torch.Tensor, image_range: str) -> torch.Tensor:
     if normalized == "-1_1":
         clamped = (clamped + 1.0) * 0.5
     return torch.clamp(clamped, 0.0, 1.0)
+
+
+def per_image_mse_0_1(recon_disp: torch.Tensor, target_disp: torch.Tensor) -> torch.Tensor:
+    """Per-image MSE on [0, 1] tensors, shape (N,)."""
+    return F.mse_loss(recon_disp, target_disp, reduction="none").flatten(1).mean(dim=1)
+
+
+def psnr_from_mse(mse: torch.Tensor) -> torch.Tensor:
+    """PSNR in dB for [0, 1] images (peak value 1)."""
+    return 10.0 * torch.log10(1.0 / mse.clamp_min(1e-10))
+
+
+_RANGE_WARNED = set()
+
+
+def check_target_range(target_images: torch.Tensor, image_range: str) -> None:
+    """Warn once if targets do not match the configured image_range."""
+    normalized = normalize_image_range(image_range)
+    t_min = float(target_images.min().item())
+    t_max = float(target_images.max().item())
+    if normalized == "0_1" and t_min < -0.5:
+        msg = f"image_range='0_1' but targets reach {t_min:.3f}; data looks [-1, 1]-normalized."
+    elif normalized == "-1_1" and t_min >= 0.0 and t_max <= 1.0 + 1e-3:
+        msg = "image_range='-1_1' but targets lie in [0, 1]; check the dataset normalization."
+    else:
+        return
+    if msg not in _RANGE_WARNED:
+        _RANGE_WARNED.add(msg)
+        warnings.warn(msg, stacklevel=3)
 
 
 def extract_input_images(inputs: Any) -> Any:
@@ -114,14 +145,17 @@ def compute_reconstruction_metrics_tensors(
     reconstruction = _ensure_4d(reconstruction.float())
     target_images = _ensure_4d(target_images.float())
 
+    check_target_range(target_images, normalized_range)
     recon_clamped = clamp_to_image_range(reconstruction, normalized_range)
     target_clamped = clamp_to_image_range(target_images, normalized_range)
 
-    mse_value = float(F.mse_loss(recon_clamped, target_clamped, reduction="mean").item())
-    psnr_value = float(10.0 * torch.log10(torch.tensor(1.0 / max(1e-10, mse_value))).item())
-
+    # MSE/PSNR on [0, 1] so values are comparable across image ranges.
     recon_disp = to_display_0_1(recon_clamped, normalized_range)
     target_disp = to_display_0_1(target_clamped, normalized_range)
+    mse_per_image = per_image_mse_0_1(recon_disp, target_disp)
+    psnr_per_image = psnr_from_mse(mse_per_image)
+    mse_value = float(mse_per_image.mean().item())
+    psnr_value = float(psnr_per_image.mean().item())
 
     ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0).eval()
     ssim_value = float(ssim_metric(recon_disp, target_disp).item())
@@ -190,6 +224,8 @@ class IncrementalVAEMetrics:
 
     def _reset_running_state(self) -> None:
         self._mse_sum = 0.0
+        self._psnr_sum = 0.0
+        self._psnr_sq_sum = 0.0
         self._ssim_sum = 0.0
         self._lpips_sum = 0.0
         self._count = 0
@@ -205,14 +241,15 @@ class IncrementalVAEMetrics:
 
         reconstruction = _ensure_4d(reconstruction.float())
         target_images = _ensure_4d(target_images.float())
+        check_target_range(target_images, self.image_range)
         recon_clamped = clamp_to_image_range(reconstruction, self.image_range)
         target_clamped = clamp_to_image_range(target_images, self.image_range)
 
         batch_size = recon_clamped.shape[0]
-        mse_value = float(F.mse_loss(recon_clamped, target_clamped, reduction="mean").item())
-
         recon_disp = to_display_0_1(recon_clamped, self.image_range)
         target_disp = to_display_0_1(target_clamped, self.image_range)
+        mse_per_image = per_image_mse_0_1(recon_disp, target_disp)
+        psnr_per_image = psnr_from_mse(mse_per_image)
         device = recon_disp.device
         # Per-batch values are averaged here; do not accumulate metric state.
         self._ssim_metric.reset()
@@ -228,7 +265,9 @@ class IncrementalVAEMetrics:
             lpips_value = lpips_value.mean()
         lpips_value = float(lpips_value.item())
 
-        self._mse_sum += mse_value * batch_size
+        self._mse_sum += float(mse_per_image.sum().item())
+        self._psnr_sum += float(psnr_per_image.sum().item())
+        self._psnr_sq_sum += float((psnr_per_image ** 2).sum().item())
         self._ssim_sum += ssim_value * batch_size
         self._lpips_sum += lpips_value * batch_size
         self._count += batch_size
@@ -237,10 +276,12 @@ class IncrementalVAEMetrics:
             return {}
 
         count = max(1, self._count)
-        mse = self._mse_sum / count
+        psnr_mean = self._psnr_sum / count
+        psnr_var = max(0.0, self._psnr_sq_sum / count - psnr_mean ** 2)
         result = {
-            "reconstruction_mse": mse,
-            "psnr": float(10.0 * torch.log10(torch.tensor(1.0 / max(1e-10, mse))).item()),
+            "reconstruction_mse": self._mse_sum / count,
+            "psnr": psnr_mean,
+            "psnr_std": math.sqrt(psnr_var),
             "ssim": self._ssim_sum / count,
             "lpips": self._lpips_sum / count,
         }
@@ -280,6 +321,7 @@ def evaluate_vae_reconstruction_dataset(
 
     mse_sum = 0.0
     psnr_sum = 0.0
+    psnr_sq_sum = 0.0
     ssim_sum = 0.0
     lpips_sum = 0.0
     total_count = 0
@@ -304,14 +346,18 @@ def evaluate_vae_reconstruction_dataset(
             reconstruction = _ensure_4d(reconstruction)
             batch_count = reconstruction.shape[0]
 
+            check_target_range(target_images, normalized_range)
             recon_clamped = clamp_to_image_range(reconstruction, normalized_range)
             target_clamped = clamp_to_image_range(target_images, normalized_range)
-            mse_value = F.mse_loss(recon_clamped, target_clamped, reduction="mean").item()
-            mse_sum += mse_value * batch_count
-            psnr_sum += (10.0 * torch.log10(torch.tensor(1.0 / max(1e-10, mse_value))).item()) * batch_count
 
+            # MSE/PSNR on [0, 1], averaged per image.
             recon_disp = to_display_0_1(reconstruction, normalized_range)
             target_disp = to_display_0_1(target_images, normalized_range)
+            mse_per_image = per_image_mse_0_1(recon_disp, target_disp)
+            psnr_per_image = psnr_from_mse(mse_per_image)
+            mse_sum += float(mse_per_image.sum().item())
+            psnr_sum += float(psnr_per_image.sum().item())
+            psnr_sq_sum += float((psnr_per_image ** 2).sum().item())
             ssim_sum += float(ssim_metric(recon_disp, target_disp).item()) * batch_count
 
             recon_lpips = recon_clamped
@@ -343,6 +389,7 @@ def evaluate_vae_reconstruction_dataset(
     metrics: Dict[str, float] = {
         "reconstruction_mse": mse_sum / total_count,
         "psnr": psnr_sum / total_count,
+        "psnr_std": math.sqrt(max(0.0, psnr_sq_sum / total_count - (psnr_sum / total_count) ** 2)),
         "ssim": ssim_sum / total_count,
         "lpips": lpips_sum / total_count,
     }
