@@ -25,6 +25,12 @@ from src.quantum_vae.utils.model_paths import registered_model_path
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
+def _load_checkpoint_state(checkpoint_path: Path) -> Any:
+    if checkpoint_path.suffix.lower() == ".safetensors":
+        return load_file(str(checkpoint_path), device="cpu")
+    return torch.load(checkpoint_path, map_location="cpu")
+
+
 @dataclass
 class TrainerParsedConfig:
     task_type: str  # "vae" | "classifier"
@@ -423,7 +429,7 @@ class TrainerConfigParser:
                         "Fix the path/registry key, or remove base_checkpoint/checkpoint from the "
                         "config to train from scratch."
                     )
-                state = torch.load(checkpoint_path, map_location="cpu")
+                state = _load_checkpoint_state(checkpoint_path)
                 if isinstance(state, dict):
                     if isinstance(state.get("state_dict"), dict):
                         state = state["state_dict"]
@@ -643,7 +649,7 @@ class TrainerConfigParser:
         base_checkpoint_path = Path(base_checkpoint)
         if not base_checkpoint_path.is_absolute() and not base_checkpoint_path.exists():
             base_checkpoint_path = Path(registered_model_path(base_checkpoint, project_root=self.project_root))
-        base_state = torch.load(base_checkpoint_path, map_location="cpu")
+        base_state = _load_checkpoint_state(base_checkpoint_path)
         base_model.load_state_dict(base_state, strict=True)
         base_model.eval()
         for p in base_model.parameters():

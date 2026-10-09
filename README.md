@@ -32,6 +32,7 @@ This repository contains the refactored Quantum VAE experiments and their paper-
 
 ## VAE evaluation notes
 
+- `--checkpoint` accepts legacy PyTorch checkpoint files (such as `.pt`) and newer `.safetensors` files.
 - Set `training.image_range` in VAE configs to `"0_1"` or `"-1_1"`.
 - Training-time validation reports non-FID metrics (`reconstruction_mse`, `psnr`, `ssim`, `lpips`).
 - End-of-training full metrics (including `fid`) are saved to `checkpoints/vae/<run>/evaluation/full_metrics.json`.
