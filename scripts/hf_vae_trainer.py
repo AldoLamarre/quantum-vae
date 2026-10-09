@@ -22,6 +22,33 @@ from src.quantum_vae.utils.imagenet_family import build_imagenet_data_bundle
 from src.quantum_vae.utils.mnist_family import build_mnist_data_bundle
 
 
+IMAGENET_SPLITS = {"train": "train", "val": "validation", "test": "test"}
+EVAL_SPLITS = ("val", "test")
+
+
+def _imagenet_transform(data_cfg: dict[str, object]) -> Compose:
+    resolution = int(data_cfg.get("resolution", 256))
+    return Compose(
+        [
+            Resize(resolution),
+            CenterCrop(224),
+            ToTensor(),
+            Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+
+
+def _load_imagenet_split(split: str, transform: Compose):
+    dataset = load_dataset("imagenet-1k", split=IMAGENET_SPLITS[split], trust_remote_code=True)
+
+    # set_transform receives batches; some ImageNet images are grayscale or CMYK.
+    def to_pixel_values(batch: dict[str, list]) -> dict[str, list]:
+        return {"pixel_values": [transform(image.convert("RGB")) for image in batch["image"]]}
+
+    dataset.set_transform(to_pixel_values)
+    return dataset
+
+
 def build_vae_dataset_bundle(config: dict[str, object]) -> dict[str, object]:
     data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
     batch_size = int(data_cfg.get("batch_size", 128))
@@ -43,25 +70,33 @@ def build_vae_dataset_bundle(config: dict[str, object]) -> dict[str, object]:
 
     if dataset_name in {"imagenet", "imagenet-1k"}:
         ssl._create_default_https_context = ssl._create_unverified_context
-        resolution = int(data_cfg.get("resolution", 256))
-        dataset = load_dataset("imagenet-1k", trust_remote_code=True)
-        train_dataset = dataset["train"]
-        val_dataset = dataset["validation"]
-        test_dataset = dataset["test"]
-        transform = Compose(
-            [
-                Resize(resolution),
-                CenterCrop(224),
-                ToTensor(),
-                Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
+        transform = _imagenet_transform(data_cfg)
+        train_dataset, val_dataset, test_dataset = (
+            _load_imagenet_split(split, transform) for split in ("train", "val", "test")
         )
-        train_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
-        val_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
-        test_dataset.set_transform(lambda example: {"pixel_values": transform(example["image"])})
         return build_imagenet_data_bundle(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
 
     raise ValueError(f"Unsupported VAE dataset: {dataset_name}")
+
+
+def build_vae_eval_datasets(config: dict[str, object], splits: tuple[str, ...]) -> dict[str, object]:
+    """Return the requested evaluation datasets keyed by split ("val", "test").
+
+    ImageNet loads only the requested splits; other datasets are small enough
+    to build the full bundle. Splits a dataset does not provide are omitted.
+    """
+    unknown = sorted(set(splits) - set(EVAL_SPLITS))
+    if unknown:
+        raise ValueError(f"Unsupported evaluation splits: {unknown}")
+
+    dataset_name = str(config.get("dataset", "mnist")).lower()
+    if dataset_name in {"imagenet", "imagenet-1k"}:
+        data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
+        transform = _imagenet_transform(data_cfg)
+        return {split: _load_imagenet_split(split, transform) for split in splits}
+
+    bundle = build_vae_dataset_bundle(config)
+    return {split: bundle[f"{split}_set"] for split in splits if f"{split}_set" in bundle}
 
 
 def main(config_path: str | Path | None = None) -> None:

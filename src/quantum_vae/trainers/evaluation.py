@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 from torchmetrics.image import StructuralSimilarityIndexMeasure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
@@ -299,6 +300,8 @@ def evaluate_vae_reconstruction_dataset(
     compute_fid: bool = False,
     sample_posterior: bool = True,
     max_samples: Optional[int] = None,
+    num_workers: int = 0,
+    desc: str = "eval",
 ) -> Dict[str, float]:
     normalized_range = normalize_image_range(image_range)
     if dataset is None:
@@ -311,7 +314,15 @@ def evaluate_vae_reconstruction_dataset(
     except StopIteration:
         model_device = torch.device("cpu")
 
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=data_collator)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=data_collator,
+        num_workers=num_workers,
+        pin_memory=model_device.type == "cuda",
+    )
+    num_samples = len(dataset) if max_samples is None else min(len(dataset), int(max_samples))
     lpips_metric = LearnedPerceptualImagePatchSimilarity(
         net_type="vgg",
         normalize=(normalized_range == "0_1"),
@@ -328,6 +339,7 @@ def evaluate_vae_reconstruction_dataset(
 
     was_training = model.training
     model.eval()
+    progress = tqdm(total=num_samples, desc=desc, unit="img", dynamic_ncols=True)
     with torch.no_grad():
         for batch in dataloader:
             inputs = extract_input_images(batch)
@@ -377,8 +389,11 @@ def evaluate_vae_reconstruction_dataset(
                 fid_metric.update(fid_fake, real=False)
 
             total_count += batch_count
+            progress.update(batch_count)
+            progress.set_postfix(lpips=f"{lpips_sum / total_count:.4f}", psnr=f"{psnr_sum / total_count:.2f}")
             if max_samples is not None and total_count >= int(max_samples):
                 break
+    progress.close()
 
     if was_training:
         model.train()

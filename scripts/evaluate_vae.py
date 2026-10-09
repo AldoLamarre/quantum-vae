@@ -11,10 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.hf_vae_trainer import build_vae_dataset_bundle
+from scripts.hf_vae_trainer import build_vae_eval_datasets
 from src.quantum_vae.trainers.config_parser import TrainerConfigParser
 from src.quantum_vae.trainers.evaluation import evaluate_vae_reconstruction_dataset
 from src.quantum_vae.utils.model_paths import registered_model_path
+
+RESULT_KEYS = {"val": "validation", "test": "test"}
 
 
 def _resolve_checkpoint_path(
@@ -45,6 +47,7 @@ def main() -> None:
     parser.add_argument("--split", type=str, default="both", choices=["val", "test", "both"], help="Split to evaluate.")
     parser.add_argument("--fid", action="store_true", help="Compute FID in addition to non-FID metrics.")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on evaluated samples per split.")
+    parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
     args = parser.parse_args()
 
     target_config = Path(args.config)
@@ -68,32 +71,24 @@ def main() -> None:
         device = torch.device("cpu")
     model.to(device)
 
-    bundle = build_vae_dataset_bundle(config)
+    splits = ("val", "test") if args.split == "both" else (args.split,)
+    eval_datasets = build_vae_eval_datasets(config, splits)
     image_range = str(parsed.training_kwargs.get("image_range", "0_1"))
     eval_batch_size = int(parsed.training_kwargs.get("per_device_eval_batch_size", parsed.training_kwargs.get("batch_size", 32)))
 
     results: dict[str, dict[str, float]] = {}
-    if args.split in {"val", "both"}:
-        results["validation"] = evaluate_vae_reconstruction_dataset(
+    for split, dataset in eval_datasets.items():
+        results[RESULT_KEYS[split]] = evaluate_vae_reconstruction_dataset(
             model=model,
-            dataset=bundle["val_set"],
+            dataset=dataset,
             data_collator=None,
             image_range=image_range,
             batch_size=eval_batch_size,
             compute_fid=args.fid,
             sample_posterior=True,
             max_samples=args.max_samples,
-        )
-    if args.split in {"test", "both"} and "test_set" in bundle:
-        results["test"] = evaluate_vae_reconstruction_dataset(
-            model=model,
-            dataset=bundle["test_set"],
-            data_collator=None,
-            image_range=image_range,
-            batch_size=eval_batch_size,
-            compute_fid=args.fid,
-            sample_posterior=True,
-            max_samples=args.max_samples,
+            num_workers=args.num_workers,
+            desc=RESULT_KEYS[split],
         )
 
     output_path = Path(parsed.training_kwargs.get("output_dir", "checkpoints/vae/evaluation")) / "evaluation" / "standalone_metrics.json"
