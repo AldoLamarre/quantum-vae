@@ -1,0 +1,76 @@
+{
+  "family": "cifar_gnn_neutral_atom",
+  "dataset": "cifar10",
+  "model_name": "neutral_atom",
+  "data": {
+    "root": "data",
+    "batch_size": 32
+  },
+  "device_profile": "pasqal_dmm",
+  "n_atoms": 9,
+  "register_geometry": "grid",
+  "atom_spacing_um": 10.0,
+  "evolution_time_us": 4.8,
+  "n_segments": 6,
+  "ode_rtol": 1e-06,
+  "ode_atol": 1e-06,
+  "evolution_backend": "torch_expm",
+  "skip_quantum_projection": false,
+  "measurement_kind": "correlators",
+  "correlator_order": 3,
+  "projection_kind": "graph",
+  "graph_d_model": 32,
+  "pulse_init_noise_std": 0.1,
+  "use_fourier_hyperedge_pos": true,
+  "fourier_atom_dim": 4,
+  "lam_offset": 1.0,
+  "lam_span": 0.5,
+  "atom_token_mode": "spatial",
+  "graph_residual": true,
+  "post_quantum_gate_init": 0.0,
+  "pre_quantum_norm": "batchnorm",
+  "pre_quantum_gain": 0.4,
+  "model": {
+    "in_channels": 3,
+    "out_channels": 3,
+    "sample_size": 32,
+    "block_out_channels": [
+      32,
+      32,
+      64
+    ],
+    "down_block_types": [
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D",
+      "DownEncoderBlock2D"
+    ],
+    "up_block_types": [
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D",
+      "UpDecoderBlock2D"
+    ]
+  },
+  "training": {
+    "image_range": "0_1",
+    "loss_type": "l1",
+    "perceptual_weight": 1,
+    "kl_weight": 1e-08,
+    "noise_after_epoch": 6,
+    "noise_std": 0.1,
+    "num_train_epochs": 40,
+    "learning_rate": 0.001,
+    "vicreg_variance_weight": 0.0,
+    "vicreg_covariance_weight": 0.0
+  },
+  "trainer": {
+    "output_dir": "checkpoints/vae/cifar_gnn_fourier_neutral_atom_prenorm_9a_o3_expm_pasqal",
+    "overwrite_output_dir": false,
+    "logging_strategy": "steps",
+    "logging_steps": 25,
+    "save_strategy": "epoch",
+    "save_total_limit": 5,
+    "evaluation_strategy": "epoch",
+    "load_best_model_at_end": false,
+    "dataloader_drop_last": true
+  }
+}

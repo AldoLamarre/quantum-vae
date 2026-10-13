@@ -67,9 +67,10 @@ Hardware scope:
 Implementation notes:
     - The time evolution is delegated to an evolver module selected by
       NeutralAtomDeviceConfig.evolution_backend: "pennylane" (PennyLaneEvolver,
-      ODE solve via qml.evolve) or "torch_expm" (ExpmEvolver in
+      ODE solve via qml.evolve), "torch_expm" (ExpmEvolver in
       neutral_atom_expm.py, exact piecewise-constant evolution via matrix
-      exponentials). JAX and PennyLane are imported only by the former.
+      exponentials) or "qadence" (QadenceEvolver in neutral_atom_qadence.py,
+      for evaluation). Each backend imports its own library only.
     - PennyLane's pulse-level ODE solver only supports interface="jax",
       not "torch". This module builds the circuit as a JAX qnode and
       bridges it into the surrounding torch model with a
@@ -381,7 +382,8 @@ class NeutralAtomDeviceConfig:
     # Time-evolution backend. "pennylane": qml.evolve ODE solve (JAX).
     # "torch_expm": exact piecewise-constant evolution via matrix
     # exponentials in torch; ode_rtol/ode_atol are ignored.
-    evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane"
+    # "qadence": same Hamiltonian via Qadence/pyqtorch, for evaluation.
+    evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane"
     # Target hardware: C6 default, pulse bounds and register/timing checks.
     device_profile: Literal["aquila", "pasqal_dmm"] = "aquila"
 
@@ -390,10 +392,10 @@ class NeutralAtomDeviceConfig:
         return get_device_profile(self.device_profile)
 
     def __post_init__(self):
-        if self.evolution_backend not in ("pennylane", "torch_expm"):
+        if self.evolution_backend not in ("pennylane", "torch_expm", "qadence"):
             raise ValueError(
                 f"evolution_backend='{self.evolution_backend}' is not supported. "
-                "Use 'pennylane' or 'torch_expm'."
+                "Use 'pennylane', 'torch_expm' or 'qadence'."
             )
         self._validate_against_profile(get_device_profile(self.device_profile))
         if self.lam_span is not None:
@@ -584,7 +586,7 @@ class NeutralAtomDeviceConfig:
         post_quantum_gate_init: float = 0.0,
         pre_quantum_norm: Optional[str] = None,
         pre_quantum_gain: float = 0.4,
-        evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane",
+        evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane",
         device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
@@ -932,6 +934,10 @@ def _build_evolver(device: NeutralAtomDeviceConfig, V0: torch.Tensor) -> nn.Modu
         from .neutral_atom_expm import ExpmEvolver
 
         return ExpmEvolver(device, V0)
+    if device.evolution_backend == "qadence":
+        from .neutral_atom_qadence import QadenceEvolver
+
+        return QadenceEvolver(device, V0)
     return PennyLaneEvolver(device, V0)
 
 
