@@ -62,6 +62,11 @@ Hardware scope:
       per-segment re-uploading pattern is not physically realizable.
 
 Implementation notes:
+    - The time evolution is delegated to an evolver module selected by
+      NeutralAtomDeviceConfig.evolution_backend: "pennylane" (PennyLaneEvolver,
+      ODE solve via qml.evolve) or "torch_expm" (ExpmEvolver in
+      neutral_atom_expm.py, exact piecewise-constant evolution via matrix
+      exponentials). JAX and PennyLane are imported only by the former.
     - PennyLane's pulse-level ODE solver only supports interface="jax",
       not "torch". This module builds the circuit as a JAX qnode and
       bridges it into the surrounding torch model with a
@@ -90,10 +95,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import pennylane as qml
-import jax
-import jax.numpy as jnp
-
 has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
@@ -103,6 +104,26 @@ from .ansatz_vae_base import AnsatzVAEBase
 AQUILA_OMEGA_MAX_MHZ = 2.5  # global Rabi frequency: one-sided, >= 0
 AQUILA_DELTA_MAX_MHZ = 20.0  # global detuning: symmetric, [-20, 20]
 AQUILA_LOCAL_DETUNING_MAX_MHZ = 25.0  # per-atom local field magnitude
+
+
+def correlator_index_sets(n_atoms: int, order: int) -> List[tuple]:
+    """Atom index tuples of all Z-correlators up to `order`, in readout order."""
+    return [
+        combo
+        for k in range(1, order + 1)
+        for combo in itertools.combinations(range(n_atoms), k)
+    ]
+
+
+def local_field_mhz(x, lam, V0, bounded: bool, tanh: Callable):
+    """Per-atom local field V0 * (1 + lam * x) in MHz, optionally soft-bounded.
+
+    `tanh` selects the array library (torch.tanh or jax.numpy.tanh).
+    """
+    v = V0 * (1.0 + lam * x)
+    if bounded:
+        v = AQUILA_LOCAL_DETUNING_MAX_MHZ * tanh(v / AQUILA_LOCAL_DETUNING_MAX_MHZ)
+    return v
 
 
 def _build_register(
@@ -271,8 +292,17 @@ class NeutralAtomDeviceConfig:
     # batch and rescale by pre_quantum_gain (fixed) before the sigmoid.
     pre_quantum_norm: Optional[str] = None
     pre_quantum_gain: float = 0.4
+    # Time-evolution backend. "pennylane": qml.evolve ODE solve (JAX).
+    # "torch_expm": exact piecewise-constant evolution via matrix
+    # exponentials in torch; ode_rtol/ode_atol are ignored.
+    evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane"
 
     def __post_init__(self):
+        if self.evolution_backend not in ("pennylane", "torch_expm"):
+            raise ValueError(
+                f"evolution_backend='{self.evolution_backend}' is not supported. "
+                "Use 'pennylane' or 'torch_expm'."
+            )
         if self.lam_span is not None:
             if self.lam_span <= 0.0:
                 raise ValueError(f"lam_span={self.lam_span} must be > 0.")
@@ -413,6 +443,7 @@ class NeutralAtomDeviceConfig:
         post_quantum_gate_init: float = 0.0,
         pre_quantum_norm: Optional[str] = None,
         pre_quantum_gain: float = 0.4,
+        evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -447,6 +478,7 @@ class NeutralAtomDeviceConfig:
             post_quantum_gate_init=post_quantum_gate_init,
             pre_quantum_norm=pre_quantum_norm,
             pre_quantum_gain=pre_quantum_gain,
+            evolution_backend=evolution_backend,
         )
 
 
@@ -454,7 +486,7 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
     """Bridges a batched, JAX-differentiable pulse qnode into torch autograd.
 
     Forward and backward each call a separate, persistent jax.jit-compiled
-    function (see NeutralAtomPulseLayer._jit_forward/_jit_backward) so the
+    function (see PennyLaneEvolver._jit_forward/_jit_backward) so the
     compiled executable is reused across calls rather than retraced every
     time. Backward recomputes the primal internally via jax.vjp before
     applying the cotangent -- a standard tradeoff that keeps both
@@ -493,6 +525,8 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
                     "the point of the DLPack zero-copy path."
                 )
 
+        import jax.numpy as jnp
+
         x_jax = jnp.from_dlpack(x.detach().contiguous())
         lam_jax = jnp.from_dlpack(lam.detach().contiguous())
         Omega0_jax = jnp.from_dlpack(Omega0_MHz.detach().contiguous())
@@ -511,6 +545,8 @@ class _NeutralAtomPulseFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        import jax.numpy as jnp
+
         if grad_output.dtype != torch.float32:
             grad_output = grad_output.to(dtype=torch.float32)
         grad_jax = jnp.from_dlpack(grad_output.detach().contiguous())
@@ -581,6 +617,168 @@ class LatentToLocalField(nn.Module):
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
         return self.proj(z_flat)
+
+
+class PennyLaneEvolver(nn.Module):
+    """Time evolution via PennyLane's pulse ODE solver (JAX), bridged into torch.
+
+    Called as evolver(x, lam, Omega0_MHz, Delta0_MHz) with already-bounded
+    pulse values; returns [batch, per_cluster_dim] readout. Holds no
+    parameters or buffers, so the layer's state_dict is unaffected.
+    """
+
+    def __init__(self, device: NeutralAtomDeviceConfig, V0: torch.Tensor):
+        super().__init__()
+        self.device_cfg = device
+        self.wires = list(range(device.n_atoms))
+        self.omega_delta_source = device.omega_delta_source
+        self._V0_np = np.asarray(V0.detach().cpu().numpy(), dtype=np.float32)
+
+        import jax
+
+        self.qnode = self._build_qnode()
+        # x and lam are always batched (one pair per sample). Omega0/Delta0
+        # are batched too when encoder-sourced (a different pulse shape per
+        # sample); shared (one pulse shape for the whole batch) otherwise.
+        omega_delta_axis = 0 if self.omega_delta_source == "encoder" else None
+        self._batched_qnode = jax.vmap(self.qnode, in_axes=(0, 0, omega_delta_axis, omega_delta_axis))
+
+        # Persistent, jit-compiled forward/backward, built once and never
+        # recreated so the compiled XLA executable is reused across calls.
+        # jax.vjp's returned closure is a fresh Python object every call
+        # and is not cached across calls even under jax.jit (jit's cache
+        # keys on the function object itself). Wrapping the entire
+        # forward-then-differentiate computation in one persistent
+        # jax.jit avoids this: backward recomputes the primal internally,
+        # but that recomputation is itself compiled once and reused.
+        self._jit_forward = jax.jit(self._batched_qnode)
+
+        def _forward_and_vjp(x, lam, Omega0_MHz, Delta0_MHz, cotangent):
+            out, vjp_fn = jax.vjp(self._batched_qnode, x, lam, Omega0_MHz, Delta0_MHz)
+            grads = vjp_fn(cotangent)
+            return out, grads
+
+        self._jit_backward = jax.jit(_forward_and_vjp)
+
+    def _build_qnode(self) -> Callable:
+        """Assemble H_interaction + H_drive + H_local exactly as documented
+        in the class docstring -- no additional structure hidden here.
+
+        Builds exactly ONE cluster's circuit. Clustering (n_clusters > 1)
+        never appears in this method at all: every cluster is an
+        identical replica of this same single-cluster circuit, and
+        forward() below routes multiple clusters through the SAME
+        jax.vmap by flattening (batch, cluster) into one leading axis
+        before calling it -- confirmed empirically that nesting a second
+        vmap here instead (one over clusters, one over batch) breaks
+        gradients through the closure-captured lam (a real JAX/PennyLane
+        interaction quirk with this ODE-based ParametrizedEvolution
+        backend, not a design choice), so this method's job is only ever
+        "build one cluster's physics," never "know how many clusters
+        exist."
+        """
+        import jax.numpy as jnp
+        import pennylane as qml
+
+        n_atoms = self.device_cfg.n_atoms
+        wires = self.wires
+        T = self.device_cfg.evolution_time_us
+        ode_kwargs = {}
+        if self.device_cfg.ode_rtol is not None:
+            ode_kwargs["rtol"] = self.device_cfg.ode_rtol
+        if self.device_cfg.ode_atol is not None:
+            ode_kwargs["atol"] = self.device_cfg.ode_atol
+        V0_np = self._V0_np
+        bound_pulse_params = self.device_cfg.bound_pulse_params
+        measurement_kind = self.device_cfg.measurement_kind
+        correlator_order = 1 if measurement_kind == "expectation" else self.device_cfg.correlator_order
+
+        H_interaction = qml.pulse.rydberg_interaction(
+            list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
+        )
+
+        def amp_fn(p, t):
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Omega0 over n_segments windows
+
+        def det_fn(p, t):
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Delta0 over n_segments windows
+
+        H_drive = qml.pulse.rydberg_drive(amplitude=amp_fn, phase=0.0, detuning=det_fn, wires=wires)
+
+        dev = qml.device("default.qubit", wires=n_atoms)
+
+        def _correlator_ops(order: int) -> list:
+            ops = []
+            for combo in correlator_index_sets(n_atoms, order):
+                op = qml.PauliZ(wires[combo[0]])
+                for w in combo[1:]:
+                    op = op @ qml.PauliZ(wires[w])
+                ops.append(op)
+            return ops
+
+        @qml.qnode(dev, interface="jax")
+        def circuit(x, lam, Omega0_MHz, Delta0_MHz):
+            # H_local's per-atom coefficient: V0_i * (1 + lam * x_i). lam
+            # is constant for the whole evolution (a per-sample scalar,
+            # not a function of t) and is captured directly from this
+            # function's own argument (a traced JAX value, differentiable
+            # like any other), rather than threaded through qml.evolve's
+            # params list alongside x. x_i alone still goes through
+            # qml.evolve's params normally.
+            # H_local = sum_i 2*pi * V_i(x) * n_i, matching the conventions
+            # rydberg_interaction and rydberg_drive already use:
+            #   - coefficients are MHz and carry an explicit 2*pi to reach
+            #     angular frequency (rydberg_interaction applies the same
+            #     factor to C6/R^6),
+            #   - n_i = (I_i - Z_i) / 2.
+            # Expanding: 2*pi * V_i * n_i = pi * V_i * I_i - pi * V_i * Z_i.
+            # The identity part is a c-number, so it contributes only a
+            # global phase and is dropped, leaving -pi * V_i on Z_i.
+            def make_local_coeff(i):
+                def f(p, t):
+                    v_i = local_field_mhz(p, lam, V0_np[i], bound_pulse_params, jnp.tanh)
+                    return -np.pi * v_i
+                return f
+
+            local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
+            local_ops = [qml.PauliZ(w) for w in wires]
+            H_local = qml.dot(local_coeffs, local_ops)
+            H = H_interaction + H_drive + H_local
+
+            local_params = tuple(x[i] for i in range(n_atoms))
+            qml.evolve(H, **ode_kwargs)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
+            if measurement_kind == "probability":
+                # Full computational-basis distribution, 2**n_atoms values.
+                # Hardware-native: the same single-shot Z-basis fluorescence
+                # detection as the expectation-value readout, just reporting
+                # the full outcome histogram instead of only per-atom means.
+                return qml.probs(wires=wires)
+            # "expectation" (order=1) or "correlators" (order>=1): all
+            # Z-operator products up to correlator_order.
+            return [qml.expval(op) for op in _correlator_ops(correlator_order)]
+
+        if measurement_kind == "probability":
+            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
+                return circuit(x, lam, Omega0_MHz, Delta0_MHz)
+        else:
+            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
+                return jnp.stack(circuit(x, lam, Omega0_MHz, Delta0_MHz))
+
+        return circuit_stacked
+
+    def forward(self, x, lam, Omega0_MHz, Delta0_MHz) -> torch.Tensor:
+        return _NeutralAtomPulseFunction.apply(
+            x, lam, Omega0_MHz, Delta0_MHz, self._jit_forward, self._jit_backward
+        )
+
+
+def _build_evolver(device: NeutralAtomDeviceConfig, V0: torch.Tensor) -> nn.Module:
+    """Select the time-evolution module from device.evolution_backend."""
+    if device.evolution_backend == "torch_expm":
+        from .neutral_atom_expm import ExpmEvolver
+
+        return ExpmEvolver(device, V0)
+    return PennyLaneEvolver(device, V0)
 
 
 class NeutralAtomPulseLayer(nn.Module):
@@ -681,144 +879,7 @@ class NeutralAtomPulseLayer(nn.Module):
             self.Omega0_MHz = None
             self.Delta0_MHz = None
 
-        self._qnode = self._build_qnode()
-        # x and lam are always batched (one pair per sample). Omega0/Delta0
-        # are batched too when encoder-sourced (a different pulse shape per
-        # sample); shared (one pulse shape for the whole batch) otherwise.
-        omega_delta_axis = 0 if self.omega_delta_source == "encoder" else None
-        self._batched_qnode = jax.vmap(self._qnode, in_axes=(0, 0, omega_delta_axis, omega_delta_axis))
-
-        # Persistent, jit-compiled forward/backward, built once and never
-        # recreated so the compiled XLA executable is reused across calls.
-        # jax.vjp's returned closure is a fresh Python object every call
-        # and is not cached across calls even under jax.jit (jit's cache
-        # keys on the function object itself). Wrapping the entire
-        # forward-then-differentiate computation in one persistent
-        # jax.jit avoids this: backward recomputes the primal internally,
-        # but that recomputation is itself compiled once and reused.
-        self._jit_forward = jax.jit(self._batched_qnode)
-
-        def _forward_and_vjp(x, lam, Omega0_MHz, Delta0_MHz, cotangent):
-            out, vjp_fn = jax.vjp(self._batched_qnode, x, lam, Omega0_MHz, Delta0_MHz)
-            grads = vjp_fn(cotangent)
-            return out, grads
-
-        self._jit_backward = jax.jit(_forward_and_vjp)
-
-    def _build_qnode(self) -> Callable:
-        """Assemble H_interaction + H_drive + H_local exactly as documented
-        in the class docstring -- no additional structure hidden here.
-
-        Builds exactly ONE cluster's circuit. Clustering (n_clusters > 1)
-        never appears in this method at all: every cluster is an
-        identical replica of this same single-cluster circuit, and
-        forward() below routes multiple clusters through the SAME
-        jax.vmap by flattening (batch, cluster) into one leading axis
-        before calling it -- confirmed empirically that nesting a second
-        vmap here instead (one over clusters, one over batch) breaks
-        gradients through the closure-captured lam (a real JAX/PennyLane
-        interaction quirk with this ODE-based ParametrizedEvolution
-        backend, not a design choice), so this method's job is only ever
-        "build one cluster's physics," never "know how many clusters
-        exist."
-        """
-        n_atoms = self.device_cfg.n_atoms
-        wires = self.wires
-        T = self.device_cfg.evolution_time_us
-        ode_kwargs = {}
-        if self.device_cfg.ode_rtol is not None:
-            ode_kwargs["rtol"] = self.device_cfg.ode_rtol
-        if self.device_cfg.ode_atol is not None:
-            ode_kwargs["atol"] = self.device_cfg.ode_atol
-        V0_np = np.asarray(self.V0.numpy(), dtype=np.float32)
-        bound_pulse_params = self.device_cfg.bound_pulse_params
-        measurement_kind = self.device_cfg.measurement_kind
-        correlator_order = 1 if measurement_kind == "expectation" else self.device_cfg.correlator_order
-
-        H_interaction = qml.pulse.rydberg_interaction(
-            list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
-        )
-
-        def amp_fn(p, t):
-            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Omega0 over n_segments windows
-
-        def det_fn(p, t):
-            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Delta0 over n_segments windows
-
-        H_drive = qml.pulse.rydberg_drive(amplitude=amp_fn, phase=0.0, detuning=det_fn, wires=wires)
-
-        dev = qml.device("default.qubit", wires=n_atoms)
-
-        def _correlator_ops(order: int) -> list:
-            # All Z-operator products up to `order`: every <Z_i> (order 1),
-            # plus every <Z_iZ_j> pair if order>=2, plus triples if
-            # order>=3, etc. "expectation" is just this at order=1 -- same
-            # ops, same ordering, so it's a genuine special case of this
-            # function, not a separately-maintained code path.
-            ops = []
-            for k in range(1, order + 1):
-                for combo in itertools.combinations(wires, k):
-                    op = qml.PauliZ(combo[0])
-                    for w in combo[1:]:
-                        op = op @ qml.PauliZ(w)
-                    ops.append(op)
-            return ops
-
-        @qml.qnode(dev, interface="jax")
-        def circuit(x, lam, Omega0_MHz, Delta0_MHz):
-            # H_local's per-atom coefficient: V0_i * (1 + lam * x_i). lam
-            # is constant for the whole evolution (a per-sample scalar,
-            # not a function of t) and is captured directly from this
-            # function's own argument (a traced JAX value, differentiable
-            # like any other), rather than threaded through qml.evolve's
-            # params list alongside x. x_i alone still goes through
-            # qml.evolve's params normally.
-            # H_local = sum_i 2*pi * V_i(x) * n_i, matching the conventions
-            # rydberg_interaction and rydberg_drive already use:
-            #   - coefficients are MHz and carry an explicit 2*pi to reach
-            #     angular frequency (rydberg_interaction applies the same
-            #     factor to C6/R^6),
-            #   - n_i = (I_i - Z_i) / 2.
-            # Expanding: 2*pi * V_i * n_i = pi * V_i * I_i - pi * V_i * Z_i.
-            # The identity part is a c-number, so it contributes only a
-            # global phase and is dropped, leaving -pi * V_i on Z_i.
-            def make_local_coeff(i):
-                def f(p, t):
-                    v_i = V0_np[i] * (1.0 + lam * p)
-                    if bound_pulse_params:
-                        # Soft-bound to Aquila's local-detuning magnitude
-                        # limit (tanh saturates smoothly at the physical
-                        # bound instead of a hard clamp, keeping gradients
-                        # flowing when v_i is pushed past it).
-                        v_i = AQUILA_LOCAL_DETUNING_MAX_MHZ * jnp.tanh(v_i / AQUILA_LOCAL_DETUNING_MAX_MHZ)
-                    return -np.pi * v_i
-                return f
-
-            local_coeffs = [make_local_coeff(i) for i in range(n_atoms)]
-            local_ops = [qml.PauliZ(w) for w in wires]
-            H_local = qml.dot(local_coeffs, local_ops)
-            H = H_interaction + H_drive + H_local
-
-            local_params = tuple(x[i] for i in range(n_atoms))
-            qml.evolve(H, **ode_kwargs)((Omega0_MHz, Delta0_MHz) + local_params, t=T)
-            if measurement_kind == "probability":
-                # Full computational-basis distribution, 2**n_atoms values.
-                # Hardware-native: the same single-shot Z-basis fluorescence
-                # detection as the expectation-value readout, just reporting
-                # the full outcome histogram instead of only per-atom means.
-                return qml.probs(wires=wires)
-            # "expectation" (order=1) or "correlators" (order>=1): all
-            # Z-operator products up to correlator_order.
-            return [qml.expval(op) for op in _correlator_ops(correlator_order)]
-
-        if measurement_kind == "probability":
-            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
-                return circuit(x, lam, Omega0_MHz, Delta0_MHz)
-        else:
-            def circuit_stacked(x, lam, Omega0_MHz, Delta0_MHz):
-                return jnp.stack(circuit(x, lam, Omega0_MHz, Delta0_MHz))
-
-        return circuit_stacked
+        self.evolver = _build_evolver(device, self.V0)
 
     def _per_cluster_measurement_dim(self) -> int:
         if self.device_cfg.measurement_kind == "probability":
@@ -905,22 +966,9 @@ class NeutralAtomPulseLayer(nn.Module):
             Omega0_MHz = self.Omega0_MHz
             Delta0_MHz = self.Delta0_MHz
 
-        if self.device_cfg.bound_pulse_params:
-            # Soft-bound to Aquila's global drive limits (tanh/sigmoid
-            # saturate smoothly at the physical bound instead of a hard
-            # clamp, keeping gradients flowing past it). Applied here so
-            # it covers both omega_delta_source modes uniformly -- a raw
-            # trainable parameter or a raw encoder output, either way
-            # what reaches the physics is bounded.
-            Omega0_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz)
-            Delta0_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz)
-        else:
-            Omega0_bounded = Omega0_MHz
-            Delta0_bounded = Delta0_MHz
+        Omega0_bounded, Delta0_bounded = self._bounded_omega_delta(Omega0_MHz, Delta0_MHz)
 
-        out_flat = _NeutralAtomPulseFunction.apply(
-            x_flat, lam_flat, Omega0_bounded, Delta0_bounded, self._jit_forward, self._jit_backward
-        )
+        out_flat = self.evolver(x_flat, lam_flat, Omega0_bounded, Delta0_bounded)
         # [batch*n_clusters, per_cluster_dim] -> [batch, n_clusters*per_cluster_dim],
         # clusters concatenated in the same cluster-major order as the input.
         out = out_flat.reshape(batch_size, n_clusters * out_flat.shape[-1])
@@ -955,6 +1003,19 @@ class NeutralAtomPulseLayer(nn.Module):
             out = out.to(dtype=original_dtype)
         return out
 
+    def _bounded_omega_delta(self, Omega0_MHz: torch.Tensor, Delta0_MHz: torch.Tensor):
+        """Soft-bound raw Omega0/Delta0 to Aquila's global drive limits.
+
+        sigmoid/tanh instead of a hard clamp keeps gradients flowing past the
+        bound; applied to both omega_delta_source modes.
+        """
+        if not self.device_cfg.bound_pulse_params:
+            return Omega0_MHz, Delta0_MHz
+        return (
+            AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz),
+            AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz),
+        )
+
     def extra_repr(self) -> str:
         """Human-readable dump for verification against experimental data --
         same symbols as standard physics notation (Omega, Delta), not
@@ -970,12 +1031,7 @@ class NeutralAtomPulseLayer(nn.Module):
             return "[" + ", ".join(f"{v:.6f}" for v in t.detach().tolist()) + "]"
 
         if self.omega_delta_source == "trainable":
-            if self.device_cfg.bound_pulse_params:
-                omega_bounded = AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(self.Omega0_MHz)
-                delta_bounded = AQUILA_DELTA_MAX_MHZ * torch.tanh(self.Delta0_MHz)
-            else:
-                omega_bounded = self.Omega0_MHz
-                delta_bounded = self.Delta0_MHz
+            omega_bounded, delta_bounded = self._bounded_omega_delta(self.Omega0_MHz, self.Delta0_MHz)
             omega_delta_str = (
                 f"Omega0_MHz={_fmt_vec(omega_bounded)}, "
                 f"Delta0_MHz={_fmt_vec(delta_bounded)}"
@@ -1000,6 +1056,7 @@ class NeutralAtomPulseLayer(nn.Module):
             f"lam_offset={self.device_cfg.lam_offset}, "
             f"lam_span={self.device_cfg.lam_span}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
+            f"evolution_backend={self.device_cfg.evolution_backend}, "
             + omega_delta_str
         )
 
@@ -1257,4 +1314,5 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         return self.process_latent(z)
 
     def construct_circuit(self) -> Callable:
-        return self.qlayer._qnode
+        """The pulse program's evolution, as called by the qlayer."""
+        return self.qlayer.evolver
