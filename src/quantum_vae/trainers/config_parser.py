@@ -713,6 +713,7 @@ class TrainerConfigParser:
                 vicreg_variance_weight=vicreg_variance_weight,
                 vicreg_covariance_weight=vicreg_covariance_weight,
                 vicreg_target_std=vicreg_target_std,
+                bn_recalibration_batches=int(parsed.training_kwargs.get("bn_recalibration_batches", 100)),
                 callbacks=callbacks,
                 **trainer_kwargs,
             )

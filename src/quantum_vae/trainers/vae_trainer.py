@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torchvision.utils import make_grid, save_image
 
 from .base import BaseHFQuantumTrainer
+from .bn_recalibration import batchnorm_layers, image_batches, recalibrate_batchnorm
 from .data_collators import VAEDataCollator
 from .evaluation import IncrementalVAEMetrics, extract_input_images, normalize_image_range
 from src.quantum_vae.losses.vicreg import variance_loss as vicreg_variance_loss
@@ -53,6 +54,7 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         vicreg_variance_weight: float = 0.0,
         vicreg_covariance_weight: float = 0.0,
         vicreg_target_std: float = 1.0,
+        bn_recalibration_batches: int = 100,
         **kwargs,
     ):
         if data_collator is None:
@@ -83,6 +85,9 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.reconstruction_every_n_epochs = max(1, int(reconstruction_every_n_epochs))
         self.reconstruction_num_images = max(1, int(reconstruction_num_images))
         self.save_test_reconstructions = bool(save_test_reconstructions)
+        # Train batches used to re-estimate BatchNorm statistics before evaluation (0 disables).
+        self.bn_recalibration_batches = max(0, int(bn_recalibration_batches))
+        self._bn_recalibrated_step: Optional[int] = None
         self._best_eval_loss: Optional[float] = None
         # One timestamp per trainer instance (i.e. per run), used only to
         # namespace the reconstruction preview PNGs -- two runs against the
@@ -370,12 +375,49 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         target_tensor = target_images.detach() if isinstance(target_images, torch.Tensor) else None
         return detached_loss, pred_tensor, target_tensor
 
+    def recalibrate_batchnorm(self, num_batches: Optional[int] = None) -> int:
+        """Re-estimate BatchNorm running statistics on clean training batches.
+
+        Uses a private data order and forks the RNG state, so the training
+        trajectory is unchanged. Returns the number of batches used.
+        """
+        num_batches = self.bn_recalibration_batches if num_batches is None else int(num_batches)
+        if self.model is None or self.train_dataset is None or num_batches <= 0:
+            return 0
+        if not batchnorm_layers(self.model):
+            return 0
+
+        device = next(self.model.parameters()).device
+        seed = int(self.args.seed) + int(self.state.global_step)
+        batches = image_batches(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            collate_fn=self.data_collator,
+            seed=seed,
+            num_workers=self.args.dataloader_num_workers,
+            device=device,
+        )
+        rng_devices = [device] if device.type == "cuda" else []
+        with torch.random.fork_rng(devices=rng_devices):
+            torch.manual_seed(seed)
+            with self.autocast_smart_context_manager():
+                return recalibrate_batchnorm(
+                    self.model,
+                    batches,
+                    num_batches,
+                    lambda images: self.model(images, sample_posterior=True, return_dict=False),
+                )
+
     def evaluate(
         self,
         eval_dataset: Optional[Any] = None,
         ignore_keys: Optional[List[str]] = None,
         metric_key_prefix: str = "eval",
     ) -> Dict[str, float]:
+        # Once per optimizer step; later evaluate() calls reuse the statistics.
+        if self._bn_recalibrated_step != self.state.global_step:
+            if self.recalibrate_batchnorm() > 0:
+                self._bn_recalibrated_step = self.state.global_step
         metrics = super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys, metric_key_prefix=metric_key_prefix)
         dataset_for_preview = eval_dataset if eval_dataset is not None else self.eval_dataset
         current_epoch = int(round(float(getattr(self.state, "epoch", 0.0) or 0.0)))

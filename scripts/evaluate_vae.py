@@ -11,7 +11,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from scripts.hf_vae_trainer import build_vae_eval_datasets
+from scripts.hf_vae_trainer import build_vae_dataset_bundle, build_vae_eval_datasets
+from src.quantum_vae.trainers.bn_recalibration import batchnorm_layers, image_batches, recalibrate_batchnorm
 from src.quantum_vae.trainers.config_parser import TrainerConfigParser
 from src.quantum_vae.trainers.evaluation import evaluate_vae_reconstruction_dataset
 from src.quantum_vae.utils.model_paths import registered_model_path
@@ -48,6 +49,12 @@ def main() -> None:
     parser.add_argument("--fid", action="store_true", help="Compute FID in addition to non-FID metrics.")
     parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on evaluated samples per split.")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoader worker processes.")
+    parser.add_argument(
+        "--bn-recal-batches",
+        type=int,
+        default=100,
+        help="Train batches used to re-estimate BatchNorm statistics before evaluation (0 disables).",
+    )
     args = parser.parse_args()
 
     target_config = Path(args.config)
@@ -70,6 +77,18 @@ def main() -> None:
     else:
         device = torch.device("cpu")
     model.to(device)
+
+    if args.bn_recal_batches > 0 and batchnorm_layers(model):
+        train_dataset = build_vae_dataset_bundle(config)["train_set"]
+        batch_size = int(config.get("data", {}).get("batch_size", 32)) if isinstance(config.get("data"), dict) else 32
+        torch.manual_seed(0)
+        used = recalibrate_batchnorm(
+            model,
+            image_batches(train_dataset, batch_size=batch_size, num_workers=args.num_workers, device=device),
+            args.bn_recal_batches,
+            lambda images: model(images, sample_posterior=True, return_dict=False),
+        )
+        print(f"Recalibrated BatchNorm statistics on {used} train batches.")
 
     splits = ("val", "test") if args.split == "both" else (args.split,)
     eval_datasets = build_vae_eval_datasets(config, splits)
