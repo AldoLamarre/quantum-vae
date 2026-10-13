@@ -51,6 +51,7 @@ class VAEBackboneConfig:
     correlator_order: Optional[int] = None
     n_clusters: Optional[int] = None
     cluster_routing: Optional[str] = None
+    device_profile: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -150,6 +151,7 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     correlator_order = strategy_cfg.get("correlator_order", vae_cfg.get("correlator_order"))
     n_clusters = strategy_cfg.get("n_clusters", vae_cfg.get("n_clusters"))
     cluster_routing = strategy_cfg.get("cluster_routing", vae_cfg.get("cluster_routing"))
+    device_profile = strategy_cfg.get("device_profile", vae_cfg.get("device_profile"))
     if strategy == "neutral_atom_vae" and n_atoms is None:
         raise ValueError(
             "vae_backbone.neutral_atom_vae.n_atoms is required when "
@@ -177,6 +179,7 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         correlator_order=int(correlator_order) if correlator_order is not None else None,
         n_clusters=int(n_clusters) if n_clusters is not None else None,
         cluster_routing=str(cluster_routing) if cluster_routing is not None else None,
+        device_profile=str(device_profile) if device_profile is not None else None,
     )
 
 
@@ -286,13 +289,14 @@ def build_vae_backbone_instance(
             register_geometry=backbone_cfg.register_geometry or "chain",
             atom_spacing_um=backbone_cfg.atom_spacing_um or 8.0,
             r0_um=backbone_cfg.r0_um,
-            C6=backbone_cfg.C6 or 862690.0,
+            C6=backbone_cfg.C6,  # None: use the device profile's C6
             evolution_time_us=backbone_cfg.evolution_time_us or 4.0,
             n_segments=backbone_cfg.n_segments or 6,
             measurement_kind=backbone_cfg.measurement_kind or "expectation",
             correlator_order=backbone_cfg.correlator_order or 1,
             n_clusters=backbone_cfg.n_clusters or 1,
             cluster_routing=backbone_cfg.cluster_routing or "global",
+            device_profile=backbone_cfg.device_profile or "aquila",
         )
         backbone = QuantumVAENeutralAtom(device_cfg, **_default_vae_model_kwargs(dataset_name))
     else:

@@ -186,6 +186,8 @@ class TrainerConfigParser:
                 model_kwargs["pre_quantum_gain"] = float(cfg["pre_quantum_gain"])
             if "evolution_backend" in cfg:
                 model_kwargs["evolution_backend"] = str(cfg["evolution_backend"])
+            if "device_profile" in cfg:
+                model_kwargs["device_profile"] = str(cfg["device_profile"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -340,6 +342,7 @@ class TrainerConfigParser:
                     "fourier_atom_dim", "lam_offset", "lam_span",
                     "atom_token_mode", "graph_residual", "post_quantum_gate_init",
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
+                    "device_profile",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

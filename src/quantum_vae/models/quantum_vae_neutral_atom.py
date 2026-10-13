@@ -39,10 +39,13 @@ Parameter tiers:
       x's effect on the circuit is never zero at initialization. With
       lam_span set, lam = lam_pulseqpu + lam_span * tanh(lam_encoder).
 
-Hardware amplitude limits (Aquila, in units of 2*pi MHz -- see
-AQUILA_OMEGA_MAX_MHZ / AQUILA_DELTA_MAX_MHZ / AQUILA_LOCAL_DETUNING_MAX_MHZ
-below): Omega0_MHz in [0, 2.5], Delta0_MHz (global detuning) in
-[-20, 20], and the per-atom local field V_i(x) in [-25, 25]. Enforced by
+Hardware limits come from NeutralAtomDeviceConfig.device_profile (see
+DEVICE_PROFILES), in units of 2*pi MHz:
+    "aquila" (default): Omega0 in [0, 2.5], Delta0 in [-20, 20],
+        V_i in [-25, 25], C6 = 862690.
+    "pasqal_dmm": Omega0 in [0, 2.0], Delta0 in [-10, 10], V_i in [0, 10],
+        C6 = 1948282 (Rydberg 75).
+Enforced by
 smooth (tanh/sigmoid) reparameterization rather than a hard clamp, so
 gradients keep flowing even when a raw value is pushed past the bound --
 see NeutralAtomPulseLayer.forward for Omega0/Delta0, _build_qnode for
@@ -99,11 +102,87 @@ has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
 
-# Aquila (QuEra) hardware amplitude limits, in units of 2*pi MHz. Fixed
-# physical constants, not tunable config -- see module docstring.
+# Aquila (QuEra) limits in 2*pi MHz. Kept for backward compatibility;
+# DEVICE_PROFILES is the source of truth.
 AQUILA_OMEGA_MAX_MHZ = 2.5  # global Rabi frequency: one-sided, >= 0
 AQUILA_DELTA_MAX_MHZ = 20.0  # global detuning: symmetric, [-20, 20]
 AQUILA_LOCAL_DETUNING_MAX_MHZ = 25.0  # per-atom local field magnitude
+
+# Pasqal WeightedAnalogDevice (pulser-core 1.9.1), converted from rad/us to
+# MHz. AnalogDevice has no DMM (local detuning) and is not offered.
+# Check against the calibrated QPU specs before a hardware run.
+PASQAL_DMM_C6_MHZ_UM6 = 1_948_281.6328864507  # Rydberg level 75
+PASQAL_DMM_OMEGA_MAX_MHZ = 2.0  # global Rabi frequency: one-sided, >= 0
+PASQAL_DMM_DELTA_MAX_MHZ = 10.0  # global detuning: symmetric, [-10, 10]
+PASQAL_DMM_LOCAL_DETUNING_MAX_MHZ = 10.0  # per atom, detuning in [-10, 0]
+PASQAL_DMM_TOTAL_LOCAL_DETUNING_MAX_MHZ = 1000.0  # summed over atoms
+PASQAL_DMM_MIN_ATOM_DISTANCE_UM = 5.0
+PASQAL_DMM_MAX_RADIAL_DISTANCE_UM = 80.0
+PASQAL_DMM_MAX_SEQUENCE_US = 6.0
+PASQAL_DMM_MAX_ATOMS = 256
+PASQAL_DMM_CLOCK_PERIOD_NS = 4
+
+# Sharpness (1/MHz) of the softplus floor for one-sided local fields.
+LOCAL_FIELD_FLOOR_SHARPNESS = 4.0
+
+
+@dataclass(frozen=True)
+class DeviceProfile:
+    """Hardware constants of one QPU (MHz, um, us), shared by all backends.
+
+    local_field_one_sided: local detuning has one sign only (Pasqal DMM),
+    i.e. V_i >= 0 with H_local = +2*pi*V_i*n_i. Limits set to None are not
+    validated.
+    """
+
+    name: str
+    C6: float
+    omega_max_mhz: float
+    delta_max_mhz: float
+    local_detuning_max_mhz: float
+    local_field_one_sided: bool
+    total_local_detuning_max_mhz: Optional[float] = None
+    min_atom_distance_um: Optional[float] = None
+    max_radial_distance_um: Optional[float] = None
+    max_sequence_us: Optional[float] = None
+    max_atoms: Optional[int] = None
+    clock_period_ns: Optional[int] = None
+
+
+DEVICE_PROFILES = {
+    # Original constants; existing checkpoints reproduce unchanged.
+    "aquila": DeviceProfile(
+        name="aquila",
+        C6=862690.0,
+        omega_max_mhz=AQUILA_OMEGA_MAX_MHZ,
+        delta_max_mhz=AQUILA_DELTA_MAX_MHZ,
+        local_detuning_max_mhz=AQUILA_LOCAL_DETUNING_MAX_MHZ,
+        local_field_one_sided=False,
+    ),
+    "pasqal_dmm": DeviceProfile(
+        name="pasqal_dmm",
+        C6=PASQAL_DMM_C6_MHZ_UM6,
+        omega_max_mhz=PASQAL_DMM_OMEGA_MAX_MHZ,
+        delta_max_mhz=PASQAL_DMM_DELTA_MAX_MHZ,
+        local_detuning_max_mhz=PASQAL_DMM_LOCAL_DETUNING_MAX_MHZ,
+        local_field_one_sided=True,
+        total_local_detuning_max_mhz=PASQAL_DMM_TOTAL_LOCAL_DETUNING_MAX_MHZ,
+        min_atom_distance_um=PASQAL_DMM_MIN_ATOM_DISTANCE_UM,
+        max_radial_distance_um=PASQAL_DMM_MAX_RADIAL_DISTANCE_UM,
+        max_sequence_us=PASQAL_DMM_MAX_SEQUENCE_US,
+        max_atoms=PASQAL_DMM_MAX_ATOMS,
+        clock_period_ns=PASQAL_DMM_CLOCK_PERIOD_NS,
+    ),
+}
+
+
+def get_device_profile(name: str) -> DeviceProfile:
+    try:
+        return DEVICE_PROFILES[name]
+    except KeyError:
+        raise ValueError(
+            f"device_profile='{name}' is not supported. Use one of {sorted(DEVICE_PROFILES)}."
+        ) from None
 
 
 def correlator_index_sets(n_atoms: int, order: int) -> List[tuple]:
@@ -115,14 +194,21 @@ def correlator_index_sets(n_atoms: int, order: int) -> List[tuple]:
     ]
 
 
-def local_field_mhz(x, lam, V0, bounded: bool, tanh: Callable):
+def local_field_mhz(x, lam, V0, bounded: bool, xp, profile: Optional[DeviceProfile] = None):
     """Per-atom local field V0 * (1 + lam * x) in MHz, optionally soft-bounded.
 
-    `tanh` selects the array library (torch.tanh or jax.numpy.tanh).
+    `xp` is the torch or jax.numpy module. `profile` defaults to Aquila.
+    Symmetric profiles: max * tanh(v / max). One-sided profiles apply a
+    softplus floor at 0 first, so v is in [0, max].
     """
+    profile = profile or DEVICE_PROFILES["aquila"]
     v = V0 * (1.0 + lam * x)
     if bounded:
-        v = AQUILA_LOCAL_DETUNING_MAX_MHZ * tanh(v / AQUILA_LOCAL_DETUNING_MAX_MHZ)
+        vmax = profile.local_detuning_max_mhz
+        if profile.local_field_one_sided:
+            beta = LOCAL_FIELD_FLOOR_SHARPNESS
+            v = xp.logaddexp(v * 0.0, beta * v) / beta
+        v = vmax * xp.tanh(v / vmax)
     return v
 
 
@@ -201,7 +287,7 @@ class NeutralAtomDeviceConfig:
     # reproduces every existing config's exact behavior.
     n_clusters: int = 1
     # Diagnostic/ablation switch. True (default): Omega0/Delta0/V_i(x) are
-    # soft-bounded to the Aquila limits via sigmoid/tanh (see class
+    # soft-bounded to the device_profile limits via sigmoid/tanh (see class
     # docstring). False: skip the bound entirely, raw values used as-is --
     # for isolating whether the bound itself is responsible for a training
     # regression, not a supported deployment mode (values are no longer
@@ -296,6 +382,12 @@ class NeutralAtomDeviceConfig:
     # "torch_expm": exact piecewise-constant evolution via matrix
     # exponentials in torch; ode_rtol/ode_atol are ignored.
     evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane"
+    # Target hardware: C6 default, pulse bounds and register/timing checks.
+    device_profile: Literal["aquila", "pasqal_dmm"] = "aquila"
+
+    @property
+    def profile(self) -> DeviceProfile:
+        return get_device_profile(self.device_profile)
 
     def __post_init__(self):
         if self.evolution_backend not in ("pennylane", "torch_expm"):
@@ -303,6 +395,7 @@ class NeutralAtomDeviceConfig:
                 f"evolution_backend='{self.evolution_backend}' is not supported. "
                 "Use 'pennylane' or 'torch_expm'."
             )
+        self._validate_against_profile(get_device_profile(self.device_profile))
         if self.lam_span is not None:
             if self.lam_span <= 0.0:
                 raise ValueError(f"lam_span={self.lam_span} must be > 0.")
@@ -411,6 +504,54 @@ class NeutralAtomDeviceConfig:
                 "targets. Single injection is final for this device."
             )
 
+    def _validate_against_profile(self, profile: DeviceProfile) -> None:
+        """Raise on registers/timings the hardware cannot run; warn on off-clock segments."""
+        n_physical = self.n_atoms * self.n_clusters
+        if profile.max_atoms is not None and n_physical > profile.max_atoms:
+            raise ValueError(
+                f"n_atoms*n_clusters={n_physical} exceeds {profile.name}'s "
+                f"max_atoms={profile.max_atoms}."
+            )
+        pos = np.asarray(self.register_um, dtype=float)
+        if profile.min_atom_distance_um is not None and len(pos) > 1:
+            diffs = pos[:, None, :] - pos[None, :, :]
+            dists = np.linalg.norm(diffs, axis=-1)[np.triu_indices(len(pos), k=1)]
+            if dists.min() < profile.min_atom_distance_um - 1e-9:
+                raise ValueError(
+                    f"Minimum atom distance {dists.min():.3f} um is below "
+                    f"{profile.name}'s min_atom_distance_um={profile.min_atom_distance_um}."
+                )
+        if profile.max_radial_distance_um is not None:
+            # Measured from the register centroid.
+            radial = np.linalg.norm(pos - pos.mean(axis=0), axis=-1).max()
+            if radial > profile.max_radial_distance_um + 1e-9:
+                raise ValueError(
+                    f"Register radius {radial:.3f} um (from centroid) exceeds "
+                    f"{profile.name}'s max_radial_distance_um={profile.max_radial_distance_um}."
+                )
+        if profile.max_sequence_us is not None and self.evolution_time_us > profile.max_sequence_us + 1e-12:
+            raise ValueError(
+                f"evolution_time_us={self.evolution_time_us} exceeds "
+                f"{profile.name}'s max_sequence_us={profile.max_sequence_us}."
+            )
+        if (
+            profile.total_local_detuning_max_mhz is not None
+            and n_physical * profile.local_detuning_max_mhz > profile.total_local_detuning_max_mhz
+        ):
+            raise ValueError(
+                f"{n_physical} atoms at up to {profile.local_detuning_max_mhz} MHz local "
+                f"detuning each can exceed {profile.name}'s total DMM budget of "
+                f"{profile.total_local_detuning_max_mhz} MHz."
+            )
+        if profile.clock_period_ns is not None:
+            seg_ns = self.evolution_time_us * 1000.0 / self.n_segments
+            if abs(seg_ns / profile.clock_period_ns - round(seg_ns / profile.clock_period_ns)) > 1e-6:
+                warnings.warn(
+                    f"Segment duration {seg_ns:.3f} ns is not a multiple of {profile.name}'s "
+                    f"{profile.clock_period_ns} ns clock period.",
+                    stacklevel=3,
+                )
+
     @classmethod
     def from_geometry(
         cls,
@@ -418,7 +559,7 @@ class NeutralAtomDeviceConfig:
         register_geometry: str = "chain",
         atom_spacing_um: float = 8.0,
         r0_um: Optional[float] = None,
-        C6: float = 862690.0,
+        C6: Optional[float] = None,
         evolution_time_us: float = 4.0,
         n_segments: int = 6,
         measurement_kind: Literal["expectation", "probability", "correlators"] = "expectation",
@@ -444,10 +585,21 @@ class NeutralAtomDeviceConfig:
         pre_quantum_norm: Optional[str] = None,
         pre_quantum_gain: float = 0.4,
         evolution_backend: Literal["pennylane", "torch_expm"] = "pennylane",
+        device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
+
+        C6=None uses the device profile's C6; a different explicit C6 warns.
         """
+        profile = get_device_profile(device_profile)
+        if C6 is None:
+            C6 = profile.C6
+        elif not np.isclose(C6, profile.C6, rtol=1e-6):
+            warnings.warn(
+                f"C6={C6} overrides device_profile='{device_profile}' C6={profile.C6}.",
+                stacklevel=2,
+            )
         register = _build_register(n_atoms, geometry=register_geometry, spacing=atom_spacing_um)
         return cls(
             n_atoms=n_atoms,
@@ -479,6 +631,7 @@ class NeutralAtomDeviceConfig:
             pre_quantum_norm=pre_quantum_norm,
             pre_quantum_gain=pre_quantum_gain,
             evolution_backend=evolution_backend,
+            device_profile=device_profile,
         )
 
 
@@ -692,6 +845,7 @@ class PennyLaneEvolver(nn.Module):
         bound_pulse_params = self.device_cfg.bound_pulse_params
         measurement_kind = self.device_cfg.measurement_kind
         correlator_order = 1 if measurement_kind == "expectation" else self.device_cfg.correlator_order
+        profile = self.device_cfg.profile
 
         H_interaction = qml.pulse.rydberg_interaction(
             list(self.device_cfg.register_um), wires=wires, interaction_coeff=self.device_cfg.C6
@@ -736,7 +890,7 @@ class PennyLaneEvolver(nn.Module):
             # global phase and is dropped, leaving -pi * V_i on Z_i.
             def make_local_coeff(i):
                 def f(p, t):
-                    v_i = local_field_mhz(p, lam, V0_np[i], bound_pulse_params, jnp.tanh)
+                    v_i = local_field_mhz(p, lam, V0_np[i], bound_pulse_params, jnp, profile)
                     return -np.pi * v_i
                 return f
 
@@ -806,11 +960,8 @@ class NeutralAtomPulseLayer(nn.Module):
     Omega0(t)/Delta0(t) can be.
 
     Whatever the source, raw Omega0_MHz/Delta0_MHz are soft-bounded to
-    Aquila's physical amplitude limits before reaching the physics
-    (AQUILA_OMEGA_MAX_MHZ, AQUILA_DELTA_MAX_MHZ -- see forward's
-    Omega0_bounded/Delta0_bounded), via sigmoid/tanh rather than a hard
-    clamp so gradients keep flowing past the bound. V_i(x) is bounded
-    the same way inside _build_qnode (AQUILA_LOCAL_DETUNING_MAX_MHZ).
+    the device profile's limits via sigmoid/tanh, so gradients keep
+    flowing past the bound. V_i(x) is bounded in local_field_mhz.
 
     Trainable when omega_delta_source="trainable": Omega0_MHz, Delta0_MHz
     (each n_segments-length vectors). NOT trainable here in either mode:
@@ -853,11 +1004,8 @@ class NeutralAtomPulseLayer(nn.Module):
         if self.omega_delta_source == "trainable":
             omega0_target = 1.0  # baseline value; must stay > 0, Omega=0 has no dynamics
             if device.bound_pulse_params:
-                # Raw init is the logit of (target / AQUILA_OMEGA_MAX_MHZ),
-                # so the bounded value (AQUILA_OMEGA_MAX_MHZ * sigmoid(raw))
-                # starts at target, matching the pre-clamp default instead
-                # of jumping to a different value at raw=target.
-                omega0_p = omega0_target / AQUILA_OMEGA_MAX_MHZ
+                # Logit of target / omega_max, so the bounded value starts at target.
+                omega0_p = omega0_target / device.profile.omega_max_mhz
                 omega0_init = float(np.log(omega0_p / (1.0 - omega0_p)))
             else:
                 # No sigmoid downstream -- init directly at the target.
@@ -1004,16 +1152,17 @@ class NeutralAtomPulseLayer(nn.Module):
         return out
 
     def _bounded_omega_delta(self, Omega0_MHz: torch.Tensor, Delta0_MHz: torch.Tensor):
-        """Soft-bound raw Omega0/Delta0 to Aquila's global drive limits.
+        """Soft-bound raw Omega0/Delta0 to the device profile's drive limits.
 
         sigmoid/tanh instead of a hard clamp keeps gradients flowing past the
         bound; applied to both omega_delta_source modes.
         """
         if not self.device_cfg.bound_pulse_params:
             return Omega0_MHz, Delta0_MHz
+        profile = self.device_cfg.profile
         return (
-            AQUILA_OMEGA_MAX_MHZ * torch.sigmoid(Omega0_MHz),
-            AQUILA_DELTA_MAX_MHZ * torch.tanh(Delta0_MHz),
+            profile.omega_max_mhz * torch.sigmoid(Omega0_MHz),
+            profile.delta_max_mhz * torch.tanh(Delta0_MHz),
         )
 
     def extra_repr(self) -> str:
@@ -1057,6 +1206,8 @@ class NeutralAtomPulseLayer(nn.Module):
             f"lam_span={self.device_cfg.lam_span}, "
             f"evolution_time_us={self.device_cfg.evolution_time_us}, "
             f"evolution_backend={self.device_cfg.evolution_backend}, "
+            f"device_profile={self.device_cfg.device_profile}, "
+            f"C6={self.device_cfg.C6}, "
             + omega_delta_str
         )
 
