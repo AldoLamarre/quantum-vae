@@ -68,7 +68,11 @@ def main() -> None:
     parsed = cfg_parser.parse(config)
 
     model = cfg_parser.build_model(parsed)
-    state = torch.load(args.checkpoint, map_location="cpu")
+    if args.checkpoint.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state = load_file(args.checkpoint)
+    else:
+        state = torch.load(args.checkpoint, map_location="cpu")
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
     model.load_state_dict(state, strict=True)
