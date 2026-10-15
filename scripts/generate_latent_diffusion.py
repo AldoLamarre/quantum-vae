@@ -107,7 +107,10 @@ def main() -> None:
             angles = xyz_from_quat(quats)  # (n_samples, n_qubits, 3)
             quantum_input = angles.reshape(args.n_samples, -1)  # (n_samples, n_qubits*3)
 
+            # The qlayer runs on its own device (CPU for default.qubit).
+            quantum_input = quantum_input.to(base_vae._quantum_torch_device)
             quantum_output = base_vae.qlayer(quantum_input)
+            quantum_output = quantum_output.to(base_vae.project_from_quantum.weight.device)
             z_quantum_flat = base_vae.project_from_quantum(quantum_output)
             z_quantum = z_quantum_flat.reshape(args.n_samples, *latent_shape)
             images = base_vae.decode(z_quantum).sample
