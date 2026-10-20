@@ -192,6 +192,8 @@ class TrainerConfigParser:
                 model_kwargs["cluster_grid"] = [int(v) for v in cfg["cluster_grid"]]
             if "graph_output" in cfg:
                 model_kwargs["graph_output"] = str(cfg["graph_output"])
+            if "graph_cell_write" in cfg:
+                model_kwargs["graph_cell_write"] = str(cfg["graph_cell_write"])
             if "pulse_shape" in cfg:
                 model_kwargs["pulse_shape"] = str(cfg["pulse_shape"])
             if "pulse_steps" in cfg:
@@ -354,7 +356,7 @@ class TrainerConfigParser:
                     "fourier_atom_dim", "lam_offset", "lam_span",
                     "atom_token_mode", "graph_residual", "post_quantum_gate_init",
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
-                    "device_profile", "cluster_grid", "graph_output",
+                    "device_profile", "cluster_grid", "graph_output", "graph_cell_write",
                     "pulse_shape", "pulse_steps", "omega_ramp_us", "pulse_delta_scale",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}

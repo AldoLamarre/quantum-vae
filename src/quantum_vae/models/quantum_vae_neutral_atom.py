@@ -420,6 +420,10 @@ class NeutralAtomDeviceConfig:
     # Graph projections only. "pooled": attention-pool all atoms into one
     # vector. "spatial": each atom writes its own latent patch.
     graph_output: Literal["pooled", "spatial"] = "pooled"
+    # Graph projections only, spatial output with atoms sharing latent cells.
+    # "resample": bilinear resampling of the atom grid (original). "merge":
+    # concatenate the atoms of each cell and map them with a shared layer.
+    graph_cell_write: Literal["resample", "merge"] = "resample"
     # "piecewise": n_segments constant segments (original). "windowed":
     # n_segments control points, linear in between, Omega multiplied by a
     # window that is zero at t=0 and t=T, simulated on pulse_steps steps.
@@ -583,6 +587,12 @@ class NeutralAtomDeviceConfig:
             )
         if self.graph_output != "pooled" and self.projection_kind != "graph":
             raise ValueError("graph_output='spatial' requires projection_kind='graph'.")
+        if self.graph_cell_write not in ("resample", "merge"):
+            raise ValueError(
+                f"graph_cell_write='{self.graph_cell_write}' is not supported. Use 'resample' or 'merge'."
+            )
+        if self.graph_cell_write == "merge" and self.graph_output != "spatial":
+            raise ValueError("graph_cell_write='merge' requires graph_output='spatial'.")
         if self.projection_kind == "graph":
             if self.n_clusters > 1:
                 if self.cluster_grid is None:
@@ -702,6 +712,7 @@ class NeutralAtomDeviceConfig:
         device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
         cluster_grid: Optional[Sequence[int]] = None,
         graph_output: Literal["pooled", "spatial"] = "pooled",
+        graph_cell_write: Literal["resample", "merge"] = "resample",
         pulse_shape: Literal["piecewise", "windowed"] = "piecewise",
         pulse_steps: int = 80,
         omega_ramp_us: float = 0.15,
@@ -754,6 +765,7 @@ class NeutralAtomDeviceConfig:
             device_profile=device_profile,
             cluster_grid=tuple(cluster_grid) if cluster_grid is not None else None,
             graph_output=graph_output,
+            graph_cell_write=graph_cell_write,
             pulse_shape=pulse_shape,
             pulse_steps=pulse_steps,
             omega_ramp_us=omega_ramp_us,
@@ -1516,6 +1528,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 layout=self.register_layout,
                 output_mode=self.device_cfg.graph_output,
                 latent_shape=tuple(z.shape[1:]),
+                cell_write=self.device_cfg.graph_cell_write,
             ).to(dummy.device)
         else:
             self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)

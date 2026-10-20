@@ -514,6 +514,34 @@ class GraphLatentToLocalField(nn.Module):
         return x, lam, extract_attn, h
 
 
+def _merge_plan(cell_index: torch.Tensor, n_atoms: int, grid: Tuple[int, int], latent_hw: Tuple[int, int]):
+    """Per axis, either several atoms merge into one latent cell (atom grid a
+    multiple of the latent) or one merged cell writes a patch (latent a
+    multiple of the atom grid). Returns (merge factors, patch factors,
+    merge_idx [n_cells, merge_r * merge_c] of atom indices; n_atoms = empty).
+    """
+    merge, patch = [], []
+    for g, size in zip(grid, latent_hw):
+        if g >= size and g % size == 0:
+            merge.append(g // size)
+            patch.append(1)
+        elif g < size and size % g == 0:
+            merge.append(1)
+            patch.append(size // g)
+        else:
+            raise ValueError(
+                f"cell_write='merge' needs each atom grid axis to be a multiple or divisor of the "
+                f"latent size; got atom grid {grid} and latent {latent_hw}. Use cell_write='resample'."
+            )
+    (mr, mc), (gr, gc) = merge, grid
+    lookup = torch.full((gr * gc,), n_atoms, dtype=torch.long)
+    lookup[cell_index] = torch.arange(n_atoms)
+    rows = (torch.arange(gr // mr).view(-1, 1, 1, 1) * mr + torch.arange(mr).view(1, 1, -1, 1))
+    cols = (torch.arange(gc // mc).view(1, -1, 1, 1) * mc + torch.arange(mc).view(1, 1, 1, -1))
+    merge_idx = lookup[(rows * gc + cols).reshape(-1, mr * mc)]
+    return tuple(merge), tuple(patch), merge_idx
+
+
 class GraphQuantumToDecoderVector(nn.Module):
     """Correlator readout -> graph -> decoder-facing vector. Drop-in
     replacement for project_from_quantum's nn.Linear.
@@ -538,9 +566,15 @@ class GraphQuantumToDecoderVector(nn.Module):
     then out_layer -> out_dim. output_mode="spatial": each atom writes its
     own latent patch at the cell it is routed to (requires latent_shape and
     a register layout); output width does not depend on the hyperedge count.
-    When the latent is not an integer multiple of the atom grid, each atom
-    writes one value per channel and the atom grid is bilinearly resampled
-    to the latent size.
+    When the latent is not an integer multiple of the atom grid, cell_write
+    decides how atoms sharing a latent cell are combined:
+      "resample": each atom writes one value per channel and the atom grid
+        is bilinearly resampled to the latent size (low-pass: suppresses
+        differences between neighbouring atoms).
+      "merge": the features of the atoms sharing a cell are concatenated
+        and mapped to the cell by one shared linear layer (lossless).
+        Requires each axis of the atom grid to be a multiple or a divisor
+        of the latent size.
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, out_dim: int,
@@ -548,11 +582,14 @@ class GraphQuantumToDecoderVector(nn.Module):
                  register_um: Sequence[Sequence[float]] = None,
                  use_fourier_pos: bool = False, fourier_atom_dim: int = 4,
                  residual: bool = False, layout: Optional[RegisterLayout] = None,
-                 output_mode: str = "pooled", latent_shape: Optional[Tuple[int, int, int]] = None):
+                 output_mode: str = "pooled", latent_shape: Optional[Tuple[int, int, int]] = None,
+                 cell_write: str = "resample"):
         super().__init__()
         validate_measurement_kind(measurement_kind)
         if output_mode not in ("pooled", "spatial"):
             raise ValueError(f"output_mode='{output_mode}' is not supported. Use 'pooled' or 'spatial'.")
+        if cell_write not in ("resample", "merge"):
+            raise ValueError(f"cell_write='{cell_write}' is not supported. Use 'resample' or 'merge'.")
         if layout is None:
             layout = RegisterLayout(n_atoms, correlator_order, register_um)
         self.layout = layout
@@ -604,13 +641,20 @@ class GraphQuantumToDecoderVector(nn.Module):
                 raise ValueError(f"latent_shape={tuple(latent_shape)} does not match out_dim={out_dim}.")
             self.latent_shape = (channels, height, width)
             self.grid_shape = (grid_rows, grid_cols)
+            self.merge = None
             if height % grid_rows == 0 and width % grid_cols == 0:
                 self.patch = (height // grid_rows, width // grid_cols)
+            elif cell_write == "merge":
+                self.merge, self.patch, merge_idx = _merge_plan(
+                    layout.cell_index, n_atoms, (grid_rows, grid_cols), (height, width)
+                )
+                self.register_buffer("merge_idx", merge_idx, persistent=False)
             else:
                 self.patch = None
             patch_cells = 1 if self.patch is None else self.patch[0] * self.patch[1]
+            merged = 1 if self.merge is None else self.merge[0] * self.merge[1]
             self.register_buffer("cell_index", layout.cell_index.clone(), persistent=False)
-            self.cell_layer = nn.Linear(d_model, channels * patch_cells)
+            self.cell_layer = nn.Linear(d_model * merged, channels * patch_cells)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         _pop_derived_buffers(self, state_dict, prefix, ("atom_pos_small", "slot_idx"), prefix_ok=("slot_idx",))
@@ -618,10 +662,15 @@ class GraphQuantumToDecoderVector(nn.Module):
 
     def atoms_to_latent(self, atom_out: torch.Tensor) -> torch.Tensor:
         """[B, n_atoms, C*ph*pw] (or [B, n_atoms, C] when resampling) ->
-        [B, C*H*W] in z.flatten(1) order. Cells without an atom stay zero."""
+        [B, C*H*W] in z.flatten(1) order. Cells without an atom stay zero.
+        With merging, atom_out is per merged cell: [B, n_cells, C*ph*pw]."""
         B = atom_out.shape[0]
         channels, height, width = self.latent_shape
         grid_rows, grid_cols = self.grid_shape
+        if self.merge is not None:
+            ph, pw = self.patch
+            cells = atom_out.reshape(B, height // ph, width // pw, channels, ph, pw)
+            return cells.permute(0, 3, 1, 4, 2, 5).reshape(B, channels * height * width)
         if self.patch is None:
             cells = atom_out.new_zeros(B, grid_rows * grid_cols, channels)
             cells[:, self.cell_index] = atom_out
@@ -632,6 +681,14 @@ class GraphQuantumToDecoderVector(nn.Module):
         cells[:, self.cell_index] = atom_out
         cells = cells.reshape(B, grid_rows, grid_cols, channels, ph, pw)
         return cells.permute(0, 3, 1, 4, 2, 5).reshape(B, channels * height * width)
+
+    def write_latent(self, h: torch.Tensor) -> torch.Tensor:
+        """Spatial output: atom features [B, n_atoms, d] -> [B, C*H*W]."""
+        if self.merge is not None:
+            # Concatenate the atoms of each merged cell; empty slots are zero.
+            h_pad = torch.cat([h, h.new_zeros(h.shape[0], 1, h.shape[-1])], dim=1)
+            h = h_pad[:, self.merge_idx].reshape(h.shape[0], self.merge_idx.shape[0], -1)
+        return self.atoms_to_latent(self.cell_layer(h))
 
     def forward(self, readout: torch.Tensor):
         B = readout.shape[0]
@@ -658,7 +715,7 @@ class GraphQuantumToDecoderVector(nn.Module):
 
         h = h.reshape(B, self.n_atoms, -1)
         if self.output_mode == "spatial":
-            return self.atoms_to_latent(self.cell_layer(h))
+            return self.write_latent(h)
         q = self.pool_query.unsqueeze(0).expand(B, -1, -1)
         pooled, _ = self.pool_attn(q, h, h)
         return self.out_layer(pooled.squeeze(1))
