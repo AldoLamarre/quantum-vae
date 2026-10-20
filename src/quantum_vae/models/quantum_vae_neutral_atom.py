@@ -1337,13 +1337,6 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 n_clusters=self.device_cfg.n_clusters,
                 cluster_grid=self.device_cfg.cluster_grid,
             )
-            if self.device_cfg.n_clusters > 1 or self.device_cfg.graph_output == "spatial":
-                grid_rows, grid_cols = layout.grid_shape
-                if z.shape[2] % grid_rows or z.shape[3] % grid_cols:
-                    raise ValueError(
-                        f"Latent grid {z.shape[2]}x{z.shape[3]} is not divisible by the "
-                        f"atom grid {grid_rows}x{grid_cols} (cluster_grid x register grid)."
-                    )
             self.register_layout = layout
             self.project_to_quantum = GraphLatentToLocalField(
                 self.device_cfg.n_atoms,

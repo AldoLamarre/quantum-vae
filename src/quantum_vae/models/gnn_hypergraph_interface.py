@@ -319,12 +319,21 @@ def _pop_derived_buffers(module: nn.Module, state_dict: dict, prefix: str,
                 current.copy_(saved)
 
 
+def resample_grid(grid: torch.Tensor, size: Tuple[int, int]) -> torch.Tensor:
+    """Bilinear resampling of [B, C, H, W] to size, antialiased when shrinking."""
+    return F.interpolate(grid, size=size, mode="bilinear", align_corners=False, antialias=True)
+
+
 class LatentToAtomPatches(nn.Module):
     """Each atom reads the latent region at its register position: the
     latent grid is average-pooled to the register's (rows, cols) layout,
     and each atom takes its own cell. Gives atoms distinct inputs from
     initialization, unlike learned-query cross-attention. With a layout,
     the grid spans all clusters (cluster grid x atom grid).
+
+    If the atom grid is larger than the latent on either axis, the latent
+    is bilinearly resampled to the atom grid instead, so several atoms can
+    read the same region.
     """
 
     def __init__(self, register_um: Sequence[Sequence[float]], latent_channels: int, d_model: int,
@@ -343,10 +352,17 @@ class LatentToAtomPatches(nn.Module):
         _pop_derived_buffers(self, state_dict, prefix, ("row_idx", "col_idx"))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
+    def sample_cells(self, z_spatial: torch.Tensor) -> torch.Tensor:
+        """[B, C, H, W] -> [B, n_atoms, C]: the latent values each atom reads."""
+        height, width = z_spatial.shape[-2:]
+        if self.n_rows <= height and self.n_cols <= width:
+            pooled = F.adaptive_avg_pool2d(z_spatial, (self.n_rows, self.n_cols))
+        else:
+            pooled = resample_grid(z_spatial, (self.n_rows, self.n_cols))
+        return pooled[:, :, self.row_idx, self.col_idx].transpose(1, 2)
+
     def forward(self, z_spatial: torch.Tensor):
-        pooled = F.adaptive_avg_pool2d(z_spatial, (self.n_rows, self.n_cols))
-        tokens = pooled[:, :, self.row_idx, self.col_idx].transpose(1, 2)  # [B, n_atoms, C]
-        return self.proj(self.norm_tokens(tokens)), None
+        return self.proj(self.norm_tokens(self.sample_cells(z_spatial))), None
 
 
 class GraphLatentToLocalField(nn.Module):
@@ -464,6 +480,9 @@ class GraphQuantumToDecoderVector(nn.Module):
     then out_layer -> out_dim. output_mode="spatial": each atom writes its
     own latent patch at the cell it is routed to (requires latent_shape and
     a register layout); output width does not depend on the hyperedge count.
+    When the latent is not an integer multiple of the atom grid, each atom
+    writes one value per channel and the atom grid is bilinearly resampled
+    to the latent size.
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, out_dim: int,
@@ -523,28 +542,34 @@ class GraphQuantumToDecoderVector(nn.Module):
                 raise ValueError("output_mode='spatial' requires latent_shape and a register layout.")
             channels, height, width = (int(v) for v in latent_shape)
             grid_rows, grid_cols = layout.grid_shape
-            if height % grid_rows or width % grid_cols:
-                raise ValueError(
-                    f"Latent grid {height}x{width} is not divisible by the atom grid {grid_rows}x{grid_cols}."
-                )
             if channels * height * width != out_dim:
                 raise ValueError(f"latent_shape={tuple(latent_shape)} does not match out_dim={out_dim}.")
             self.latent_shape = (channels, height, width)
-            self.patch = (height // grid_rows, width // grid_cols)
+            self.grid_shape = (grid_rows, grid_cols)
+            if height % grid_rows == 0 and width % grid_cols == 0:
+                self.patch = (height // grid_rows, width // grid_cols)
+            else:
+                self.patch = None
+            patch_cells = 1 if self.patch is None else self.patch[0] * self.patch[1]
             self.register_buffer("cell_index", layout.cell_index.clone(), persistent=False)
-            self.cell_layer = nn.Linear(d_model, channels * self.patch[0] * self.patch[1])
+            self.cell_layer = nn.Linear(d_model, channels * patch_cells)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         _pop_derived_buffers(self, state_dict, prefix, ("atom_pos_small", "slot_idx"), prefix_ok=("slot_idx",))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def atoms_to_latent(self, atom_out: torch.Tensor) -> torch.Tensor:
-        """[B, n_atoms, C*ph*pw] -> [B, C*H*W] in z.flatten(1) order. Cells
-        without an atom stay zero."""
+        """[B, n_atoms, C*ph*pw] (or [B, n_atoms, C] when resampling) ->
+        [B, C*H*W] in z.flatten(1) order. Cells without an atom stay zero."""
         B = atom_out.shape[0]
         channels, height, width = self.latent_shape
+        grid_rows, grid_cols = self.grid_shape
+        if self.patch is None:
+            cells = atom_out.new_zeros(B, grid_rows * grid_cols, channels)
+            cells[:, self.cell_index] = atom_out
+            grid = cells.transpose(1, 2).reshape(B, channels, grid_rows, grid_cols)
+            return resample_grid(grid, (height, width)).reshape(B, channels * height * width)
         ph, pw = self.patch
-        grid_rows, grid_cols = height // ph, width // pw
         cells = atom_out.new_zeros(B, grid_rows * grid_cols, channels * ph * pw)
         cells[:, self.cell_index] = atom_out
         cells = cells.reshape(B, grid_rows, grid_cols, channels, ph, pw)
