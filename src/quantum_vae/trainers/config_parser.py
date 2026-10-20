@@ -188,6 +188,10 @@ class TrainerConfigParser:
                 model_kwargs["evolution_backend"] = str(cfg["evolution_backend"])
             if "device_profile" in cfg:
                 model_kwargs["device_profile"] = str(cfg["device_profile"])
+            if "cluster_grid" in cfg:
+                model_kwargs["cluster_grid"] = [int(v) for v in cfg["cluster_grid"]]
+            if "graph_output" in cfg:
+                model_kwargs["graph_output"] = str(cfg["graph_output"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -342,7 +346,7 @@ class TrainerConfigParser:
                     "fourier_atom_dim", "lam_offset", "lam_span",
                     "atom_token_mode", "graph_residual", "post_quantum_gate_init",
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
-                    "device_profile",
+                    "device_profile", "cluster_grid", "graph_output",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -354,23 +358,11 @@ class TrainerConfigParser:
                 try:
                     model = model_cls(device_cfg, **kwargs)
                 except Exception as exc:
-                    fallback_kwargs = dict(
-                        in_channels=kwargs.get("in_channels", 3),
-                        out_channels=kwargs.get("out_channels", 3),
-                        sample_size=kwargs.get("sample_size", 32),
-                        block_out_channels=kwargs.get("block_out_channels", (32, 32, 64)),
-                        down_block_types=kwargs.get("down_block_types", ("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D")),
-                        up_block_types=kwargs.get("up_block_types", ("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D")),
-                    )
-                    warnings.warn(
+                    # No silent fallback: a default architecture would not match the config.
+                    raise ValueError(
                         f"Failed to construct {model_cls.__name__} with configured kwargs "
-                        f"{kwargs}: {type(exc).__name__}: {exc}. Falling back to default "
-                        f"architecture kwargs {fallback_kwargs}. The model you get may NOT "
-                        "match what your config requested -- fix the underlying error above "
-                        "if that matters for this run.",
-                        stacklevel=2,
-                    )
-                    model = model_cls(device_cfg, **fallback_kwargs)
+                        f"{kwargs}: {type(exc).__name__}: {exc}"
+                    ) from exc
             else:
                 try:
                     model = model_cls(**kwargs)

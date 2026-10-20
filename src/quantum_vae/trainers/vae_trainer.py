@@ -408,6 +408,20 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
                     lambda images: self.model(images, sample_posterior=True, return_dict=False),
                 )
 
+    def _cluster_diagnostics(self, dataset: Any, num_images: int = 64) -> Dict[str, float]:
+        model = self.model
+        device_cfg = getattr(model, "device_cfg", None)
+        if device_cfg is None or getattr(device_cfg, "n_clusters", 1) <= 1:
+            return {}
+        if not hasattr(model, "cluster_diagnostics"):
+            return {}
+        batch = self._build_preview_batch(dataset, num_images)
+        if batch is None or batch.shape[0] < 2:
+            return {}
+        prepared = self._prepare_inputs({"sample": batch})
+        stats = model.cluster_diagnostics(prepared["sample"])
+        return {f"eval_{k}": v for k, v in stats.items()}
+
     def evaluate(
         self,
         eval_dataset: Optional[Any] = None,
@@ -425,6 +439,10 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
             current_epoch = 1
 
         if metric_key_prefix == "eval":
+            cluster_metrics = self._cluster_diagnostics(dataset_for_preview)
+            if cluster_metrics:
+                metrics.update(cluster_metrics)
+                self.log(cluster_metrics)
             should_save_periodic = current_epoch == 1 or (current_epoch % self.reconstruction_every_n_epochs == 0)
             if should_save_periodic:
                 self._save_reconstruction_preview(dataset_for_preview, split="validation", tag="periodic", epoch=current_epoch)

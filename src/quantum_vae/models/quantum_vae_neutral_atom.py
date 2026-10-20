@@ -92,7 +92,7 @@ import itertools
 import warnings
 from dataclasses import dataclass
 from math import comb
-from typing import Callable, List, Literal, Optional, Sequence
+from typing import Callable, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -335,8 +335,8 @@ class NeutralAtomDeviceConfig:
     # "linear" (default): LatentToLocalField / nn.Linear, unchanged.
     # "graph": hypergraph message-passing projections (see
     # gnn_hypergraph_interface.py) in place of both. Requires
-    # n_clusters=1, omega_delta_source="trainable", and
-    # measurement_kind != "probability" -- see __post_init__.
+    # omega_delta_source="trainable" and measurement_kind != "probability";
+    # n_clusters > 1 also needs cluster_grid and atom_token_mode="spatial".
     projection_kind: Literal["linear", "graph"] = "linear"
     # Hidden width for the graph projections. Only read when
     # projection_kind="graph".
@@ -386,6 +386,12 @@ class NeutralAtomDeviceConfig:
     evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane"
     # Target hardware: C6 default, pulse bounds and register/timing checks.
     device_profile: Literal["aquila", "pasqal_dmm"] = "aquila"
+    # Graph projections only. (rows, cols) placement of clusters on the
+    # latent grid, row-major in cluster order. Required when n_clusters > 1.
+    cluster_grid: Optional[Tuple[int, int]] = None
+    # Graph projections only. "pooled": attention-pool all atoms into one
+    # vector. "spatial": each atom writes its own latent patch.
+    graph_output: Literal["pooled", "spatial"] = "pooled"
 
     @property
     def profile(self) -> DeviceProfile:
@@ -469,13 +475,27 @@ class NeutralAtomDeviceConfig:
                 f"projection_kind='{self.projection_kind}' is not "
                 "supported. Use 'linear' or 'graph'."
             )
+        if self.cluster_grid is not None:
+            grid = tuple(int(v) for v in self.cluster_grid)
+            if len(grid) != 2 or min(grid) < 1:
+                raise ValueError(f"cluster_grid={self.cluster_grid} must be two positive integers.")
+            object.__setattr__(self, "cluster_grid", grid)
+            if grid[0] * grid[1] != self.n_clusters:
+                raise ValueError(f"cluster_grid={grid} does not match n_clusters={self.n_clusters}.")
+            if self.projection_kind != "graph":
+                raise ValueError("cluster_grid requires projection_kind='graph'.")
+        if self.graph_output not in ("pooled", "spatial"):
+            raise ValueError(
+                f"graph_output='{self.graph_output}' is not supported. Use 'pooled' or 'spatial'."
+            )
+        if self.graph_output != "pooled" and self.projection_kind != "graph":
+            raise ValueError("graph_output='spatial' requires projection_kind='graph'.")
         if self.projection_kind == "graph":
-            if self.n_clusters != 1:
-                raise NotImplementedError(
-                    "projection_kind='graph' requires n_clusters=1 -- the "
-                    "graph projections do not yet have a per-cluster "
-                    "output routing."
-                )
+            if self.n_clusters > 1:
+                if self.cluster_grid is None:
+                    raise ValueError("projection_kind='graph' with n_clusters > 1 requires cluster_grid.")
+                if self.atom_token_mode != "spatial":
+                    raise ValueError("projection_kind='graph' with n_clusters > 1 requires atom_token_mode='spatial'.")
             if self.omega_delta_source != "trainable":
                 raise NotImplementedError(
                     "projection_kind='graph' requires "
@@ -588,6 +608,8 @@ class NeutralAtomDeviceConfig:
         pre_quantum_gain: float = 0.4,
         evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane",
         device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
+        cluster_grid: Optional[Sequence[int]] = None,
+        graph_output: Literal["pooled", "spatial"] = "pooled",
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -634,6 +656,8 @@ class NeutralAtomDeviceConfig:
             pre_quantum_gain=pre_quantum_gain,
             evolution_backend=evolution_backend,
             device_profile=device_profile,
+            cluster_grid=tuple(cluster_grid) if cluster_grid is not None else None,
+            graph_output=graph_output,
         )
 
 
@@ -1249,6 +1273,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
 
         self.project_to_quantum: Optional[nn.Module] = None
         self.project_from_quantum: Optional[nn.Module] = None
+        self.register_layout = None
         self.post_quantum_bn: Optional[nn.BatchNorm1d] = None
         self.post_quantum_gate: Optional[nn.Parameter] = None
         self.quantum_pad: int = 0
@@ -1294,7 +1319,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         if self.device_cfg.projection_kind == "graph":
             # Imported lazily: torch_geometric is only required for
             # projection_kind="graph", not a hard dependency of this module.
-            from .gnn_hypergraph_interface import GraphLatentToLocalField
+            from .gnn_hypergraph_interface import GraphLatentToLocalField, RegisterLayout
             if z.dim() != 4:
                 raise ValueError(
                     f"projection_kind='graph' requires a spatial [B,C,H,W] "
@@ -1305,6 +1330,21 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 1 if self.device_cfg.measurement_kind == "expectation"
                 else self.device_cfg.correlator_order
             )
+            layout = RegisterLayout(
+                self.device_cfg.n_atoms,
+                effective_order,
+                self.device_cfg.register_um,
+                n_clusters=self.device_cfg.n_clusters,
+                cluster_grid=self.device_cfg.cluster_grid,
+            )
+            if self.device_cfg.n_clusters > 1 or self.device_cfg.graph_output == "spatial":
+                grid_rows, grid_cols = layout.grid_shape
+                if z.shape[2] % grid_rows or z.shape[3] % grid_cols:
+                    raise ValueError(
+                        f"Latent grid {z.shape[2]}x{z.shape[3]} is not divisible by the "
+                        f"atom grid {grid_rows}x{grid_cols} (cluster_grid x register grid)."
+                    )
+            self.register_layout = layout
             self.project_to_quantum = GraphLatentToLocalField(
                 self.device_cfg.n_atoms,
                 effective_order,
@@ -1317,6 +1357,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 residual=self.device_cfg.graph_residual,
                 pre_quantum_norm=self.device_cfg.pre_quantum_norm,
                 pre_quantum_gain=self.device_cfg.pre_quantum_gain,
+                layout=layout,
             ).to(dummy.device)
         else:
             self.project_to_quantum = LatentToLocalField(
@@ -1361,6 +1402,9 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 use_fourier_pos=self.device_cfg.use_fourier_hyperedge_pos,
                 fourier_atom_dim=self.device_cfg.fourier_atom_dim,
                 residual=self.device_cfg.graph_residual,
+                layout=self.register_layout,
+                output_mode=self.device_cfg.graph_output,
+                latent_shape=tuple(z.shape[1:]),
             ).to(dummy.device)
         else:
             self.project_from_quantum = nn.Linear(self.qlayer.measurement_dim, latent_dim).to(dummy.device)
@@ -1433,6 +1477,35 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             z_quantum_flat = z_quantum_flat + self.post_quantum_gate * (normed - z_quantum_flat)
 
         return z_quantum_flat.reshape(old_shape)
+
+    @torch.no_grad()
+    def cluster_diagnostics(self, sample: torch.FloatTensor, dead_ratio: float = 0.05) -> dict:
+        """Per-cluster spread across the batch of x and of the readout.
+
+        A cluster counts as dead when its readout spread is below dead_ratio
+        times the median spread over clusters.
+        """
+        n_atoms, n_clusters = self.device_cfg.n_atoms, self.device_cfg.n_clusters
+        was_training = self.training
+        self.eval()
+        try:
+            combined = self.get_pre_quantum_features(sample, sample_posterior=False)
+            combined = combined.to(self._quantum_torch_device, dtype=torch.float32)
+            readout = self.qlayer(combined)
+        finally:
+            self.train(was_training)
+        batch = combined.shape[0]
+        x_std = combined[:, : n_atoms * n_clusters].reshape(batch, n_clusters, n_atoms).std(0).mean(-1)
+        readout_std = readout.reshape(batch, n_clusters, -1).std(0).mean(-1)
+        median = readout_std.median().clamp_min(1e-12)
+        return {
+            "cluster_x_std_min": float(x_std.min()),
+            "cluster_x_std_mean": float(x_std.mean()),
+            "cluster_readout_std_min": float(readout_std.min()),
+            "cluster_readout_std_mean": float(readout_std.mean()),
+            "cluster_readout_std_argmin": int(readout_std.argmin()),
+            "cluster_dead": int((readout_std < dead_ratio * median).sum()),
+        }
 
     def get_pre_quantum_features(
         self,

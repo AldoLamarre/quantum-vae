@@ -6,9 +6,12 @@ GraphQuantumToDecoderVector: correlator readout -> decoder-facing vector.
 Hyperedges are built from atom subsets (order 1..correlator_order), in the
 same enumeration order as _correlator_ops in quantum_vae_neutral_atom.py.
 Batched via block-diagonal graph construction (no Python loop over batch).
+
+RegisterLayout is the single source of truth for atom indexing, latent
+routing and the hyperedge/readout order across clusters.
 """
 import itertools
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -166,20 +169,179 @@ def register_grid_index(register_um: Sequence[Sequence[float]]):
     return len(ys), len(xs), row_idx, col_idx
 
 
+class RegisterLayout:
+    """Global atom indexing for n_clusters copies of one register.
+
+    Atoms are numbered cluster-major (global index = cluster * n_atoms + atom),
+    matching the qlayer's x and readout layout. Clusters are placed row-major
+    on cluster_grid. Hyperedges are listed per cluster in _correlator_ops
+    order, so hyperedge i is readout column i. The list is append-only:
+    cross-cluster hyperedges can be added later without moving indices.
+
+    coords_um are layout coordinates for position features and latent
+    routing only; the physics simulates each cluster's register_um.
+    """
+
+    def __init__(self, n_atoms: int, correlator_order: int,
+                 register_um: Optional[Sequence[Sequence[float]]] = None,
+                 n_clusters: int = 1, cluster_grid: Optional[Tuple[int, int]] = None):
+        if cluster_grid is None:
+            if n_clusters != 1:
+                raise ValueError("cluster_grid is required when n_clusters > 1.")
+            cluster_grid = (1, 1)
+        cluster_rows, cluster_cols = (int(v) for v in cluster_grid)
+        if cluster_rows * cluster_cols != n_clusters:
+            raise ValueError(
+                f"cluster_grid={tuple(cluster_grid)} does not match n_clusters={n_clusters}."
+            )
+        if register_um is None and n_clusters != 1:
+            raise ValueError("register_um is required when n_clusters > 1.")
+
+        self.n_atoms = n_atoms
+        self.n_clusters = n_clusters
+        self.cluster_grid = (cluster_rows, cluster_cols)
+        self.correlator_order = correlator_order
+        self.n_nodes = n_atoms * n_clusters
+
+        _, local_subsets = build_hyperedge_index(n_atoms, correlator_order)
+        self.per_cluster_hyperedges = len(local_subsets)
+        self.subsets = [
+            tuple(c * n_atoms + a for a in subset)
+            for c in range(n_clusters) for subset in local_subsets
+        ]
+        singleton = {subset[0]: h for h, subset in enumerate(self.subsets) if len(subset) == 1}
+        self.node_readout_idx = torch.tensor([singleton[g] for g in range(self.n_nodes)], dtype=torch.long)
+        self._build_hyperedge_tensors()
+
+        self.coords_um = None
+        if register_um is not None:
+            reg = torch.as_tensor(register_um, dtype=torch.float32)
+            atom_rows, atom_cols, row_idx, col_idx = register_grid_index(register_um)
+            self.atom_grid = (atom_rows, atom_cols)
+            self.grid_shape = (cluster_rows * atom_rows, cluster_cols * atom_cols)
+            cluster_r = torch.arange(n_clusters) // cluster_cols
+            cluster_c = torch.arange(n_clusters) % cluster_cols
+            self.cell_row = (cluster_r.view(-1, 1) * atom_rows + row_idx.view(1, -1)).reshape(-1)
+            self.cell_col = (cluster_c.view(-1, 1) * atom_cols + col_idx.view(1, -1)).reshape(-1)
+            cells = self.cell_row * self.grid_shape[1] + self.cell_col
+            if torch.unique(cells).numel() != self.n_nodes:
+                raise ValueError("Two atoms map to the same latent cell; use a register with distinct grid positions.")
+            if n_clusters == 1:
+                self.coords_um = reg
+            else:
+                if n_atoms > 1:
+                    d = torch.cdist(reg, reg)
+                    nn_um = d[d > 0].min()
+                else:
+                    nn_um = torch.tensor(1.0)
+                step = (reg.max(dim=0).values - reg.min(dim=0).values) + nn_um
+                offset = torch.stack([cluster_c.float() * step[0], cluster_r.float() * step[1]], dim=-1)
+                self.coords_um = (offset.unsqueeze(1) + reg.unsqueeze(0)).reshape(-1, 2)
+
+    def _build_hyperedge_tensors(self) -> None:
+        self.n_hyperedges = len(self.subsets)
+        node_idx = [a for subset in self.subsets for a in subset]
+        edge_idx = [h for h, subset in enumerate(self.subsets) for _ in subset]
+        self.hyperedge_index = torch.tensor([node_idx, edge_idx], dtype=torch.long)
+        self.slot_idx = build_hyperedge_slot_index(self.subsets, self.correlator_order, self.n_nodes)
+
+    def append_hyperedges(self, subsets: Sequence[Sequence[int]]) -> None:
+        """Append extra hyperedges (e.g. cross-cluster pairs) after the
+        per-cluster ones. Existing indices are unchanged; the readout must
+        provide one extra column per appended hyperedge, in this order.
+        Call before building modules from this layout.
+        """
+        existing = set(self.subsets)
+        for subset in subsets:
+            subset = tuple(int(a) for a in subset)
+            if not 2 <= len(subset) <= self.correlator_order:
+                raise ValueError(
+                    f"Hyperedge {subset} must have between 2 and correlator_order={self.correlator_order} atoms."
+                )
+            if len(set(subset)) != len(subset) or min(subset) < 0 or max(subset) >= self.n_nodes:
+                raise ValueError(f"Hyperedge {subset} has invalid atom indices.")
+            if subset in existing:
+                raise ValueError(f"Hyperedge {subset} already exists.")
+            existing.add(subset)
+            self.subsets.append(subset)
+        self._build_hyperedge_tensors()
+
+    @property
+    def cell_index(self) -> torch.Tensor:
+        """Flat latent-grid cell of each global atom."""
+        return self.cell_row * self.grid_shape[1] + self.cell_col
+
+
+class _BatchedIndexCache:
+    """Caches the block-diagonal hyperedge index per (batch size, device)."""
+
+    def __init__(self, hyperedge_index: torch.Tensor, n_nodes: int, n_hyperedges: int):
+        self.hyperedge_index = hyperedge_index
+        self.n_nodes = n_nodes
+        self.n_hyperedges = n_hyperedges
+        self._cache = {}
+
+    def __call__(self, batch_size: int, device) -> torch.Tensor:
+        key = (batch_size, str(device))
+        if key not in self._cache:
+            self._cache[key] = batch_hyperedge_index(
+                self.hyperedge_index, self.n_nodes, self.n_hyperedges, batch_size, device
+            )
+        return self._cache[key]
+
+
+def _pop_derived_buffers(module: nn.Module, state_dict: dict, prefix: str,
+                         names: Sequence[str], prefix_ok: Sequence[str] = ()) -> None:
+    """Remove layout-derived buffers saved by older checkpoints.
+
+    These buffers are rebuilt from the config and are not saved. A saved
+    copy must match the rebuilt one; names in prefix_ok may be a leading
+    slice of it (hyperedges appended since the checkpoint). Matching float
+    buffers keep the saved values, so older checkpoints reproduce exactly.
+    """
+    for name in names:
+        saved = state_dict.pop(prefix + name, None)
+        current = getattr(module, name, None)
+        if saved is None or current is None:
+            continue
+        saved = saved.to(device=current.device, dtype=current.dtype)
+        if name in prefix_ok:
+            ok = (saved.shape[1:] == current.shape[1:] and saved.shape[0] <= current.shape[0]
+                  and torch.equal(saved, current[: saved.shape[0]]))
+        else:
+            ok = saved.shape == current.shape and torch.allclose(saved, current, rtol=1e-5, atol=1e-6)
+        if not ok:
+            raise RuntimeError(
+                f"Checkpoint buffer '{prefix + name}' does not match the configured register layout."
+            )
+        if current.is_floating_point():
+            with torch.no_grad():
+                current.copy_(saved)
+
+
 class LatentToAtomPatches(nn.Module):
     """Each atom reads the latent region at its register position: the
     latent grid is average-pooled to the register's (rows, cols) layout,
     and each atom takes its own cell. Gives atoms distinct inputs from
-    initialization, unlike learned-query cross-attention.
+    initialization, unlike learned-query cross-attention. With a layout,
+    the grid spans all clusters (cluster grid x atom grid).
     """
 
-    def __init__(self, register_um: Sequence[Sequence[float]], latent_channels: int, d_model: int):
+    def __init__(self, register_um: Sequence[Sequence[float]], latent_channels: int, d_model: int,
+                 layout: Optional[RegisterLayout] = None):
         super().__init__()
-        self.n_rows, self.n_cols, row_idx, col_idx = register_grid_index(register_um)
-        self.register_buffer("row_idx", row_idx)
-        self.register_buffer("col_idx", col_idx)
+        if layout is None:
+            self.n_rows, self.n_cols, row_idx, col_idx = register_grid_index(register_um)
+        else:
+            (self.n_rows, self.n_cols), row_idx, col_idx = layout.grid_shape, layout.cell_row, layout.cell_col
+        self.register_buffer("row_idx", row_idx.clone(), persistent=False)
+        self.register_buffer("col_idx", col_idx.clone(), persistent=False)
         self.norm_tokens = nn.LayerNorm(latent_channels)
         self.proj = nn.Linear(latent_channels, d_model)
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        _pop_derived_buffers(self, state_dict, prefix, ("row_idx", "col_idx"))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, z_spatial: torch.Tensor):
         pooled = F.adaptive_avg_pool2d(z_spatial, (self.n_rows, self.n_cols))
@@ -191,7 +353,12 @@ class GraphLatentToLocalField(nn.Module):
     """Cross-attention extraction + hypergraph message passing, producing
     x_i (per-atom local-detuning weight, in [0, 1]) and lam (pooled global
     scale). Drop-in replacement for LatentToLocalField's (x, lam) output;
-    supports n_clusters=1 and omega_delta_source="trainable" only.
+    supports omega_delta_source="trainable" only.
+
+    With a multi-cluster layout, x covers all n_atoms * n_clusters atoms
+    (cluster-major), graph weights are shared across clusters and lam is
+    pooled over the whole register. Multi-cluster requires
+    atom_token_mode="spatial".
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, latent_channels: int,
@@ -199,9 +366,15 @@ class GraphLatentToLocalField(nn.Module):
                  register_um: Sequence[Sequence[float]] = None,
                  use_fourier_pos: bool = False, atom_token_mode: str = "attention",
                  residual: bool = False, pre_quantum_norm: Optional[str] = None,
-                 pre_quantum_gain: float = 0.4):
+                 pre_quantum_gain: float = 0.4, layout: Optional[RegisterLayout] = None):
         super().__init__()
         validate_measurement_kind(measurement_kind)
+        if layout is None:
+            layout = RegisterLayout(n_atoms, correlator_order, register_um)
+        if layout.n_clusters > 1 and atom_token_mode != "spatial":
+            raise ValueError("n_clusters > 1 requires atom_token_mode='spatial'.")
+        self.layout = layout
+        n_atoms = layout.n_nodes
         self.n_atoms = n_atoms
         self.residual = residual
         # Optional batch normalization of the x logits: fixes the across-sample
@@ -214,7 +387,7 @@ class GraphLatentToLocalField(nn.Module):
         if atom_token_mode == "spatial":
             if register_um is None:
                 raise ValueError("atom_token_mode='spatial' requires register_um.")
-            self.extractor = LatentToAtomPatches(register_um, latent_channels, d_model)
+            self.extractor = LatentToAtomPatches(register_um, latent_channels, d_model, layout=layout)
         else:
             atom_pos = None
             if use_fourier_pos:
@@ -222,8 +395,9 @@ class GraphLatentToLocalField(nn.Module):
                     raise ValueError("use_fourier_pos=True requires register_um.")
                 atom_pos = fourier_atom_features(register_um, d_model)
             self.extractor = LatentToAtomTokens(n_atoms, latent_channels, d_model, atom_pos=atom_pos)
-        self.hyperedge_index, self.subsets = build_hyperedge_index(n_atoms, correlator_order)
-        self.n_hyperedges = len(self.subsets)
+        self.hyperedge_index, self.subsets = layout.hyperedge_index, list(layout.subsets)
+        self.n_hyperedges = layout.n_hyperedges
+        self._batched_index = _BatchedIndexCache(self.hyperedge_index, self.n_atoms, self.n_hyperedges)
         self.hconv1 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
         self.hconv2 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
 
@@ -240,9 +414,7 @@ class GraphLatentToLocalField(nn.Module):
         B = z_spatial.shape[0]
         atom_tokens, extract_attn = self.extractor(z_spatial)
 
-        batched_index = batch_hyperedge_index(
-            self.hyperedge_index, self.n_atoms, self.n_hyperedges, B, atom_tokens.device
-        )
+        batched_index = self._batched_index(B, atom_tokens.device)
         batched_node_idx, batched_edge_idx = batched_index
         n_edges_total = B * self.n_hyperedges
 
@@ -287,19 +459,34 @@ class GraphQuantumToDecoderVector(nn.Module):
     into fixed correlator_order slots, padded with a learned pad_token for
     hyperedges below the max order, so no two distinct atom subsets can
     ever collide onto the same identity vector.
+
+    output_mode="pooled" (default): attention-pool all atoms into one vector,
+    then out_layer -> out_dim. output_mode="spatial": each atom writes its
+    own latent patch at the cell it is routed to (requires latent_shape and
+    a register layout); output width does not depend on the hyperedge count.
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, out_dim: int,
                  d_model: int = 24, measurement_kind: str = "correlators",
                  register_um: Sequence[Sequence[float]] = None,
                  use_fourier_pos: bool = False, fourier_atom_dim: int = 4,
-                 residual: bool = False):
+                 residual: bool = False, layout: Optional[RegisterLayout] = None,
+                 output_mode: str = "pooled", latent_shape: Optional[Tuple[int, int, int]] = None):
         super().__init__()
         validate_measurement_kind(measurement_kind)
+        if output_mode not in ("pooled", "spatial"):
+            raise ValueError(f"output_mode='{output_mode}' is not supported. Use 'pooled' or 'spatial'.")
+        if layout is None:
+            layout = RegisterLayout(n_atoms, correlator_order, register_um)
+        self.layout = layout
+        n_atoms = layout.n_nodes
         self.n_atoms = n_atoms
         self.residual = residual
-        self.hyperedge_index, self.subsets = build_hyperedge_index(n_atoms, correlator_order)
-        self.n_hyperedges = len(self.subsets)
+        self.output_mode = output_mode
+        self.hyperedge_index, self.subsets = layout.hyperedge_index, list(layout.subsets)
+        self.n_hyperedges = layout.n_hyperedges
+        self._batched_index = _BatchedIndexCache(self.hyperedge_index, self.n_atoms, self.n_hyperedges)
+        self.register_buffer("node_readout_idx", layout.node_readout_idx, persistent=False)
 
         self.use_fourier_pos = use_fourier_pos
         if use_fourier_pos:
@@ -316,11 +503,10 @@ class GraphQuantumToDecoderVector(nn.Module):
                     "and compresses/loses part of the identity encoding). Increase "
                     "d_model, or lower fourier_atom_dim/correlator_order."
                 )
-            atom_pos_small = fourier_atom_features(register_um, fourier_atom_dim)
-            self.register_buffer("atom_pos_small", atom_pos_small)
+            atom_pos_small = fourier_atom_features(layout.coords_um, fourier_atom_dim)
+            self.register_buffer("atom_pos_small", atom_pos_small, persistent=False)
             self.pad_token = nn.Parameter(torch.zeros(fourier_atom_dim))
-            slot_idx = build_hyperedge_slot_index(self.subsets, correlator_order, n_atoms)
-            self.register_buffer("slot_idx", slot_idx)
+            self.register_buffer("slot_idx", layout.slot_idx.clone(), persistent=False)
             self.hyperedge_proj = nn.Linear(1 + identity_dim, d_model)
         else:
             self.hyperedge_proj = nn.Linear(1, d_model)
@@ -328,15 +514,45 @@ class GraphQuantumToDecoderVector(nn.Module):
         self.hconv1 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
         self.hconv2 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
 
-        self.pool_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
-        self.pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
-        self.out_layer = nn.Linear(d_model, out_dim)
+        if output_mode == "pooled":
+            self.pool_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
+            self.pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
+            self.out_layer = nn.Linear(d_model, out_dim)
+        else:
+            if latent_shape is None or layout.coords_um is None:
+                raise ValueError("output_mode='spatial' requires latent_shape and a register layout.")
+            channels, height, width = (int(v) for v in latent_shape)
+            grid_rows, grid_cols = layout.grid_shape
+            if height % grid_rows or width % grid_cols:
+                raise ValueError(
+                    f"Latent grid {height}x{width} is not divisible by the atom grid {grid_rows}x{grid_cols}."
+                )
+            if channels * height * width != out_dim:
+                raise ValueError(f"latent_shape={tuple(latent_shape)} does not match out_dim={out_dim}.")
+            self.latent_shape = (channels, height, width)
+            self.patch = (height // grid_rows, width // grid_cols)
+            self.register_buffer("cell_index", layout.cell_index.clone(), persistent=False)
+            self.cell_layer = nn.Linear(d_model, channels * self.patch[0] * self.patch[1])
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        _pop_derived_buffers(self, state_dict, prefix, ("atom_pos_small", "slot_idx"), prefix_ok=("slot_idx",))
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def atoms_to_latent(self, atom_out: torch.Tensor) -> torch.Tensor:
+        """[B, n_atoms, C*ph*pw] -> [B, C*H*W] in z.flatten(1) order. Cells
+        without an atom stay zero."""
+        B = atom_out.shape[0]
+        channels, height, width = self.latent_shape
+        ph, pw = self.patch
+        grid_rows, grid_cols = height // ph, width // pw
+        cells = atom_out.new_zeros(B, grid_rows * grid_cols, channels * ph * pw)
+        cells[:, self.cell_index] = atom_out
+        cells = cells.reshape(B, grid_rows, grid_cols, channels, ph, pw)
+        return cells.permute(0, 3, 1, 4, 2, 5).reshape(B, channels * height * width)
 
     def forward(self, readout: torch.Tensor):
         B = readout.shape[0]
-        batched_index = batch_hyperedge_index(
-            self.hyperedge_index, self.n_atoms, self.n_hyperedges, B, readout.device
-        )
+        batched_index = self._batched_index(B, readout.device)
 
         if self.use_fourier_pos:
             # (n_atoms+1, atom_dim): real atom rows plus one pad row.
@@ -349,7 +565,7 @@ class GraphQuantumToDecoderVector(nn.Module):
         else:
             hyperedge_attr = self.hyperedge_proj(readout.reshape(-1, 1))
 
-        h = hyperedge_attr.reshape(B, self.n_hyperedges, -1)[:, :self.n_atoms, :]
+        h = hyperedge_attr.reshape(B, self.n_hyperedges, -1)[:, self.node_readout_idx, :]
         h = h.reshape(B * self.n_atoms, -1)
 
         out = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=hyperedge_attr))
@@ -358,6 +574,8 @@ class GraphQuantumToDecoderVector(nn.Module):
         h = h + out if self.residual else out
 
         h = h.reshape(B, self.n_atoms, -1)
+        if self.output_mode == "spatial":
+            return self.atoms_to_latent(self.cell_layer(h))
         q = self.pool_query.unsqueeze(0).expand(B, -1, -1)
         pooled, _ = self.pool_attn(q, h, h)
         return self.out_layer(pooled.squeeze(1))
