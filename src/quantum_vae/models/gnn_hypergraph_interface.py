@@ -11,6 +11,7 @@ RegisterLayout is the single source of truth for atom indexing, latent
 routing and the hyperedge/readout order across clusters.
 """
 import itertools
+import math
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -365,6 +366,45 @@ class LatentToAtomPatches(nn.Module):
         return self.proj(self.norm_tokens(self.sample_cells(z_spatial))), None
 
 
+def time_features(times: torch.Tensor, dim: int) -> torch.Tensor:
+    """Fixed sinusoidal features [len(times), dim] of times in [0, 1]."""
+    n_freq = dim // 2
+    freqs = torch.logspace(0, 2, n_freq) * math.pi
+    args = times[:, None] * freqs[None, :]
+    feats = torch.cat([args.sin(), args.cos()], dim=-1)
+    if feats.shape[1] < dim:
+        feats = torch.cat([feats, times[:, None]], dim=-1)
+    return feats
+
+
+class PulseQueryHead(nn.Module):
+    """Per-sample pulse corrections at n_points control points.
+
+    One query per control point (fixed time features plus a learned offset)
+    cross-attends the atom tokens; a shared MLP maps each query to raw
+    (Omega, Delta) corrections. The last layer is zero-initialized, so the
+    corrections start at zero. Output [B, 2 * n_points]: Omega, then Delta.
+    """
+
+    def __init__(self, d_model: int, n_points: int):
+        super().__init__()
+        n_heads = 4 if d_model % 4 == 0 else 1
+        times = (torch.arange(n_points, dtype=torch.float32) + 0.5) / n_points
+        self.register_buffer("time_embed", time_features(times, d_model), persistent=False)
+        self.query_offset = nn.Parameter(torch.zeros(n_points, d_model))
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 2))
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, atom_tokens: torch.Tensor) -> torch.Tensor:
+        B = atom_tokens.shape[0]
+        q = (self.time_embed + self.query_offset).unsqueeze(0).expand(B, -1, -1)
+        out, _ = self.attn(q, atom_tokens, atom_tokens)
+        a = self.mlp(out)  # [B, n_points, 2]
+        return torch.cat([a[..., 0], a[..., 1]], dim=-1)
+
+
 class GraphLatentToLocalField(nn.Module):
     """Cross-attention extraction + hypergraph message passing, producing
     x_i (per-atom local-detuning weight, in [0, 1]) and lam (pooled global
@@ -375,6 +415,9 @@ class GraphLatentToLocalField(nn.Module):
     (cluster-major), graph weights are shared across clusters and lam is
     pooled over the whole register. Multi-cluster requires
     atom_token_mode="spatial".
+
+    pulse_points (optional): adds a PulseQueryHead producing per-sample
+    pulse corrections at that many control points (see pack()).
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, latent_channels: int,
@@ -382,7 +425,8 @@ class GraphLatentToLocalField(nn.Module):
                  register_um: Sequence[Sequence[float]] = None,
                  use_fourier_pos: bool = False, atom_token_mode: str = "attention",
                  residual: bool = False, pre_quantum_norm: Optional[str] = None,
-                 pre_quantum_gain: float = 0.4, layout: Optional[RegisterLayout] = None):
+                 pre_quantum_gain: float = 0.4, layout: Optional[RegisterLayout] = None,
+                 pulse_points: Optional[int] = None):
         super().__init__()
         validate_measurement_kind(measurement_kind)
         if layout is None:
@@ -425,8 +469,22 @@ class GraphLatentToLocalField(nn.Module):
         self.lam_pool_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
         self.lam_pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
         self.lam_layer = nn.Linear(d_model, 1)
+        self.pulse_head = PulseQueryHead(d_model, pulse_points) if pulse_points is not None else None
 
     def forward(self, z_spatial: torch.Tensor):
+        x, lam, extract_attn, _ = self._encode(z_spatial)
+        return x, lam, extract_attn
+
+    def pack(self, z_spatial: torch.Tensor) -> torch.Tensor:
+        """Qlayer input: [x, lam] plus, with a pulse head, the raw pulse
+        corrections [Omega_1..Omega_Q, Delta_1..Delta_Q]."""
+        x, lam, _, h = self._encode(z_spatial)
+        parts = [x, lam.unsqueeze(-1)]
+        if self.pulse_head is not None:
+            parts.append(self.pulse_head(h))
+        return torch.cat(parts, dim=-1)
+
+    def _encode(self, z_spatial: torch.Tensor):
         B = z_spatial.shape[0]
         atom_tokens, extract_attn = self.extractor(z_spatial)
 
@@ -453,7 +511,7 @@ class GraphLatentToLocalField(nn.Module):
         pooled, _ = self.lam_pool_attn(q, h, h)
         lam = self.lam_layer(pooled.squeeze(1)).squeeze(-1)
 
-        return x, lam, extract_attn
+        return x, lam, extract_attn, h
 
 
 class GraphQuantumToDecoderVector(nn.Module):

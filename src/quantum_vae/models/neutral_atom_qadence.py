@@ -66,8 +66,8 @@ class QadenceEvolver(nn.Module):
         self.measurement_kind = device.measurement_kind
         n = device.n_atoms
         self.n_atoms = n
-        self.n_segments = device.n_segments
-        dt = device.evolution_time_us / device.n_segments
+        self.n_segments = device.simulation_steps
+        dt = device.evolution_time_us / device.simulation_steps
 
         pos = torch.tensor(device.register_um, dtype=torch.float64)
         interaction = add(*[

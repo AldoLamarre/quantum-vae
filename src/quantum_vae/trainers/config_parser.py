@@ -192,6 +192,14 @@ class TrainerConfigParser:
                 model_kwargs["cluster_grid"] = [int(v) for v in cfg["cluster_grid"]]
             if "graph_output" in cfg:
                 model_kwargs["graph_output"] = str(cfg["graph_output"])
+            if "pulse_shape" in cfg:
+                model_kwargs["pulse_shape"] = str(cfg["pulse_shape"])
+            if "pulse_steps" in cfg:
+                model_kwargs["pulse_steps"] = int(cfg["pulse_steps"])
+            if "omega_ramp_us" in cfg:
+                model_kwargs["omega_ramp_us"] = float(cfg["omega_ramp_us"])
+            if "pulse_delta_scale" in cfg:
+                model_kwargs["pulse_delta_scale"] = float(cfg["pulse_delta_scale"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -347,6 +355,7 @@ class TrainerConfigParser:
                     "atom_token_mode", "graph_residual", "post_quantum_gate_init",
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
                     "device_profile", "cluster_grid", "graph_output",
+                    "pulse_shape", "pulse_steps", "omega_ramp_us", "pulse_delta_scale",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

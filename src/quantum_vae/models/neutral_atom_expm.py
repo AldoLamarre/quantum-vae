@@ -46,8 +46,8 @@ class ExpmEvolver(nn.Module):
         self.device_cfg = device
         n = device.n_atoms
         dim = 2 ** n
-        self.n_segments = device.n_segments
-        self.dt = device.evolution_time_us / device.n_segments
+        self.n_segments = device.simulation_steps
+        self.dt = device.evolution_time_us / device.simulation_steps
         self.bounded = device.bound_pulse_params
         self.profile = device.profile
         self.measurement_kind = device.measurement_kind

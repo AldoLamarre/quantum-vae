@@ -108,6 +108,7 @@ from .ansatz_vae_base import AnsatzVAEBase
 AQUILA_OMEGA_MAX_MHZ = 2.5  # global Rabi frequency: one-sided, >= 0
 AQUILA_DELTA_MAX_MHZ = 20.0  # global detuning: symmetric, [-20, 20]
 AQUILA_LOCAL_DETUNING_MAX_MHZ = 25.0  # per-atom local field magnitude
+AQUILA_OMEGA_SLEW_MAX_MHZ_PER_US = 250.0 / (2.0 * np.pi)  # 250 rad/us^2 (arXiv:2306.11727)
 
 # Pasqal WeightedAnalogDevice (pulser-core 1.9.1), converted from rad/us to
 # MHz. AnalogDevice has no DMM (local detuning) and is not offered.
@@ -148,6 +149,7 @@ class DeviceProfile:
     max_sequence_us: Optional[float] = None
     max_atoms: Optional[int] = None
     clock_period_ns: Optional[int] = None
+    omega_slew_max_mhz_per_us: Optional[float] = None
 
 
 DEVICE_PROFILES = {
@@ -159,6 +161,7 @@ DEVICE_PROFILES = {
         delta_max_mhz=AQUILA_DELTA_MAX_MHZ,
         local_detuning_max_mhz=AQUILA_LOCAL_DETUNING_MAX_MHZ,
         local_field_one_sided=False,
+        omega_slew_max_mhz_per_us=AQUILA_OMEGA_SLEW_MAX_MHZ_PER_US,
     ),
     "pasqal_dmm": DeviceProfile(
         name="pasqal_dmm",
@@ -213,6 +216,29 @@ def local_field_mhz(x, lam, V0, bounded: bool, xp, profile: Optional[DeviceProfi
     return v
 
 
+def windowed_pulse_basis(n_points: int, n_steps: int, duration_us: float, ramp_us: float):
+    """Linear interpolation matrix [n_points, n_steps] from control points
+    at segment centres to step midpoints (held constant outside the first
+    and last centre), and the Omega window [n_steps]: sin^2 rise and fall
+    of length ramp_us, 1 in between, 0 at both ends.
+    """
+    t = (torch.arange(n_steps, dtype=torch.float64) + 0.5) * duration_us / n_steps
+    centres = (torch.arange(n_points, dtype=torch.float64) + 0.5) * duration_us / n_points
+    interp = torch.zeros(n_points, n_steps, dtype=torch.float64)
+    if n_points == 1:
+        interp[0] = 1.0
+    else:
+        pos = ((t - centres[0]) / (centres[1] - centres[0])).clamp(0.0, n_points - 1.0)
+        left = pos.floor().long().clamp(max=n_points - 2)
+        frac = pos - left
+        cols = torch.arange(n_steps)
+        interp[left, cols] = 1.0 - frac
+        interp[left + 1, cols] += frac
+    edge = torch.minimum(t, duration_us - t)
+    window = torch.where(edge < ramp_us, torch.sin(0.5 * np.pi * edge / ramp_us) ** 2, torch.ones_like(t))
+    return interp.to(torch.float32), window.to(torch.float32)
+
+
 def _build_register(
     n_atoms: int,
     geometry: str = "chain",
@@ -256,7 +282,9 @@ class NeutralAtomDeviceConfig:
     # data channel now that lam can no longer carry that role. Both
     # remain within the real constraint: only Omega_k/Delta_k (shared
     # across the whole register, not per-atom) ever vary.
-    omega_delta_source: Literal["trainable", "encoder"] = "trainable"
+    # "trainable_plus_encoder": shared trainable pulse plus a bounded
+    # per-sample correction from the encoder, summed before the bound.
+    omega_delta_source: Literal["trainable", "encoder", "trainable_plus_encoder"] = "trainable"
     # "expectation": n_atoms real values, one <Z_i> per atom -- equivalent
     # to "correlators" with correlator_order=1, kept as a separate name for
     # readability and backward compatibility.
@@ -392,10 +420,72 @@ class NeutralAtomDeviceConfig:
     # Graph projections only. "pooled": attention-pool all atoms into one
     # vector. "spatial": each atom writes its own latent patch.
     graph_output: Literal["pooled", "spatial"] = "pooled"
+    # "piecewise": n_segments constant segments (original). "windowed":
+    # n_segments control points, linear in between, Omega multiplied by a
+    # window that is zero at t=0 and t=T, simulated on pulse_steps steps.
+    pulse_shape: Literal["piecewise", "windowed"] = "piecewise"
+    pulse_steps: int = 80
+    # Length of the window's rise and fall (windowed only).
+    omega_ramp_us: float = 0.15
+    # Bound c on the per-sample correction c * tanh(a)
+    # (omega_delta_source="trainable_plus_encoder").
+    pulse_delta_scale: float = 2.0
 
     @property
     def profile(self) -> DeviceProfile:
         return get_device_profile(self.device_profile)
+
+    @property
+    def simulation_steps(self) -> int:
+        """Number of piecewise-constant steps the evolvers simulate."""
+        return self.pulse_steps if self.pulse_shape == "windowed" else self.n_segments
+
+    def max_windowed_segments(self) -> Optional[int]:
+        """Largest n_segments for which the windowed Omega(t) respects the
+        profile's slew limit, or None if the profile has no slew limit."""
+        profile = self.profile
+        if profile.omega_slew_max_mhz_per_us is None:
+            return None
+        rate = profile.omega_slew_max_mhz_per_us / profile.omega_max_mhz - np.pi / (2.0 * self.omega_ramp_us)
+        return int(np.floor(self.evolution_time_us * rate + 1e-9))
+
+    def _validate_pulse_shape(self) -> None:
+        if self.pulse_shape not in ("piecewise", "windowed"):
+            raise ValueError(
+                f"pulse_shape='{self.pulse_shape}' is not supported. Use 'piecewise' or 'windowed'."
+            )
+        if self.pulse_delta_scale <= 0.0:
+            raise ValueError(f"pulse_delta_scale={self.pulse_delta_scale} must be > 0.")
+        if self.pulse_shape != "windowed":
+            return
+        if not self.bound_pulse_params:
+            raise ValueError("pulse_shape='windowed' requires bound_pulse_params=True.")
+        if self.n_segments < 1:
+            raise ValueError(f"n_segments={self.n_segments} must be >= 1.")
+        if self.pulse_steps < self.n_segments:
+            raise ValueError(f"pulse_steps={self.pulse_steps} must be >= n_segments={self.n_segments}.")
+        if not 0.0 < self.omega_ramp_us <= self.evolution_time_us / 2.0:
+            raise ValueError(
+                f"omega_ramp_us={self.omega_ramp_us} must be in (0, evolution_time_us / 2]."
+            )
+        if self.evolution_time_us / self.pulse_steps > self.omega_ramp_us / 2.0:
+            warnings.warn(
+                f"pulse_steps={self.pulse_steps} resolves the {self.omega_ramp_us} us ramp with "
+                "fewer than two steps.",
+                stacklevel=3,
+            )
+        max_segments = self.max_windowed_segments()
+        if max_segments is None:
+            warnings.warn(
+                f"device_profile='{self.device_profile}' has no Omega slew limit; the windowed "
+                "pulse is not checked against the hardware slew rate.",
+                stacklevel=3,
+            )
+        elif self.n_segments > max_segments:
+            raise ValueError(
+                f"n_segments={self.n_segments} can exceed {self.device_profile}'s Omega slew limit "
+                f"with omega_ramp_us={self.omega_ramp_us}; the maximum is {max_segments}."
+            )
 
     def __post_init__(self):
         if self.evolution_backend not in ("pennylane", "torch_expm", "qadence"):
@@ -431,11 +521,14 @@ class NeutralAtomDeviceConfig:
             raise ValueError("pre_quantum_norm requires projection_kind='graph'.")
         if self.pre_quantum_gain <= 0.0:
             raise ValueError(f"pre_quantum_gain={self.pre_quantum_gain} must be > 0.")
-        if self.omega_delta_source not in ("trainable", "encoder"):
+        if self.omega_delta_source not in ("trainable", "encoder", "trainable_plus_encoder"):
             raise ValueError(
                 f"omega_delta_source='{self.omega_delta_source}' is not "
-                "supported. Use 'trainable' or 'encoder'."
+                "supported. Use 'trainable', 'encoder' or 'trainable_plus_encoder'."
             )
+        if self.omega_delta_source == "trainable_plus_encoder" and self.projection_kind != "graph":
+            raise ValueError("omega_delta_source='trainable_plus_encoder' requires projection_kind='graph'.")
+        self._validate_pulse_shape()
         if self.measurement_kind not in ("expectation", "probability", "correlators"):
             raise ValueError(
                 f"measurement_kind='{self.measurement_kind}' is not "
@@ -496,11 +589,10 @@ class NeutralAtomDeviceConfig:
                     raise ValueError("projection_kind='graph' with n_clusters > 1 requires cluster_grid.")
                 if self.atom_token_mode != "spatial":
                     raise ValueError("projection_kind='graph' with n_clusters > 1 requires atom_token_mode='spatial'.")
-            if self.omega_delta_source != "trainable":
+            if self.omega_delta_source == "encoder":
                 raise NotImplementedError(
-                    "projection_kind='graph' requires "
-                    "omega_delta_source='trainable' -- the graph "
-                    "projections do not produce omega_seg/delta_seg."
+                    "projection_kind='graph' supports omega_delta_source="
+                    "'trainable' or 'trainable_plus_encoder'."
                 )
             if self.measurement_kind == "probability":
                 raise ValueError(
@@ -566,7 +658,7 @@ class NeutralAtomDeviceConfig:
                 f"{profile.total_local_detuning_max_mhz} MHz."
             )
         if profile.clock_period_ns is not None:
-            seg_ns = self.evolution_time_us * 1000.0 / self.n_segments
+            seg_ns = self.evolution_time_us * 1000.0 / self.simulation_steps
             if abs(seg_ns / profile.clock_period_ns - round(seg_ns / profile.clock_period_ns)) > 1e-6:
                 warnings.warn(
                     f"Segment duration {seg_ns:.3f} ns is not a multiple of {profile.name}'s "
@@ -588,7 +680,7 @@ class NeutralAtomDeviceConfig:
         correlator_order: int = 1,
         n_clusters: int = 1,
         cluster_routing: Literal["global", "local"] = "global",
-        omega_delta_source: Literal["trainable", "encoder"] = "trainable",
+        omega_delta_source: Literal["trainable", "encoder", "trainable_plus_encoder"] = "trainable",
         bound_pulse_params: bool = True,
         ode_rtol: Optional[float] = None,
         ode_atol: Optional[float] = None,
@@ -610,6 +702,10 @@ class NeutralAtomDeviceConfig:
         device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
         cluster_grid: Optional[Sequence[int]] = None,
         graph_output: Literal["pooled", "spatial"] = "pooled",
+        pulse_shape: Literal["piecewise", "windowed"] = "piecewise",
+        pulse_steps: int = 80,
+        omega_ramp_us: float = 0.15,
+        pulse_delta_scale: float = 2.0,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -658,6 +754,10 @@ class NeutralAtomDeviceConfig:
             device_profile=device_profile,
             cluster_grid=tuple(cluster_grid) if cluster_grid is not None else None,
             graph_output=graph_output,
+            pulse_shape=pulse_shape,
+            pulse_steps=pulse_steps,
+            omega_ramp_us=omega_ramp_us,
+            pulse_delta_scale=pulse_delta_scale,
         )
 
 
@@ -819,7 +919,7 @@ class PennyLaneEvolver(nn.Module):
         # x and lam are always batched (one pair per sample). Omega0/Delta0
         # are batched too when encoder-sourced (a different pulse shape per
         # sample); shared (one pulse shape for the whole batch) otherwise.
-        omega_delta_axis = 0 if self.omega_delta_source == "encoder" else None
+        omega_delta_axis = 0 if self.omega_delta_source in ("encoder", "trainable_plus_encoder") else None
         self._batched_qnode = jax.vmap(self.qnode, in_axes=(0, 0, omega_delta_axis, omega_delta_axis))
 
         # Persistent, jit-compiled forward/backward, built once and never
@@ -1031,7 +1131,7 @@ class NeutralAtomPulseLayer(nn.Module):
         # shared across every sample. Only built when trainable here --
         # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
         # forward() instead. lam is NOT here either way -- see class docstring.
-        if self.omega_delta_source == "trainable":
+        if self.omega_delta_source in ("trainable", "trainable_plus_encoder"):
             omega0_target = 1.0  # baseline value; must stay > 0, Omega=0 has no dynamics
             if device.bound_pulse_params:
                 # Logit of target / omega_max, so the bounded value starts at target.
@@ -1056,6 +1156,13 @@ class NeutralAtomPulseLayer(nn.Module):
         else:
             self.Omega0_MHz = None
             self.Delta0_MHz = None
+
+        if device.pulse_shape == "windowed":
+            interp, window = windowed_pulse_basis(
+                device.n_segments, device.pulse_steps, device.evolution_time_us, device.omega_ramp_us
+            )
+            self.register_buffer("pulse_interp", interp, persistent=False)
+            self.register_buffer("omega_window", window, persistent=False)
 
         self.evolver = _build_evolver(device, self.V0)
 
@@ -1134,10 +1241,14 @@ class NeutralAtomPulseLayer(nn.Module):
         else:
             lam_flat = lam_flat + self.lam_pulseqpu
 
-        if self.omega_delta_source == "encoder":
+        if self.omega_delta_source in ("encoder", "trainable_plus_encoder"):
             offset = n_atoms * n_clusters + 1
             omega_seg = combined[:, offset : offset + n_segments].contiguous()
             delta_seg = combined[:, offset + n_segments : offset + 2 * n_segments].contiguous()
+            if self.omega_delta_source == "trainable_plus_encoder":
+                scale = self.device_cfg.pulse_delta_scale
+                omega_seg = self.Omega0_MHz + scale * torch.tanh(omega_seg)
+                delta_seg = self.Delta0_MHz + scale * torch.tanh(delta_seg)
             Omega0_MHz = omega_seg.repeat_interleave(n_clusters, dim=0)
             Delta0_MHz = delta_seg.repeat_interleave(n_clusters, dim=0)
         else:
@@ -1190,10 +1301,13 @@ class NeutralAtomPulseLayer(nn.Module):
         if not self.device_cfg.bound_pulse_params:
             return Omega0_MHz, Delta0_MHz
         profile = self.device_cfg.profile
-        return (
-            profile.omega_max_mhz * torch.sigmoid(Omega0_MHz),
-            profile.delta_max_mhz * torch.tanh(Delta0_MHz),
-        )
+        omega = profile.omega_max_mhz * torch.sigmoid(Omega0_MHz)
+        delta = profile.delta_max_mhz * torch.tanh(Delta0_MHz)
+        if self.device_cfg.pulse_shape == "windowed":
+            # Control points -> simulation steps; Omega is zero at t=0 and t=T.
+            omega = (omega @ self.pulse_interp) * self.omega_window
+            delta = delta @ self.pulse_interp
+        return omega, delta
 
     def extra_repr(self) -> str:
         """Human-readable dump for verification against experimental data --
@@ -1209,7 +1323,7 @@ class NeutralAtomPulseLayer(nn.Module):
         def _fmt_vec(t: torch.Tensor) -> str:
             return "[" + ", ".join(f"{v:.6f}" for v in t.detach().tolist()) + "]"
 
-        if self.omega_delta_source == "trainable":
+        if self.omega_delta_source in ("trainable", "trainable_plus_encoder"):
             omega_bounded, delta_bounded = self._bounded_omega_delta(self.Omega0_MHz, self.Delta0_MHz)
             omega_delta_str = (
                 f"Omega0_MHz={_fmt_vec(omega_bounded)}, "
@@ -1351,6 +1465,10 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 pre_quantum_norm=self.device_cfg.pre_quantum_norm,
                 pre_quantum_gain=self.device_cfg.pre_quantum_gain,
                 layout=layout,
+                pulse_points=(
+                    self.device_cfg.n_segments
+                    if self.device_cfg.omega_delta_source == "trainable_plus_encoder" else None
+                ),
             ).to(dummy.device)
         else:
             self.project_to_quantum = LatentToLocalField(
@@ -1445,8 +1563,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         z_flat = z.flatten(1)
 
         if self.device_cfg.projection_kind == "graph":
-            x, lam, _ = to_quantum_layer(z)  # spatial latent in, unflattened
-            combined = torch.cat([x, lam.unsqueeze(-1)], dim=-1)
+            combined = to_quantum_layer.pack(z)  # spatial latent in, unflattened
         else:
             combined = to_quantum_layer(z_flat)  # (x, lam[, omega_seg, delta_seg])
 
@@ -1521,8 +1638,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
         if self.project_to_quantum is None or self.project_from_quantum is None:
             self.initialize_projections(sample)
-        x, lam, _ = self.project_to_quantum(z)
-        return torch.cat([x, lam.unsqueeze(-1)], dim=-1)
+        return self.project_to_quantum.pack(z)
 
     def get_latent(
         self,
