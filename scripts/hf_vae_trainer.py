@@ -7,9 +7,17 @@ from pathlib import Path
 import sys
 import torch
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from torchvision import datasets
-from torchvision.transforms import CenterCrop, Compose, Normalize, Resize, ToTensor
+from torchvision.transforms import (
+    CenterCrop,
+    Compose,
+    Normalize,
+    RandomCrop,
+    RandomHorizontalFlip,
+    Resize,
+    ToTensor,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -26,20 +34,45 @@ IMAGENET_SPLITS = {"train": "train", "val": "validation", "test": "test"}
 EVAL_SPLITS = ("val", "test")
 
 
-def _imagenet_transform(data_cfg: dict[str, object]) -> Compose:
+def _imagenet_transform(data_cfg: dict[str, object], train: bool = False) -> Compose:
+    """Resize the short side to data.resolution, then crop data.crop_size.
+
+    With data.train_augment, training images get a random crop and a
+    horizontal flip; evaluation always uses the centre crop.
+    """
     resolution = int(data_cfg.get("resolution", 256))
+    crop_size = int(data_cfg.get("crop_size", 224))
+    if crop_size > resolution:
+        raise ValueError(f"data.crop_size={crop_size} must not exceed data.resolution={resolution}.")
+    if train and bool(data_cfg.get("train_augment", False)):
+        crop = [RandomCrop(crop_size), RandomHorizontalFlip()]
+    else:
+        crop = [CenterCrop(crop_size)]
     return Compose(
         [
             Resize(resolution),
-            CenterCrop(224),
+            *crop,
             ToTensor(),
             Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
 
 
-def _load_imagenet_split(split: str, transform: Compose):
-    dataset = load_dataset("imagenet-1k", split=IMAGENET_SPLITS[split], trust_remote_code=True)
+def _load_imagenet_split(split: str, transform: Compose, data_cfg: dict[str, object] | None = None,
+                         limit: int | None = None):
+    """ImageNet split from data.imagenet_path (prepared with
+    scripts/prepare_imagenet.py) or from the Hugging Face hub.
+
+    limit: keep a fixed random subset of that many images (seed 0).
+    """
+    data_cfg = data_cfg or {}
+    path = data_cfg.get("imagenet_path")
+    if path:
+        dataset = load_from_disk(str(Path(str(path)).expanduser()))[IMAGENET_SPLITS[split]]
+    else:
+        dataset = load_dataset("imagenet-1k", split=IMAGENET_SPLITS[split], trust_remote_code=True)
+    if limit is not None and limit < len(dataset):
+        dataset = dataset.shuffle(seed=0).select(range(int(limit)))
 
     # set_transform receives batches; some ImageNet images are grayscale or CMYK.
     def to_pixel_values(batch: dict[str, list]) -> dict[str, list]:
@@ -70,11 +103,17 @@ def build_vae_dataset_bundle(config: dict[str, object]) -> dict[str, object]:
 
     if dataset_name in {"imagenet", "imagenet-1k"}:
         ssl._create_default_https_context = ssl._create_unverified_context
-        transform = _imagenet_transform(data_cfg)
+        limits = {"train": data_cfg.get("train_limit"), "val": data_cfg.get("eval_limit")}
         train_dataset, val_dataset, test_dataset = (
-            _load_imagenet_split(split, transform) for split in ("train", "val", "test")
+            _load_imagenet_split(split, _imagenet_transform(data_cfg, train=split == "train"), data_cfg,
+                                 limit=limits.get(split))
+            for split in ("train", "val", "test")
         )
-        return build_imagenet_data_bundle(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
+        bundle = build_imagenet_data_bundle(train_dataset, val_dataset, test_dataset, batch_size=batch_size)
+        if limits["val"] is not None:
+            # eval_limit only shortens the evaluations during training.
+            bundle["full_val_set"] = _load_imagenet_split("val", _imagenet_transform(data_cfg), data_cfg)
+        return bundle
 
     raise ValueError(f"Unsupported VAE dataset: {dataset_name}")
 
@@ -93,7 +132,7 @@ def build_vae_eval_datasets(config: dict[str, object], splits: tuple[str, ...]) 
     if dataset_name in {"imagenet", "imagenet-1k"}:
         data_cfg = config.get("data", {}) if isinstance(config.get("data"), dict) else {}
         transform = _imagenet_transform(data_cfg)
-        return {split: _load_imagenet_split(split, transform) for split in splits}
+        return {split: _load_imagenet_split(split, transform, data_cfg) for split in splits}
 
     bundle = build_vae_dataset_bundle(config)
     return {split: bundle[f"{split}_set"] for split in splits if f"{split}_set" in bundle}
@@ -139,7 +178,7 @@ def main(config_path: str | Path | None = None) -> None:
     final_metrics = {}
     full_val_metrics = evaluate_vae_reconstruction_dataset(
         model=trainer.model,
-        dataset=bundle["val_set"],
+        dataset=bundle.get("full_val_set", bundle["val_set"]),
         data_collator=trainer.data_collator,
         image_range=image_range,
         batch_size=eval_batch_size,

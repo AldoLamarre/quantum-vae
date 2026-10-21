@@ -61,7 +61,7 @@ def main() -> None:
     image_range = str(getattr(trainer, "image_range", "0_1"))
     eval_batch_size = int(getattr(trainer.args, "per_device_eval_batch_size", 32))
     final_metrics = {}
-    for split, key in (("validation", "val_set"), ("test", "test_set")):
+    for split, key in (("validation", "full_val_set" if "full_val_set" in bundle else "val_set"), ("test", "test_set")):
         if key not in bundle:
             continue
         final_metrics[split] = evaluate_vae_reconstruction_dataset(

@@ -36,7 +36,10 @@ class ClassicalVAE(QuantumVAEBase):
     def process_latent(self, z: torch.FloatTensor) -> torch.FloatTensor:
         if self.bottleneck_down is None:
             return z
-        return self.bottleneck_up(self.bottleneck_down(z.flatten(1))).reshape(z.shape)
+        # float32 like the quantum interface, so mixed precision affects both alike.
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            flat = self.bottleneck_down(z.float().flatten(1))
+            return self.bottleneck_up(flat).reshape(z.shape)
 
     def get_latent(
         self,

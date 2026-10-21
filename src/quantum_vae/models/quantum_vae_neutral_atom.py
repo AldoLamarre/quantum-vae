@@ -1566,6 +1566,13 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 "Projections not initialized. Call initialize_projections() "
                 "before process_latent()"
             )
+        # The quantum interface (encoder head, pulse evolution, decoder head,
+        # post-quantum norm) always runs in float32, also under autocast.
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            return self._process_latent_fp32(z.float())
+
+    def _process_latent_fp32(self, z: torch.FloatTensor) -> torch.FloatTensor:
+        skip_projection = self.device_cfg.skip_quantum_projection
         to_quantum_layer = self.project_to_quantum
 
         old_shape = z.shape

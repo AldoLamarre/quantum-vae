@@ -31,6 +31,10 @@ def _load_checkpoint_state(checkpoint_path: Path) -> Any:
     return torch.load(checkpoint_path, map_location="cpu")
 
 
+# Training keys applied to the model rather than passed to TrainingArguments.
+_MODEL_SIDE_TRAINING_KEYS = ("gradient_checkpointing",)
+
+
 @dataclass
 class TrainerParsedConfig:
     task_type: str  # "vae" | "classifier"
@@ -600,6 +604,13 @@ class TrainerConfigParser:
         if "report_to" in valid_params:
             kwargs["report_to"] = []
 
+        # Remaining keys that are TrainingArguments fields (warmup, scheduler,
+        # bf16, workers, save limits, ...). gradient_checkpointing is handled
+        # on the model in build_trainer.
+        for key, value in t_kwargs.items():
+            if key in valid_params and key not in kwargs and key not in _MODEL_SIDE_TRAINING_KEYS:
+                kwargs[key] = value
+
         eval_strat = str(t_kwargs.get("eval_strategy", t_kwargs.get("evaluation_strategy", "epoch")))
         if "eval_strategy" in valid_params:
             kwargs["eval_strategy"] = eval_strat
@@ -681,6 +692,9 @@ class TrainerConfigParser:
 
         if training_args is None:
             training_args = self.build_training_args(parsed)
+
+        if bool(parsed.training_kwargs.get("gradient_checkpointing", False)):
+            model.enable_gradient_checkpointing()
 
         if parsed.task_type == "vae":
             kl_weight = float(parsed.training_kwargs.get("kl_weight", 1e-4))
