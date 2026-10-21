@@ -375,16 +375,11 @@ class NeutralAtomDeviceConfig:
     # Delta0 at exactly zero). A small nonzero value breaks that symmetry
     # up front instead of relying on training to do it from noise alone.
     pulse_init_noise_std: float = 0.0
-    # Only read when projection_kind="graph". False (default) reproduces
-    # today's behavior: each hyperedge's embedding comes from its scalar
-    # correlator value alone (a single shared weight column, so every
-    # hyperedge's embedding sits on one line in d_model-space regardless of
-    # width -- attention in the graph layers can't tell hyperedges apart by
-    # which atoms they cover, only by value). True concatenates each
-    # hyperedge's member atoms' fixed Fourier position features (from the
-    # register's real coordinates) to the scalar value first, and adds the
-    # same per-atom features to project_to_quantum's atom queries -- see
-    # gnn_hypergraph_interface.py.
+    # Only read when projection_kind="graph". True adds fixed Fourier
+    # position features (from the register's real coordinates): to each
+    # correlator's embedding (its member atoms) and atom nodes in the
+    # decoder, and to project_to_quantum's atom queries. False: correlators
+    # are told apart by value and order only. See gnn_hypergraph_interface.py.
     use_fourier_hyperedge_pos: bool = False
     # Per-atom width of the Fourier position features above. Must be a
     # multiple of 2 (chain register) or 4 (grid register). Only read when
@@ -404,7 +399,8 @@ class NeutralAtomDeviceConfig:
     # Initial value of the post-quantum BatchNorm gate (0.0 = identity at init).
     post_quantum_gate_init: float = 0.0
     # Graph projections only. "batchnorm": normalize the x logits across the
-    # batch and rescale by pre_quantum_gain (fixed) before the sigmoid.
+    # batch and scale them by a trainable gain before the sigmoid;
+    # pre_quantum_gain is its initial value.
     pre_quantum_norm: Optional[str] = None
     pre_quantum_gain: float = 0.4
     # Time-evolution backend. "pennylane": qml.evolve ODE solve (JAX).
@@ -1621,6 +1617,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         x_std = combined[:, : n_atoms * n_clusters].reshape(batch, n_clusters, n_atoms).std(0).mean(-1)
         readout_std = readout.reshape(batch, n_clusters, -1).std(0).mean(-1)
         median = readout_std.median().clamp_min(1e-12)
+        gain = getattr(self.project_to_quantum, "pre_quantum_gain", None)
         return {
             "cluster_x_std_min": float(x_std.min()),
             "cluster_x_std_mean": float(x_std.mean()),
@@ -1628,6 +1625,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             "cluster_readout_std_mean": float(readout_std.mean()),
             "cluster_readout_std_argmin": int(readout_std.argmin()),
             "cluster_dead": int((readout_std < dead_ratio * median).sum()),
+            **({"pre_quantum_gain": gain} if gain is not None else {}),
         }
 
     def get_pre_quantum_features(

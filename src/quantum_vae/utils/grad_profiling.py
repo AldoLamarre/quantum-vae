@@ -2,7 +2,7 @@
 
 Opt-in HF TrainerCallback: prints grad norm for the projection_kind="graph"
 parameters (project_to_quantum's atom-token extractor, qlayer's own pulse
-parameters, project_from_quantum's first projection) on the same cadence
+parameters, project_from_quantum's correlator embedding) on the same cadence
 as the trainer's normal loss logging (args.logging_steps).
 
 Hooks on_pre_optimizer_step, which fires after backward() and before
@@ -16,9 +16,10 @@ from transformers import TrainerCallback
 
 DEFAULT_TRACKED_SUBSTRINGS = (
     "project_to_quantum.extractor.atom_queries",
+    "project_to_quantum.log_gain",
     "qlayer.Omega0_MHz",
     "qlayer.Delta0_MHz",
-    "project_from_quantum.hyperedge_proj.weight",
+    "project_from_quantum.correlator_embed.0.weight",
 )
 
 

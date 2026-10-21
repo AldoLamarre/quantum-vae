@@ -437,13 +437,18 @@ class GraphLatentToLocalField(nn.Module):
         n_atoms = layout.n_nodes
         self.n_atoms = n_atoms
         self.residual = residual
-        # Optional batch normalization of the x logits: fixes the across-sample
-        # spread of each atom's local field to pre_quantum_gain before the sigmoid.
+        # Optional batch normalization of the x logits, scaled by a trainable
+        # gain exp(log_gain) (initialized to pre_quantum_gain) before the sigmoid.
         if pre_quantum_norm not in (None, "batchnorm"):
             raise ValueError(f"pre_quantum_norm='{pre_quantum_norm}' is not supported.")
+        if pre_quantum_gain <= 0.0:
+            raise ValueError(f"pre_quantum_gain={pre_quantum_gain} must be > 0.")
         self.x_norm = nn.BatchNorm1d(n_atoms, affine=False) if pre_quantum_norm == "batchnorm" else None
-        self.pre_quantum_gain = float(pre_quantum_gain)
-        self.x_shift = nn.Parameter(torch.zeros(n_atoms)) if self.x_norm is not None else None
+        self.log_gain = None
+        self.x_shift = None
+        if self.x_norm is not None:
+            self.log_gain = nn.Parameter(torch.tensor(math.log(pre_quantum_gain)))
+            self.x_shift = nn.Parameter(torch.zeros(n_atoms))
         if atom_token_mode == "spatial":
             if register_um is None:
                 raise ValueError("atom_token_mode='spatial' requires register_um.")
@@ -470,6 +475,17 @@ class GraphLatentToLocalField(nn.Module):
         self.lam_pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
         self.lam_layer = nn.Linear(d_model, 1)
         self.pulse_head = PulseQueryHead(d_model, pulse_points) if pulse_points is not None else None
+
+    @property
+    def pre_quantum_gain(self) -> Optional[float]:
+        """Current gain on the normalized x logits (None without pre-quantum norm)."""
+        return None if self.log_gain is None else float(self.log_gain.detach().exp())
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        # Checkpoints saved before the gain was trainable used the configured value.
+        if self.log_gain is not None and prefix + "log_gain" not in state_dict:
+            state_dict[prefix + "log_gain"] = self.log_gain.detach().clone()
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def forward(self, z_spatial: torch.Tensor):
         x, lam, extract_attn, _ = self._encode(z_spatial)
@@ -504,7 +520,7 @@ class GraphLatentToLocalField(nn.Module):
         h = h.reshape(B, self.n_atoms, -1)
         x_logit = self.x_layer(h).squeeze(-1)
         if self.x_norm is not None:
-            x_logit = self.pre_quantum_gain * self.x_norm(x_logit) + self.x_shift
+            x_logit = self.log_gain.exp() * self.x_norm(x_logit) + self.x_shift
         x = torch.sigmoid(x_logit)
 
         q = self.lam_pool_query.unsqueeze(0).expand(B, -1, -1)
@@ -542,25 +558,67 @@ def _merge_plan(cell_index: torch.Tensor, n_atoms: int, grid: Tuple[int, int], l
     return tuple(merge), tuple(patch), merge_idx
 
 
+def _mlp(*widths: int) -> nn.Sequential:
+    """Linear layers with LayerNorm and ReLU in between. He init before a
+    ReLU, unit gain on the output layer, zero bias."""
+    layers = []
+    for i, (d_in, d_out) in enumerate(zip(widths[:-1], widths[1:])):
+        linear = nn.Linear(d_in, d_out)
+        last = i == len(widths) - 2
+        nn.init.kaiming_normal_(linear.weight, nonlinearity="linear" if last else "relu")
+        nn.init.zeros_(linear.bias)
+        layers.append(linear)
+        if not last:
+            layers += [nn.LayerNorm(d_out), nn.ReLU()]
+    return nn.Sequential(*layers)
+
+
+class AllSetLayer(nn.Module):
+    """One AllDeepSets step on the atom-correlator incidence graph
+    (Chien et al., "You are AllSet", ICLR 2022), mean aggregation.
+
+    Correlators keep their own state: each correlator reads the mean of its
+    member atoms, then each atom reads the mean of its correlators.
+    """
+
+    def __init__(self, d_model: int, residual: bool = True):
+        super().__init__()
+        self.residual = residual
+        self.atom_to_edge = _mlp(d_model, d_model, d_model)
+        self.edge_update = _mlp(2 * d_model, d_model, d_model)
+        self.edge_to_atom = _mlp(d_model, d_model, d_model)
+        self.atom_update = _mlp(2 * d_model, d_model, d_model)
+
+    def _step(self, state, update):
+        return state + update if self.residual else torch.relu(update)
+
+    def forward(self, atoms, edges, node_idx, edge_idx, atom_deg, edge_deg):
+        """atoms [N, d], edges [M, d]; (node_idx, edge_idx) are the incidence
+        pairs; atom_deg [N, 1] and edge_deg [M, 1] their counts."""
+        msg = self.atom_to_edge(atoms)[node_idx]
+        pooled = edges.new_zeros(edges.shape).index_add_(0, edge_idx, msg) / edge_deg
+        edges = self._step(edges, self.edge_update(torch.cat([edges, pooled], dim=-1)))
+        msg = self.edge_to_atom(edges)[edge_idx]
+        pooled = atoms.new_zeros(atoms.shape).index_add_(0, node_idx, msg) / atom_deg
+        atoms = self._step(atoms, self.atom_update(torch.cat([atoms, pooled], dim=-1)))
+        return atoms, edges
+
+
 class GraphQuantumToDecoderVector(nn.Module):
     """Correlator readout -> graph -> decoder-facing vector. Drop-in
     replacement for project_from_quantum's nn.Linear.
 
-    readout[i] must match build_hyperedge_index's subset order -- verified
-    against the real qlayer's _correlator_ops (same nested-loop structure
-    over wires=range(n_atoms)).
+    Every readout value (all orders, including <Z_i>) is a correlator node
+    linked to its member atoms; readout[i] is correlator i in the layout's
+    hyperedge order. Correlator nodes start from correlator_embed(value,
+    order, identity); atom nodes start from their position only. Two
+    AllSetLayer steps exchange messages between them, and the atom states
+    are written to the decoder input.
 
-    use_fourier_pos (opt-in): concatenates each hyperedge's own member-atom
-    Fourier position features to its scalar readout value before
-    hyperedge_proj, instead of projecting the bare scalar alone. Without
-    this, every hyperedge's embedding is confined to hyperedge_proj's
-    single weight column (a 1D line in d_model-space, positioned only by
-    the scalar value) -- the attention in hconv1/hconv2 has no way to tell
-    hyperedges apart by which atoms they cover, only by value. This gives
-    it that missing identity. Member atoms are concatenated (not summed)
-    into fixed correlator_order slots, padded with a learned pad_token for
-    hyperedges below the max order, so no two distinct atom subsets can
-    ever collide onto the same identity vector.
+    use_fourier_pos: each correlator's identity is the concatenated Fourier
+    position features of its member atoms (fixed correlator_order slots,
+    learned pad_token below the max order), and atom nodes start from their
+    own position features.
 
     output_mode="pooled" (default): attention-pool all atoms into one vector,
     then out_layer -> out_dim. output_mode="spatial": each atom writes its
@@ -600,7 +658,19 @@ class GraphQuantumToDecoderVector(nn.Module):
         self.hyperedge_index, self.subsets = layout.hyperedge_index, list(layout.subsets)
         self.n_hyperedges = layout.n_hyperedges
         self._batched_index = _BatchedIndexCache(self.hyperedge_index, self.n_atoms, self.n_hyperedges)
-        self.register_buffer("node_readout_idx", layout.node_readout_idx, persistent=False)
+        node_idx, edge_idx = self.hyperedge_index
+        self.register_buffer(
+            "atom_deg", torch.bincount(node_idx, minlength=n_atoms).float().unsqueeze(-1), persistent=False
+        )
+        self.register_buffer(
+            "edge_deg", torch.bincount(edge_idx, minlength=self.n_hyperedges).float().unsqueeze(-1),
+            persistent=False,
+        )
+        order_onehot = F.one_hot(
+            torch.tensor([len(s) for s in self.subsets]) - 1, num_classes=correlator_order
+        ).float()
+        self.register_buffer("order_onehot", order_onehot, persistent=False)
+        self.atom_token = nn.Parameter(torch.zeros(d_model))
 
         self.use_fourier_pos = use_fourier_pos
         if use_fourier_pos:
@@ -613,7 +683,7 @@ class GraphQuantumToDecoderVector(nn.Module):
                     f"d_model={d_model} is too small for correlator_order="
                     f"{correlator_order} with fourier_atom_dim={fourier_atom_dim} "
                     f"(needs d_model >= {min_d_model} = 1 + correlator_order * "
-                    "fourier_atom_dim, or hyperedge_proj's output rank bottlenecks "
+                    "fourier_atom_dim, or correlator_embed's width bottlenecks "
                     "and compresses/loses part of the identity encoding). Increase "
                     "d_model, or lower fourier_atom_dim/correlator_order."
                 )
@@ -621,12 +691,11 @@ class GraphQuantumToDecoderVector(nn.Module):
             self.register_buffer("atom_pos_small", atom_pos_small, persistent=False)
             self.pad_token = nn.Parameter(torch.zeros(fourier_atom_dim))
             self.register_buffer("slot_idx", layout.slot_idx.clone(), persistent=False)
-            self.hyperedge_proj = nn.Linear(1 + identity_dim, d_model)
+            self.atom_pos_proj = nn.Linear(fourier_atom_dim, d_model)
         else:
-            self.hyperedge_proj = nn.Linear(1, d_model)
-
-        self.hconv1 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
-        self.hconv2 = HypergraphConv(d_model, d_model, use_attention=True, heads=1)
+            identity_dim = 0
+        self.correlator_embed = _mlp(1 + correlator_order + identity_dim, d_model, d_model)
+        self.layers = nn.ModuleList([AllSetLayer(d_model, residual) for _ in range(2)])
 
         if output_mode == "pooled":
             self.pool_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
@@ -657,6 +726,11 @@ class GraphQuantumToDecoderVector(nn.Module):
             self.cell_layer = nn.Linear(d_model * merged, channels * patch_cells)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        if any(k.startswith(prefix + "hconv1.") for k in state_dict):
+            raise RuntimeError(
+                "Checkpoint uses the previous HypergraphConv decoder, which ignored correlators "
+                "of order >= 2. It is not compatible with the current decoder; retrain."
+            )
         _pop_derived_buffers(self, state_dict, prefix, ("atom_pos_small", "slot_idx"), prefix_ok=("slot_idx",))
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
@@ -692,26 +766,25 @@ class GraphQuantumToDecoderVector(nn.Module):
 
     def forward(self, readout: torch.Tensor):
         B = readout.shape[0]
-        batched_index = self._batched_index(B, readout.device)
+        node_idx, edge_idx = self._batched_index(B, readout.device)
 
+        parts = [readout.reshape(B, self.n_hyperedges, 1), self.order_onehot.expand(B, -1, -1)]
         if self.use_fourier_pos:
             # (n_atoms+1, atom_dim): real atom rows plus one pad row.
             atom_pos_table = torch.cat([self.atom_pos_small, self.pad_token.unsqueeze(0)], dim=0)
             identity = atom_pos_table[self.slot_idx].reshape(self.n_hyperedges, -1)
-            identity = identity.unsqueeze(0).expand(B, -1, -1).reshape(B * self.n_hyperedges, -1)
-            hyperedge_attr = self.hyperedge_proj(
-                torch.cat([readout.reshape(-1, 1), identity], dim=-1)
-            )
-        else:
-            hyperedge_attr = self.hyperedge_proj(readout.reshape(-1, 1))
+            parts.append(identity.expand(B, -1, -1))
+        edges = self.correlator_embed(torch.cat(parts, dim=-1)).reshape(B * self.n_hyperedges, -1)
 
-        h = hyperedge_attr.reshape(B, self.n_hyperedges, -1)[:, self.node_readout_idx, :]
-        h = h.reshape(B * self.n_atoms, -1)
+        atoms = self.atom_token.expand(self.n_atoms, -1)
+        if self.use_fourier_pos:
+            atoms = atoms + self.atom_pos_proj(self.atom_pos_small)
+        h = atoms.repeat(B, 1)
 
-        out = torch.relu(self.hconv1(h, batched_index, hyperedge_attr=hyperedge_attr))
-        h = h + out if self.residual else out
-        out = torch.relu(self.hconv2(h, batched_index, hyperedge_attr=hyperedge_attr))
-        h = h + out if self.residual else out
+        atom_deg = self.atom_deg.repeat(B, 1)
+        edge_deg = self.edge_deg.repeat(B, 1)
+        for layer in self.layers:
+            h, edges = layer(h, edges, node_idx, edge_idx, atom_deg, edge_deg)
 
         h = h.reshape(B, self.n_atoms, -1)
         if self.output_mode == "spatial":
