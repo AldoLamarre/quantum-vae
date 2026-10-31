@@ -15,8 +15,12 @@ from .base import BaseHFQuantumTrainer
 from .bn_recalibration import batchnorm_layers, image_batches, recalibrate_batchnorm
 from .data_collators import VAEDataCollator
 from .evaluation import IncrementalVAEMetrics, extract_input_images, normalize_image_range
+from src.quantum_vae.losses.quantum_regularizers import (
+    cluster_covariance_loss,
+    connected_correlators,
+    mean_state_fidelity,
+)
 from src.quantum_vae.losses.vicreg import variance_loss as vicreg_variance_loss
-from src.quantum_vae.losses.vicreg import covariance_loss as vicreg_covariance_loss
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 
@@ -54,6 +58,9 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         vicreg_variance_weight: float = 0.0,
         vicreg_covariance_weight: float = 0.0,
         vicreg_target_std: float = 1.0,
+        vicreg_connected_variance_weight: float = 0.0,
+        vicreg_connected_target_std: float = 0.1,
+        state_fidelity_weight: float = 0.0,
         bn_recalibration_batches: int = 100,
         **kwargs,
     ):
@@ -76,6 +83,24 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         self.vicreg_variance_weight = float(vicreg_variance_weight)
         self.vicreg_covariance_weight = float(vicreg_covariance_weight)
         self.vicreg_target_std = float(vicreg_target_std)
+        # Quantum terms: spread of the connected correlators (joint cumulants
+        # within each cluster) and mean fidelity between the cluster states of
+        # different images.
+        self.vicreg_connected_variance_weight = float(vicreg_connected_variance_weight)
+        self.vicreg_connected_target_std = float(vicreg_connected_target_std)
+        self.state_fidelity_weight = float(state_fidelity_weight)
+        self._quantum_stats: Dict[str, List[torch.Tensor]] = {}
+        device_cfg = getattr(model, "device_cfg", None)
+        self._readout_layout = None
+        if device_cfg is not None and getattr(device_cfg, "measurement_kind", None) == "correlators":
+            self._readout_layout = (int(device_cfg.n_atoms), int(device_cfg.n_clusters), int(device_cfg.correlator_order))
+        if self.vicreg_connected_variance_weight > 0 and (self._readout_layout is None or self._readout_layout[2] < 2):
+            warnings.warn("vicreg_connected_variance_weight needs correlator readout of order >= 2; disabled.", stacklevel=2)
+            self.vicreg_connected_variance_weight = 0.0
+        self._fidelity_available = getattr(device_cfg, "evolution_backend", None) == "torch_expm"
+        if self.state_fidelity_weight > 0 and not self._fidelity_available:
+            warnings.warn("state_fidelity_weight needs evolution_backend='torch_expm'; disabled.", stacklevel=2)
+            self.state_fidelity_weight = 0.0
         self.noise_after_epoch = noise_after_epoch
         self.noise_std = float(noise_std)
         self.image_range = self._normalize_image_range(image_range)
@@ -321,22 +346,8 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
 
             loss = recon_loss + self.kl_weight * kl_div
 
-            # Regularize the raw quantum circuit readout (Pauli-Z
-            # correlators), not z_quantum -- see losses/vicreg.py and the
-            # __init__ comment above for why. Only models exposing this
-            # side channel (currently QuantumVAENeutralAtom) are affected;
-            # absent on other variants, so this is a no-op there.
-            quantum_readout = getattr(model, "_last_quantum_readout", None)
-            if (
-                isinstance(quantum_readout, torch.Tensor)
-                and (self.vicreg_variance_weight > 0 or self.vicreg_covariance_weight > 0)
-            ):
-                readout_flat = quantum_readout.flatten(1)
-                loss = (
-                    loss
-                    + self.vicreg_variance_weight * vicreg_variance_loss(readout_flat, self.vicreg_target_std)
-                    + self.vicreg_covariance_weight * vicreg_covariance_loss(readout_flat)
-                )
+            with torch.autocast(device_type=self.args.device.type, enabled=False):
+                loss = loss + self._quantum_regularizers(model)
 
         outputs = {
             "loss": loss,
@@ -346,6 +357,57 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         }
 
         return (loss, outputs) if return_outputs else loss
+
+    def _quantum_regularizers(self, model: Any) -> Union[torch.Tensor, float]:
+        """Weighted readout and state regularizers; also records their values for logging."""
+        readout = getattr(model, "_last_quantum_readout", None)
+        if not isinstance(readout, torch.Tensor):
+            return 0.0
+        readout = readout.flatten(1).float()
+        record = getattr(model, "training", False)
+        total = readout.new_zeros(())
+
+        if self.vicreg_variance_weight > 0:
+            total = total + self.vicreg_variance_weight * vicreg_variance_loss(readout, self.vicreg_target_std)
+        if self.vicreg_covariance_weight > 0:
+            n_clusters = 1 if self._readout_layout is None else self._readout_layout[1]
+            total = total + self.vicreg_covariance_weight * cluster_covariance_loss(readout, n_clusters)
+        if record:
+            self._record("quantum_readout_std", readout.detach().std(0).mean())
+
+        if self._readout_layout is not None and self._readout_layout[2] >= 2:
+            n_atoms, n_clusters, order = self._readout_layout
+            if self.vicreg_connected_variance_weight > 0:
+                connected = connected_correlators(readout, n_atoms, n_clusters, order)
+                total = total + self.vicreg_connected_variance_weight * vicreg_variance_loss(
+                    connected.flatten(1), self.vicreg_connected_target_std
+                )
+            elif record:
+                connected = connected_correlators(readout.detach(), n_atoms, n_clusters, order)
+            if record:
+                self._record("quantum_connected_std", connected.detach().std(0).mean())
+
+        if self._fidelity_available:
+            state = getattr(model, "last_quantum_state", None)
+            if isinstance(state, torch.Tensor):
+                if self.state_fidelity_weight > 0:
+                    fidelity = mean_state_fidelity(state)
+                    total = total + self.state_fidelity_weight * fidelity
+                elif record:
+                    fidelity = mean_state_fidelity(state.detach())
+                if record:
+                    self._record("quantum_state_fidelity", fidelity.detach())
+        return total
+
+    def _record(self, name: str, value: torch.Tensor) -> None:
+        self._quantum_stats.setdefault(name, []).append(value.detach().float())
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        if "loss" in logs and self._quantum_stats:
+            for name, values in self._quantum_stats.items():
+                logs[name] = float(torch.stack(values).mean())
+            self._quantum_stats = {}
+        super().log(logs, *args, **kwargs)
 
     def prediction_step(
         self,

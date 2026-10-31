@@ -77,6 +77,8 @@ class ExpmEvolver(nn.Module):
         self.register_buffer("interaction_diag", interaction.to(torch.float32), persistent=False)
         self.register_buffer("number_diag", bits_f.sum(1).to(torch.float32), persistent=False)
         self.register_buffer("sigma_x_sum", sigma_x_sum.to(torch.float32), persistent=False)
+        # Final states of the last forward call, [B, 2**n_atoms] (complex64).
+        self.last_state: torch.Tensor | None = None
 
         if self.measurement_kind != "probability":
             order = 1 if self.measurement_kind == "expectation" else device.correlator_order
@@ -101,7 +103,14 @@ class ExpmEvolver(nn.Module):
             # Initial state |0...0>: first step is U's first column.
             psi = U[:, :, 0] if psi is None else (U @ psi[..., None]).squeeze(-1)
 
+        self.last_state = psi
         probs = psi.real ** 2 + psi.imag ** 2
+        shots = self.device_cfg.readout_shots
+        if shots is not None:
+            # Empirical frequencies of `shots` sampled bitstrings; gradients of the exact probabilities.
+            weights = probs.detach() / probs.detach().sum(-1, keepdim=True)
+            counts = torch.distributions.Multinomial(int(shots), probs=weights).sample()
+            probs = probs + (counts / shots - probs).detach()
         if self.measurement_kind == "probability":
             return probs
         return probs @ self.readout_signs

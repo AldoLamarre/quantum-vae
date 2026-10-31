@@ -206,6 +206,8 @@ class TrainerConfigParser:
                 model_kwargs["omega_ramp_us"] = float(cfg["omega_ramp_us"])
             if "pulse_delta_scale" in cfg:
                 model_kwargs["pulse_delta_scale"] = float(cfg["pulse_delta_scale"])
+            if cfg.get("readout_shots") is not None:
+                model_kwargs["readout_shots"] = int(cfg["readout_shots"])
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -362,6 +364,7 @@ class TrainerConfigParser:
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
                     "device_profile", "cluster_grid", "graph_output", "graph_cell_write",
                     "pulse_shape", "pulse_steps", "omega_ramp_us", "pulse_delta_scale",
+                    "readout_shots",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:
@@ -585,8 +588,9 @@ class TrainerConfigParser:
             "logging_steps": log_steps,
             "seed": seed,
             "save_strategy": str(t_kwargs.get("save_strategy", "epoch")),
-            "overwrite_output_dir": bool(t_kwargs.get("overwrite_output_dir", False)),
         }
+        if "overwrite_output_dir" in valid_params:  # removed in transformers 5
+            kwargs["overwrite_output_dir"] = bool(t_kwargs.get("overwrite_output_dir", False))
 
         # dataloader_drop_last was never read from config at all -- setting
         # it in a JSON config silently did nothing. HF's own default is
@@ -641,7 +645,9 @@ class TrainerConfigParser:
         # default would strip the very keys our collator needs and fail
         # with a bare KeyError deep in the dataloader, not a clear error
         # pointing at the actual cause.
-        if parsed.task_type == "latent_diffusion":
+        # VAE datasets with a set_transform build pixel_values from the raw
+        # "image" column, which would otherwise be stripped first.
+        if parsed.task_type in {"latent_diffusion", "vae"}:
             kwargs["remove_unused_columns"] = False
 
         dropped = [k for k in kwargs if k not in valid_params]
@@ -705,6 +711,9 @@ class TrainerConfigParser:
             vicreg_variance_weight = float(parsed.training_kwargs.get("vicreg_variance_weight", 0.0))
             vicreg_covariance_weight = float(parsed.training_kwargs.get("vicreg_covariance_weight", 0.0))
             vicreg_target_std = float(parsed.training_kwargs.get("vicreg_target_std", 1.0))
+            vicreg_connected_variance_weight = float(parsed.training_kwargs.get("vicreg_connected_variance_weight", 0.0))
+            vicreg_connected_target_std = float(parsed.training_kwargs.get("vicreg_connected_target_std", 0.1))
+            state_fidelity_weight = float(parsed.training_kwargs.get("state_fidelity_weight", 0.0))
 
             # Auto-attach gradient-norm profiling for the graph-based
             # quantum interface -- no separate config flag, keyed off the
@@ -733,6 +742,9 @@ class TrainerConfigParser:
                 vicreg_variance_weight=vicreg_variance_weight,
                 vicreg_covariance_weight=vicreg_covariance_weight,
                 vicreg_target_std=vicreg_target_std,
+                vicreg_connected_variance_weight=vicreg_connected_variance_weight,
+                vicreg_connected_target_std=vicreg_connected_target_std,
+                state_fidelity_weight=state_fidelity_weight,
                 bn_recalibration_batches=int(parsed.training_kwargs.get("bn_recalibration_batches", 100)),
                 callbacks=callbacks,
                 **trainer_kwargs,
@@ -833,9 +845,14 @@ def train_from_config(
     model: Optional[Any] = None,
     train_dataset: Optional[Any] = None,
     eval_dataset: Optional[Any] = None,
+    resume_from_checkpoint: Optional[str] = None,
     **kwargs,
 ) -> Tuple[BaseHFQuantumTrainer, Any, Optional[Dict[str, float]]]:
-    """Load config, construct trainer, execute training, evaluate, and save model."""
+    """Load config, construct trainer, execute training, evaluate, and save model.
+
+    resume_from_checkpoint: checkpoint folder (checkpoint-N) to continue from,
+    restoring model, optimizer, scheduler and step.
+    """
     trainer = build_trainer_from_config(
         config_source=config_source,
         model=model,
@@ -843,7 +860,7 @@ def train_from_config(
         eval_dataset=eval_dataset,
         **kwargs,
     )
-    train_output = trainer.train()
+    train_output = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     train_results = getattr(train_output, "metrics", train_output)
     eval_results = None
     if eval_dataset is not None or getattr(trainer, "eval_dataset", None) is not None:

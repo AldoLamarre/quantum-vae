@@ -141,6 +141,7 @@ def build_vae_eval_datasets(config: dict[str, object], splits: tuple[str, ...]) 
 def main(config_path: str | Path | None = None) -> None:
     parser = argparse.ArgumentParser(description="Train a config-driven HF VAE experiment.")
     parser.add_argument("--config", type=str, required=True, help="Path to the JSON config file")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint-N folder to continue training from")
     args = parser.parse_args()
 
     target_config = Path(config_path) if config_path is not None else Path(args.config)
@@ -155,6 +156,7 @@ def main(config_path: str | Path | None = None) -> None:
         target_config,
         train_dataset=bundle["train_set"],
         eval_dataset=bundle["val_set"],
+        resume_from_checkpoint=args.resume,
     )
     print(f"Trainer built: {type(trainer).__name__}")
     if train_results is not None:

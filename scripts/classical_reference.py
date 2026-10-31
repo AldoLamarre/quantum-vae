@@ -28,6 +28,7 @@ from src.quantum_vae.trainers.evaluation import evaluate_vae_reconstruction_data
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a classical reference VAE.")
     parser.add_argument("--config", type=str, required=True, help="Path to the JSON config file")
+    parser.add_argument("--resume", type=str, default=None, help="checkpoint-N folder to continue training from")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -46,6 +47,7 @@ def main() -> None:
         model=model,
         train_dataset=bundle["train_set"],
         eval_dataset=bundle["val_set"],
+        resume_from_checkpoint=args.resume,
     )
     print(train_results)
     print(eval_results)

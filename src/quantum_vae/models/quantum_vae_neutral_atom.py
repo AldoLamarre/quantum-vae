@@ -102,6 +102,7 @@ import torch.nn as nn
 has_quantum_deps = True
 
 from .ansatz_vae_base import AnsatzVAEBase
+from ..losses.quantum_regularizers import connected_correlators, mean_state_fidelity
 
 # Aquila (QuEra) limits in 2*pi MHz. Kept for backward compatibility;
 # DEVICE_PROFILES is the source of truth.
@@ -430,6 +431,10 @@ class NeutralAtomDeviceConfig:
     # Bound c on the per-sample correction c * tanh(a)
     # (omega_delta_source="trainable_plus_encoder").
     pulse_delta_scale: float = 2.0
+    # Finite-shot readout: correlators estimated from this many sampled
+    # bitstrings per cluster (straight-through gradient of the exact value).
+    # None: exact expectation values. torch_expm only.
+    readout_shots: Optional[int] = None
 
     @property
     def profile(self) -> DeviceProfile:
@@ -494,6 +499,11 @@ class NeutralAtomDeviceConfig:
                 "Use 'pennylane', 'torch_expm' or 'qadence'."
             )
         self._validate_against_profile(get_device_profile(self.device_profile))
+        if self.readout_shots is not None:
+            if int(self.readout_shots) < 1:
+                raise ValueError(f"readout_shots={self.readout_shots} must be >= 1.")
+            if self.evolution_backend != "torch_expm":
+                raise ValueError("readout_shots requires evolution_backend='torch_expm'.")
         if self.lam_span is not None:
             if self.lam_span <= 0.0:
                 raise ValueError(f"lam_span={self.lam_span} must be > 0.")
@@ -713,6 +723,7 @@ class NeutralAtomDeviceConfig:
         pulse_steps: int = 80,
         omega_ramp_us: float = 0.15,
         pulse_delta_scale: float = 2.0,
+        readout_shots: Optional[int] = None,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -766,6 +777,7 @@ class NeutralAtomDeviceConfig:
             pulse_steps=pulse_steps,
             omega_ramp_us=omega_ramp_us,
             pulse_delta_scale=pulse_delta_scale,
+            readout_shots=readout_shots,
         )
 
 
@@ -1407,6 +1419,15 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         # forward()/process_latent() return contract.
         self._last_quantum_readout: Optional[torch.Tensor] = None
 
+    @property
+    def last_quantum_state(self) -> Optional[torch.Tensor]:
+        """Final cluster states of the last forward call, [B, n_clusters, 2**n_atoms],
+        or None when the evolution backend does not expose them."""
+        state = getattr(self.qlayer.evolver, "last_state", None)
+        if state is None:
+            return None
+        return state.reshape(-1, self.device_cfg.n_clusters, state.shape[-1])
+
     def _infer_quantum_torch_device(self) -> torch.device:
         # qlayer has no nn.Parameters at all when
         # device.omega_delta_source="encoder" (Omega0_MHz/Delta0_MHz are
@@ -1625,7 +1646,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
         readout_std = readout.reshape(batch, n_clusters, -1).std(0).mean(-1)
         median = readout_std.median().clamp_min(1e-12)
         gain = getattr(self.project_to_quantum, "pre_quantum_gain", None)
-        return {
+        stats = {
             "cluster_x_std_min": float(x_std.min()),
             "cluster_x_std_mean": float(x_std.mean()),
             "cluster_readout_std_min": float(readout_std.min()),
@@ -1634,6 +1655,13 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             "cluster_dead": int((readout_std < dead_ratio * median).sum()),
             **({"pre_quantum_gain": gain} if gain is not None else {}),
         }
+        if self.device_cfg.measurement_kind == "correlators" and self.device_cfg.correlator_order >= 2:
+            connected = connected_correlators(readout, n_atoms, n_clusters, self.device_cfg.correlator_order)
+            stats["cluster_connected_std_mean"] = float(connected.std(0).mean())
+        state = self.last_quantum_state
+        if state is not None:
+            stats["state_fidelity_mean"] = float(mean_state_fidelity(state))
+        return stats
 
     def get_pre_quantum_features(
         self,
