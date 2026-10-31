@@ -41,6 +41,9 @@ class ExpmEvolver(nn.Module):
     so the layer's state_dict matches the PennyLane backend.
     """
 
+    # Dense sum_i sigma_x_i [dim, dim]; subclasses that apply the drive otherwise skip it.
+    dense_drive = True
+
     def __init__(self, device: NeutralAtomDeviceConfig, V0: torch.Tensor):
         super().__init__()
         self.device_cfg = device
@@ -66,17 +69,16 @@ class ExpmEvolver(nn.Module):
                 interaction += device.C6 / r ** 6 * bits_f[:, i] * bits_f[:, j]
         interaction *= 2.0 * math.pi
 
-        sigma_x_sum = torch.zeros(dim, dim, dtype=torch.float64)
-        basis = torch.arange(dim)
-        for i in range(n):
-            flipped = basis ^ (1 << (n - 1 - i))
-            sigma_x_sum[basis, flipped] += 1.0
-
         self.register_buffer("V0", V0.detach().clone().to(torch.float32), persistent=False)
         self.register_buffer("z", z.to(torch.float32), persistent=False)
         self.register_buffer("interaction_diag", interaction.to(torch.float32), persistent=False)
         self.register_buffer("number_diag", bits_f.sum(1).to(torch.float32), persistent=False)
-        self.register_buffer("sigma_x_sum", sigma_x_sum.to(torch.float32), persistent=False)
+        if self.dense_drive:
+            sigma_x_sum = torch.zeros(dim, dim, dtype=torch.float32)
+            basis = torch.arange(dim)
+            for i in range(n):
+                sigma_x_sum[basis, basis ^ (1 << (n - 1 - i))] += 1.0
+            self.register_buffer("sigma_x_sum", sigma_x_sum, persistent=False)
         # Final states of the last forward call, [B, 2**n_atoms] (complex64).
         self.last_state: torch.Tensor | None = None
 
@@ -94,15 +96,20 @@ class ExpmEvolver(nn.Module):
 
         v = local_field_mhz(x, lam[:, None], self.V0, self.bounded, torch, self.profile)  # [B, n]
         static_diag = self.interaction_diag - math.pi * (v @ self.z.T)  # [B, dim]
+        return self._measure(self._evolve(static_diag, omega, delta))
 
+    def _evolve(self, static_diag, omega, delta) -> torch.Tensor:
+        """Final states [B, dim] from |0...0>, one exact step per simulation step."""
         psi = None
-        for k in range(S):
+        for k in range(self.n_segments):
             diag = static_diag - 2.0 * math.pi * delta[:, k : k + 1] * self.number_diag
             H = math.pi * omega[:, k, None, None] * self.sigma_x_sum + torch.diag_embed(diag)
             U = torch.linalg.matrix_exp((-1j * self.dt) * H.to(torch.complex64))
             # Initial state |0...0>: first step is U's first column.
             psi = U[:, :, 0] if psi is None else (U @ psi[..., None]).squeeze(-1)
+        return psi
 
+    def _measure(self, psi: torch.Tensor) -> torch.Tensor:
         self.last_state = psi
         probs = psi.real ** 2 + psi.imag ** 2
         shots = self.device_cfg.readout_shots

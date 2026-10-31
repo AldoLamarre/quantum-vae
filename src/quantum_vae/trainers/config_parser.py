@@ -208,6 +208,10 @@ class TrainerConfigParser:
                 model_kwargs["pulse_delta_scale"] = float(cfg["pulse_delta_scale"])
             if cfg.get("readout_shots") is not None:
                 model_kwargs["readout_shots"] = int(cfg["readout_shots"])
+            if "split_substeps" in cfg:
+                model_kwargs["split_substeps"] = int(cfg["split_substeps"])
+            if cfg.get("register_shape") is not None:
+                model_kwargs["register_shape"] = [int(v) for v in cfg["register_shape"]]
 
             # Data
             if isinstance(cfg.get("data"), dict):
@@ -364,7 +368,7 @@ class TrainerConfigParser:
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",
                     "device_profile", "cluster_grid", "graph_output", "graph_cell_write",
                     "pulse_shape", "pulse_steps", "omega_ramp_us", "pulse_delta_scale",
-                    "readout_shots",
+                    "readout_shots", "split_substeps", "register_shape",
                 )
                 device_kwargs = {k: kwargs.pop(k) for k in device_keys if k in kwargs}
                 if "n_atoms" not in device_kwargs:

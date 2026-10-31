@@ -244,10 +244,19 @@ def _build_register(
     n_atoms: int,
     geometry: str = "chain",
     spacing: float = 8.0,
+    shape: Optional[Sequence[int]] = None,
 ) -> List[List[float]]:
-    """Build atom coordinates (in micrometers) for a simple register."""
+    """Build atom coordinates (in micrometers) for a simple register.
+
+    shape: (rows, cols) of a grid register; default is the smallest square.
+    """
     if geometry == "chain":
         return [[float(i) * spacing, 0.0] for i in range(n_atoms)]
+    if geometry == "grid" and shape is not None:
+        rows, cols = (int(v) for v in shape)
+        if rows * cols != n_atoms:
+            raise ValueError(f"register_shape={tuple(shape)} does not hold n_atoms={n_atoms}.")
+        return [[float(col) * spacing, float(row) * spacing] for row in range(rows) for col in range(cols)]
     if geometry == "grid":
         side = int(np.ceil(np.sqrt(n_atoms)))
         coords = []
@@ -408,7 +417,9 @@ class NeutralAtomDeviceConfig:
     # "torch_expm": exact piecewise-constant evolution via matrix
     # exponentials in torch; ode_rtol/ode_atol are ignored.
     # "qadence": same Hamiltonian via Qadence/pyqtorch, for evaluation.
-    evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane"
+    # "torch_split": Strang split-step evolution (neutral_atom_split.py),
+    # for larger clusters where matrix exponentials are too costly.
+    evolution_backend: Literal["pennylane", "torch_expm", "torch_split", "qadence"] = "pennylane"
     # Target hardware: C6 default, pulse bounds and register/timing checks.
     device_profile: Literal["aquila", "pasqal_dmm"] = "aquila"
     # Graph projections only. (rows, cols) placement of clusters on the
@@ -433,8 +444,10 @@ class NeutralAtomDeviceConfig:
     pulse_delta_scale: float = 2.0
     # Finite-shot readout: correlators estimated from this many sampled
     # bitstrings per cluster (straight-through gradient of the exact value).
-    # None: exact expectation values. torch_expm only.
+    # None: exact expectation values. torch_expm and torch_split only.
     readout_shots: Optional[int] = None
+    # torch_split only: Strang substeps per simulation step.
+    split_substeps: int = 4
 
     @property
     def profile(self) -> DeviceProfile:
@@ -493,17 +506,19 @@ class NeutralAtomDeviceConfig:
             )
 
     def __post_init__(self):
-        if self.evolution_backend not in ("pennylane", "torch_expm", "qadence"):
+        if self.evolution_backend not in ("pennylane", "torch_expm", "torch_split", "qadence"):
             raise ValueError(
                 f"evolution_backend='{self.evolution_backend}' is not supported. "
-                "Use 'pennylane', 'torch_expm' or 'qadence'."
+                "Use 'pennylane', 'torch_expm', 'torch_split' or 'qadence'."
             )
         self._validate_against_profile(get_device_profile(self.device_profile))
         if self.readout_shots is not None:
             if int(self.readout_shots) < 1:
                 raise ValueError(f"readout_shots={self.readout_shots} must be >= 1.")
-            if self.evolution_backend != "torch_expm":
-                raise ValueError("readout_shots requires evolution_backend='torch_expm'.")
+            if self.evolution_backend not in ("torch_expm", "torch_split"):
+                raise ValueError("readout_shots requires evolution_backend='torch_expm' or 'torch_split'.")
+        if self.split_substeps < 1:
+            raise ValueError(f"split_substeps={self.split_substeps} must be >= 1.")
         if self.lam_span is not None:
             if self.lam_span <= 0.0:
                 raise ValueError(f"lam_span={self.lam_span} must be > 0.")
@@ -714,7 +729,7 @@ class NeutralAtomDeviceConfig:
         post_quantum_gate_init: float = 0.0,
         pre_quantum_norm: Optional[str] = None,
         pre_quantum_gain: float = 0.4,
-        evolution_backend: Literal["pennylane", "torch_expm", "qadence"] = "pennylane",
+        evolution_backend: Literal["pennylane", "torch_expm", "torch_split", "qadence"] = "pennylane",
         device_profile: Literal["aquila", "pasqal_dmm"] = "aquila",
         cluster_grid: Optional[Sequence[int]] = None,
         graph_output: Literal["pooled", "spatial"] = "pooled",
@@ -724,6 +739,8 @@ class NeutralAtomDeviceConfig:
         omega_ramp_us: float = 0.15,
         pulse_delta_scale: float = 2.0,
         readout_shots: Optional[int] = None,
+        split_substeps: int = 4,
+        register_shape: Optional[Sequence[int]] = None,
     ) -> "NeutralAtomDeviceConfig":
         """Convenience constructor: build a register from a simple
         chain/grid geometry rather than passing coordinates by hand.
@@ -738,7 +755,7 @@ class NeutralAtomDeviceConfig:
                 f"C6={C6} overrides device_profile='{device_profile}' C6={profile.C6}.",
                 stacklevel=2,
             )
-        register = _build_register(n_atoms, geometry=register_geometry, spacing=atom_spacing_um)
+        register = _build_register(n_atoms, geometry=register_geometry, spacing=atom_spacing_um, shape=register_shape)
         return cls(
             n_atoms=n_atoms,
             register_um=register,
@@ -778,6 +795,7 @@ class NeutralAtomDeviceConfig:
             omega_ramp_us=omega_ramp_us,
             pulse_delta_scale=pulse_delta_scale,
             readout_shots=readout_shots,
+            split_substeps=split_substeps,
         )
 
 
@@ -1078,6 +1096,10 @@ def _build_evolver(device: NeutralAtomDeviceConfig, V0: torch.Tensor) -> nn.Modu
         from .neutral_atom_expm import ExpmEvolver
 
         return ExpmEvolver(device, V0)
+    if device.evolution_backend == "torch_split":
+        from .neutral_atom_split import SplitStepEvolver
+
+        return SplitStepEvolver(device, V0)
     if device.evolution_backend == "qadence":
         from .neutral_atom_qadence import QadenceEvolver
 

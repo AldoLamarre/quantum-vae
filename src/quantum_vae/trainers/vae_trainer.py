@@ -97,9 +97,10 @@ class QuantumVAETrainer(BaseHFQuantumTrainer):
         if self.vicreg_connected_variance_weight > 0 and (self._readout_layout is None or self._readout_layout[2] < 2):
             warnings.warn("vicreg_connected_variance_weight needs correlator readout of order >= 2; disabled.", stacklevel=2)
             self.vicreg_connected_variance_weight = 0.0
-        self._fidelity_available = getattr(device_cfg, "evolution_backend", None) == "torch_expm"
+        self._fidelity_available = getattr(device_cfg, "evolution_backend", None) in ("torch_expm", "torch_split")
         if self.state_fidelity_weight > 0 and not self._fidelity_available:
-            warnings.warn("state_fidelity_weight needs evolution_backend='torch_expm'; disabled.", stacklevel=2)
+            warnings.warn("state_fidelity_weight needs evolution_backend='torch_expm' or 'torch_split'; disabled.",
+                          stacklevel=2)
             self.state_fidelity_weight = 0.0
         self.noise_after_epoch = noise_after_epoch
         self.noise_std = float(noise_std)
