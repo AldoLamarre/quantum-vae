@@ -337,6 +337,11 @@ class TrainerConfigParser:
             from src.quantum_vae.models.quantum_vae_neutral_atom import NeutralAtomDeviceConfig, QuantumVAENeutralAtom
 
             model_name = str(parsed.model_name).lower()
+            if model_name == "classical":
+                raise ValueError(
+                    "Classical reference configs are built by scripts/classical_reference.py, "
+                    "not by the quantum VAE trainer."
+                )
             pulse_keywords = ("neutral_atom", "neutral atom", "rydberg", "pulse", "analog")
             is_pulse = any(kw in model_name for kw in pulse_keywords)
             if is_pulse:

@@ -66,8 +66,8 @@ class QuantumVAEAmplitude(QuantumVAEBase):
         # Remember original shape for reconstruction
         old_shape = z.shape
         
-        # Flatten to [batch_size, flattened_dim]
-        z_flattened = z.reshape(z.size(0), -1)
+        # Flatten to [batch_size, flattened_dim]; complex tensors need float32.
+        z_flattened = z.reshape(z.size(0), -1).float()
         
         # Split into real and complex halves
         real_values, complex_values = torch.split(
@@ -99,7 +99,7 @@ class QuantumVAEAmplitude(QuantumVAEBase):
     ) -> torch.Tensor:
         posterior = self.encode(sample).latent_dist
         z = posterior.sample(generator=generator) if sample_posterior else posterior.mode()
-        z_flattened = z.reshape(z.size(0), -1)
+        z_flattened = z.reshape(z.size(0), -1).float()
         real_values, complex_values = torch.split(z_flattened, z_flattened.size(1) // 2, dim=1)
         complex_tensor = torch.complex(real_values, complex_values)
         return torch.nn.functional.normalize(complex_tensor, dim=1)
