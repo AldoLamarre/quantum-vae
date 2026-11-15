@@ -12,7 +12,8 @@
   "register_geometry": "chain",
   "atom_spacing_um": 10.0,
   "evolution_time_us": 4.0,
-  "n_segments": 8,
+  "omega_segments": 8,
+  "delta_segments": 8,
   "model": {
     "in_channels": 3,
     "out_channels": 3,

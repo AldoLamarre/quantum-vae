@@ -24,7 +24,8 @@ plays, made trainable instead of fixed by geometry.
 
 Parameter tiers:
     - Fixed hardware constants (NeutralAtomDeviceConfig): n_atoms,
-      register_um, r0_um, C6, evolution_time_us, n_segments. Set once,
+      register_um, r0_um, C6, evolution_time_us, omega_segments,
+      delta_segments. Set once,
       never trained, never touched by the classical encoder.
     - Trainable physics parameters (NeutralAtomPulseLayer): Omega0_MHz,
       Delta0_MHz. Few, global, learned like ordinary model weights.
@@ -110,6 +111,9 @@ AQUILA_OMEGA_MAX_MHZ = 2.5  # global Rabi frequency: one-sided, >= 0
 AQUILA_DELTA_MAX_MHZ = 20.0  # global detuning: symmetric, [-20, 20]
 AQUILA_LOCAL_DETUNING_MAX_MHZ = 25.0  # per-atom local field magnitude
 AQUILA_OMEGA_SLEW_MAX_MHZ_PER_US = 250.0 / (2.0 * np.pi)  # 250 rad/us^2 (arXiv:2306.11727)
+# Braket aquila.properties (rydbergGlobal); confirm against the live device before hardware runs.
+AQUILA_DELTA_SLEW_MAX_MHZ_PER_US = 6000.0 / (2.0 * np.pi)  # 6e15 rad/s^2
+AQUILA_TIME_STEP_MIN_US = 0.05  # timeDeltaMin 50 ns
 
 # Pasqal WeightedAnalogDevice (pulser-core 1.9.1), converted from rad/us to
 # MHz. AnalogDevice has no DMM (local detuning) and is not offered.
@@ -151,6 +155,9 @@ class DeviceProfile:
     max_atoms: Optional[int] = None
     clock_period_ns: Optional[int] = None
     omega_slew_max_mhz_per_us: Optional[float] = None
+    delta_slew_max_mhz_per_us: Optional[float] = None
+    # Minimum spacing of waveform time points.
+    time_step_min_us: Optional[float] = None
 
 
 DEVICE_PROFILES = {
@@ -163,6 +170,8 @@ DEVICE_PROFILES = {
         local_detuning_max_mhz=AQUILA_LOCAL_DETUNING_MAX_MHZ,
         local_field_one_sided=False,
         omega_slew_max_mhz_per_us=AQUILA_OMEGA_SLEW_MAX_MHZ_PER_US,
+        delta_slew_max_mhz_per_us=AQUILA_DELTA_SLEW_MAX_MHZ_PER_US,
+        time_step_min_us=AQUILA_TIME_STEP_MIN_US,
     ),
     "pasqal_dmm": DeviceProfile(
         name="pasqal_dmm",
@@ -280,7 +289,9 @@ class NeutralAtomDeviceConfig:
     r0_um: float
     C6: float
     evolution_time_us: float
-    n_segments: int
+    # Control points of Omega(t) and Delta(t); independent waveforms on the device.
+    omega_segments: int
+    delta_segments: int
     n_data_injections: int = 1
     encoding: Literal["local_detuning", "geometry"] = "local_detuning"
     # Only Omega(t)/Delta(t) are physically variable on the target
@@ -385,6 +396,8 @@ class NeutralAtomDeviceConfig:
     # Delta0 at exactly zero). A small nonzero value breaks that symmetry
     # up front instead of relying on training to do it from noise alone.
     pulse_init_noise_std: float = 0.0
+    # Initial global Omega (MHz). Larger clusters scramble at 1 MHz over 4 us.
+    omega0_init_mhz: float = 1.0
     # Only read when projection_kind="graph". True adds fixed Fourier
     # position features (from the register's real coordinates): to each
     # correlator's embedding (its member atoms) and atom nodes in the
@@ -432,9 +445,10 @@ class NeutralAtomDeviceConfig:
     # "resample": bilinear resampling of the atom grid (original). "merge":
     # concatenate the atoms of each cell and map them with a shared layer.
     graph_cell_write: Literal["resample", "merge"] = "resample"
-    # "piecewise": n_segments constant segments (original). "windowed":
-    # n_segments control points, linear in between, Omega multiplied by a
-    # window that is zero at t=0 and t=T, simulated on pulse_steps steps.
+    # "piecewise": constant segments (original; requires omega_segments ==
+    # delta_segments). "windowed": control points, linear in between, Omega
+    # multiplied by a window that is zero at t=0 and t=T, simulated on
+    # pulse_steps steps.
     pulse_shape: Literal["piecewise", "windowed"] = "piecewise"
     pulse_steps: int = 80
     # Length of the window's rise and fall (windowed only).
@@ -456,16 +470,33 @@ class NeutralAtomDeviceConfig:
     @property
     def simulation_steps(self) -> int:
         """Number of piecewise-constant steps the evolvers simulate."""
-        return self.pulse_steps if self.pulse_shape == "windowed" else self.n_segments
+        return self.pulse_steps if self.pulse_shape == "windowed" else self.omega_segments
 
-    def max_windowed_segments(self) -> Optional[int]:
-        """Largest n_segments for which the windowed Omega(t) respects the
+    def max_omega_segments(self) -> Optional[int]:
+        """Largest omega_segments for which the windowed Omega(t) respects the
         profile's slew limit, or None if the profile has no slew limit."""
         profile = self.profile
         if profile.omega_slew_max_mhz_per_us is None:
             return None
         rate = profile.omega_slew_max_mhz_per_us / profile.omega_max_mhz - np.pi / (2.0 * self.omega_ramp_us)
         return int(np.floor(self.evolution_time_us * rate + 1e-9))
+
+    def max_delta_segments(self) -> Optional[int]:
+        """Largest delta_segments for which a full-range step between adjacent
+        control points respects the profile's Delta slew limit."""
+        profile = self.profile
+        if profile.delta_slew_max_mhz_per_us is None:
+            return None
+        rate = profile.delta_slew_max_mhz_per_us / (2.0 * profile.delta_max_mhz)
+        return int(np.floor(self.evolution_time_us * rate + 1e-9))
+
+    def max_segments_for_time_step(self) -> Optional[int]:
+        """Largest number of control points whose waveform time points
+        (0, segment centres, T) respect the profile's minimum time step."""
+        step = self.profile.time_step_min_us
+        if step is None:
+            return None
+        return int(np.floor(self.evolution_time_us / (2.0 * step) + 1e-9))
 
     def _validate_pulse_shape(self) -> None:
         if self.pulse_shape not in ("piecewise", "windowed"):
@@ -474,14 +505,21 @@ class NeutralAtomDeviceConfig:
             )
         if self.pulse_delta_scale <= 0.0:
             raise ValueError(f"pulse_delta_scale={self.pulse_delta_scale} must be > 0.")
+        for name in ("omega_segments", "delta_segments"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"{name}={getattr(self, name)} must be >= 1.")
         if self.pulse_shape != "windowed":
+            if self.omega_segments != self.delta_segments:
+                raise ValueError(
+                    f"pulse_shape='{self.pulse_shape}' needs omega_segments == delta_segments "
+                    f"(got {self.omega_segments} and {self.delta_segments}); use 'windowed'."
+                )
             return
         if not self.bound_pulse_params:
             raise ValueError("pulse_shape='windowed' requires bound_pulse_params=True.")
-        if self.n_segments < 1:
-            raise ValueError(f"n_segments={self.n_segments} must be >= 1.")
-        if self.pulse_steps < self.n_segments:
-            raise ValueError(f"pulse_steps={self.pulse_steps} must be >= n_segments={self.n_segments}.")
+        n_max = max(self.omega_segments, self.delta_segments)
+        if self.pulse_steps < n_max:
+            raise ValueError(f"pulse_steps={self.pulse_steps} must be >= the number of control points ({n_max}).")
         if not 0.0 < self.omega_ramp_us <= self.evolution_time_us / 2.0:
             raise ValueError(
                 f"omega_ramp_us={self.omega_ramp_us} must be in (0, evolution_time_us / 2]."
@@ -492,18 +530,32 @@ class NeutralAtomDeviceConfig:
                 "fewer than two steps.",
                 stacklevel=3,
             )
-        max_segments = self.max_windowed_segments()
+        max_segments = self.max_omega_segments()
         if max_segments is None:
             warnings.warn(
                 f"device_profile='{self.device_profile}' has no Omega slew limit; the windowed "
                 "pulse is not checked against the hardware slew rate.",
                 stacklevel=3,
             )
-        elif self.n_segments > max_segments:
+        elif self.omega_segments > max_segments:
             raise ValueError(
-                f"n_segments={self.n_segments} can exceed {self.device_profile}'s Omega slew limit "
+                f"omega_segments={self.omega_segments} can exceed {self.device_profile}'s Omega slew limit "
                 f"with omega_ramp_us={self.omega_ramp_us}; the maximum is {max_segments}."
             )
+        max_segments = self.max_delta_segments()
+        if max_segments is not None and self.delta_segments > max_segments:
+            raise ValueError(
+                f"delta_segments={self.delta_segments} can exceed {self.device_profile}'s Delta slew limit; "
+                f"the maximum is {max_segments}."
+            )
+        max_segments = self.max_segments_for_time_step()
+        if max_segments is not None:
+            for name in ("omega_segments", "delta_segments"):
+                if getattr(self, name) > max_segments:
+                    raise ValueError(
+                        f"{name}={getattr(self, name)} puts waveform points closer than "
+                        f"{self.device_profile}'s minimum time step; the maximum is {max_segments}."
+                    )
 
     def __post_init__(self):
         if self.evolution_backend not in ("pennylane", "torch_expm", "torch_split", "qadence"):
@@ -517,6 +569,8 @@ class NeutralAtomDeviceConfig:
                 raise ValueError(f"readout_shots={self.readout_shots} must be >= 1.")
             if self.evolution_backend not in ("torch_expm", "torch_split"):
                 raise ValueError("readout_shots requires evolution_backend='torch_expm' or 'torch_split'.")
+        if not 0.0 < self.omega0_init_mhz < get_device_profile(self.device_profile).omega_max_mhz:
+            raise ValueError(f"omega0_init_mhz={self.omega0_init_mhz} must be in (0, omega_max).")
         if self.split_substeps < 1:
             raise ValueError(f"split_substeps={self.split_substeps} must be >= 1.")
         if self.lam_span is not None:
@@ -706,7 +760,8 @@ class NeutralAtomDeviceConfig:
         r0_um: Optional[float] = None,
         C6: Optional[float] = None,
         evolution_time_us: float = 4.0,
-        n_segments: int = 6,
+        omega_segments: int = 6,
+        delta_segments: int = 6,
         measurement_kind: Literal["expectation", "probability", "correlators"] = "expectation",
         correlator_order: int = 1,
         n_clusters: int = 1,
@@ -720,6 +775,7 @@ class NeutralAtomDeviceConfig:
         projection_kind: Literal["linear", "graph"] = "linear",
         graph_d_model: int = 24,
         pulse_init_noise_std: float = 0.0,
+        omega0_init_mhz: float = 1.0,
         use_fourier_hyperedge_pos: bool = False,
         fourier_atom_dim: int = 4,
         lam_offset: float = 1e-4,
@@ -762,7 +818,8 @@ class NeutralAtomDeviceConfig:
             r0_um=r0_um if r0_um is not None else atom_spacing_um,
             C6=C6,
             evolution_time_us=evolution_time_us,
-            n_segments=n_segments,
+            omega_segments=omega_segments,
+            delta_segments=delta_segments,
             measurement_kind=measurement_kind,
             correlator_order=correlator_order,
             n_clusters=n_clusters,
@@ -776,6 +833,7 @@ class NeutralAtomDeviceConfig:
             projection_kind=projection_kind,
             graph_d_model=graph_d_model,
             pulse_init_noise_std=pulse_init_noise_std,
+            omega0_init_mhz=omega0_init_mhz,
             use_fourier_hyperedge_pos=use_fourier_hyperedge_pos,
             fourier_atom_dim=fourier_atom_dim,
             lam_offset=lam_offset,
@@ -896,7 +954,7 @@ class LatentToLocalField(nn.Module):
          under the same shared time-envelope (see
          NeutralAtomDeviceConfig.n_clusters).
     omega_seg, delta_seg: present only when omega_delta_source="encoder"
-         -- n_segments values each, the per-sample Omega(t)/Delta(t)
+         -- omega_segments and delta_segments values, the per-sample Omega(t)/Delta(t)
          pulse shape (in place of NeutralAtomPulseLayer's own trainable
          Omega0_MHz/Delta0_MHz). This is the one channel the target
          hardware actually allows to vary per shot, so it's the intended
@@ -918,18 +976,20 @@ class LatentToLocalField(nn.Module):
         self,
         latent_dim: int,
         n_atoms: int,
-        n_segments: int,
+        omega_segments: int,
+        delta_segments: int,
         n_clusters: int = 1,
         omega_delta_source: Literal["trainable", "encoder"] = "trainable",
     ):
         super().__init__()
         self.n_atoms = n_atoms
-        self.n_segments = n_segments
+        self.omega_segments = omega_segments
+        self.delta_segments = delta_segments
         self.n_clusters = n_clusters
         self.omega_delta_source = omega_delta_source
         out_dim = n_atoms * n_clusters + 1
         if omega_delta_source == "encoder":
-            out_dim += 2 * n_segments  # omega_seg, delta_seg
+            out_dim += omega_segments + delta_segments  # omega_seg, delta_seg
         self.proj = nn.Linear(latent_dim, out_dim)
 
     def forward(self, z_flat: torch.Tensor) -> torch.Tensor:
@@ -1016,10 +1076,10 @@ class PennyLaneEvolver(nn.Module):
         )
 
         def amp_fn(p, t):
-            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Omega0 over n_segments windows
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Omega0 over the simulation steps
 
         def det_fn(p, t):
-            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Delta0 over n_segments windows
+            return qml.pulse.pwc((0, T))(p, t)   # piecewise-constant Delta0 over the simulation steps
 
         H_drive = qml.pulse.rydberg_drive(amplitude=amp_fn, phase=0.0, detuning=det_fn, wires=wires)
 
@@ -1114,8 +1174,8 @@ class NeutralAtomPulseLayer(nn.Module):
         H_drive(t) = Omega0(t)/2 * sum_i sigma_x_i - Delta0(t) * sum_i n_i
         H_local(x, lam) = sum_i V0_i * (1 + lam * x_i) * n_i
 
-    Omega0(t) and Delta0(t) are piecewise-constant over n_segments
-    windows. Source controlled by device.omega_delta_source:
+    Omega0(t) and Delta0(t) are defined at omega_segments and
+    delta_segments control points. Source controlled by device.omega_delta_source:
         - "trainable" (default): Omega0_MHz[k]/Delta0_MHz[k] are ordinary
           trainable weights, one shared pulse shape for every sample.
         - "encoder": Omega0_MHz[k]/Delta0_MHz[k] come from the ENCODER
@@ -1136,7 +1196,7 @@ class NeutralAtomPulseLayer(nn.Module):
     flowing past the bound. V_i(x) is bounded in local_field_mhz.
 
     Trainable when omega_delta_source="trainable": Omega0_MHz, Delta0_MHz
-    (each n_segments-length vectors). NOT trainable here in either mode:
+    (omega_segments and delta_segments values). NOT trainable here in either mode:
     lam -- always an encoder output, passed into forward() alongside x,
     never a qlayer parameter.
     Not trainable: device (NeutralAtomDeviceConfig, tier-1 constants).
@@ -1154,7 +1214,8 @@ class NeutralAtomPulseLayer(nn.Module):
         self.device_cfg = device
         self.wires = list(range(device.n_atoms))
         self.n_atoms = device.n_atoms
-        self.n_segments = device.n_segments
+        self.omega_segments = device.omega_segments
+        self.delta_segments = device.delta_segments
         self.n_clusters = device.n_clusters
         self.omega_delta_source = device.omega_delta_source
 
@@ -1174,7 +1235,7 @@ class NeutralAtomPulseLayer(nn.Module):
         # in "encoder" mode Omega0_MHz/Delta0_MHz arrive per-sample via
         # forward() instead. lam is NOT here either way -- see class docstring.
         if self.omega_delta_source in ("trainable", "trainable_plus_encoder"):
-            omega0_target = 1.0  # baseline value; must stay > 0, Omega=0 has no dynamics
+            omega0_target = device.omega0_init_mhz
             if device.bound_pulse_params:
                 # Logit of target / omega_max, so the bounded value starts at target.
                 omega0_p = omega0_target / device.profile.omega_max_mhz
@@ -1183,16 +1244,16 @@ class NeutralAtomPulseLayer(nn.Module):
                 # No sigmoid downstream -- init directly at the target.
                 omega0_init = omega0_target
             noise_std = device.pulse_init_noise_std
-            omega0_vals = torch.full((device.n_segments,), omega0_init, dtype=torch.float32)
-            delta0_vals = torch.zeros(device.n_segments, dtype=torch.float32)
+            omega0_vals = torch.full((device.omega_segments,), omega0_init, dtype=torch.float32)
+            delta0_vals = torch.zeros(device.delta_segments, dtype=torch.float32)
             if noise_std > 0.0:
                 # Break the fully symmetric init: without this, all
                 # segments start identical (Omega0) or at exactly zero
                 # (Delta0), so early training has to generate
                 # segment-to-segment asymmetry from noise alone before the
                 # pulse can become genuinely time-varying.
-                omega0_vals = omega0_vals + torch.randn(device.n_segments) * noise_std
-                delta0_vals = delta0_vals + torch.randn(device.n_segments) * noise_std
+                omega0_vals = omega0_vals + torch.randn(device.omega_segments) * noise_std
+                delta0_vals = delta0_vals + torch.randn(device.delta_segments) * noise_std
             self.Omega0_MHz = nn.Parameter(omega0_vals)
             self.Delta0_MHz = nn.Parameter(delta0_vals)
         else:
@@ -1200,10 +1261,14 @@ class NeutralAtomPulseLayer(nn.Module):
             self.Delta0_MHz = None
 
         if device.pulse_shape == "windowed":
-            interp, window = windowed_pulse_basis(
-                device.n_segments, device.pulse_steps, device.evolution_time_us, device.omega_ramp_us
+            omega_interp, window = windowed_pulse_basis(
+                device.omega_segments, device.pulse_steps, device.evolution_time_us, device.omega_ramp_us
             )
-            self.register_buffer("pulse_interp", interp, persistent=False)
+            delta_interp, _ = windowed_pulse_basis(
+                device.delta_segments, device.pulse_steps, device.evolution_time_us, device.omega_ramp_us
+            )
+            self.register_buffer("omega_interp", omega_interp, persistent=False)
+            self.register_buffer("delta_interp", delta_interp, persistent=False)
             self.register_buffer("omega_window", window, persistent=False)
 
         self.evolver = _build_evolver(device, self.V0)
@@ -1228,13 +1293,13 @@ class NeutralAtomPulseLayer(nn.Module):
 
         Args:
             combined: [batch, n_atoms*n_clusters + 1] (omega_delta_source=
-               "trainable") or [batch, n_atoms*n_clusters + 1 + 2*n_segments]
+               "trainable") or [batch, n_atoms*n_clusters + 1 + omega_segments + delta_segments]
                (omega_delta_source="encoder") -- x (first
                n_atoms*n_clusters columns, cluster-major: cluster 0's
                n_atoms columns, then cluster 1's, etc.), lam (next
                column, one scalar per sample, shared across every
                cluster within that sample), and, only in "encoder" mode,
-               omega_seg/delta_seg (the last 2*n_segments columns, same
+               omega_seg/delta_seg (the last omega_segments + delta_segments columns, same
                per-sample-shared-across-clusters convention as lam)
                packed into one tensor, exactly as LatentToLocalField
                produces. Cast to float32 if not already -- a no-op in
@@ -1259,7 +1324,7 @@ class NeutralAtomPulseLayer(nn.Module):
         n_clusters = self.n_clusters
         n_atoms = self.n_atoms
 
-        n_segments = self.n_segments
+        n_om, n_de = self.omega_segments, self.delta_segments
         x = combined[:, : n_atoms * n_clusters].contiguous()
         lam = combined[:, n_atoms * n_clusters : n_atoms * n_clusters + 1].squeeze(-1).contiguous()
 
@@ -1285,8 +1350,8 @@ class NeutralAtomPulseLayer(nn.Module):
 
         if self.omega_delta_source in ("encoder", "trainable_plus_encoder"):
             offset = n_atoms * n_clusters + 1
-            omega_seg = combined[:, offset : offset + n_segments].contiguous()
-            delta_seg = combined[:, offset + n_segments : offset + 2 * n_segments].contiguous()
+            omega_seg = combined[:, offset : offset + n_om].contiguous()
+            delta_seg = combined[:, offset + n_om : offset + n_om + n_de].contiguous()
             if self.omega_delta_source == "trainable_plus_encoder":
                 scale = self.device_cfg.pulse_delta_scale
                 omega_seg = self.Omega0_MHz + scale * torch.tanh(omega_seg)
@@ -1347,8 +1412,8 @@ class NeutralAtomPulseLayer(nn.Module):
         delta = profile.delta_max_mhz * torch.tanh(Delta0_MHz)
         if self.device_cfg.pulse_shape == "windowed":
             # Control points -> simulation steps; Omega is zero at t=0 and t=T.
-            omega = (omega @ self.pulse_interp) * self.omega_window
-            delta = delta @ self.pulse_interp
+            omega = (omega @ self.omega_interp) * self.omega_window
+            delta = delta @ self.delta_interp
         return omega, delta
 
     def extra_repr(self) -> str:
@@ -1378,7 +1443,8 @@ class NeutralAtomPulseLayer(nn.Module):
             f"n_atoms={self.device_cfg.n_atoms}, "
             f"n_clusters={self.device_cfg.n_clusters}, "
             f"cluster_routing={self.device_cfg.cluster_routing}, "
-            f"n_segments={self.device_cfg.n_segments}, "
+            f"omega_segments={self.device_cfg.omega_segments}, "
+            f"delta_segments={self.device_cfg.delta_segments}, "
             f"measurement_kind={self.device_cfg.measurement_kind}"
             + (f"(order={self.device_cfg.correlator_order})" if self.device_cfg.measurement_kind == "correlators" else "")
             + f", measurement_dim={self.measurement_dim}, "
@@ -1517,7 +1583,7 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
                 pre_quantum_gain=self.device_cfg.pre_quantum_gain,
                 layout=layout,
                 pulse_points=(
-                    self.device_cfg.n_segments
+                    (self.device_cfg.omega_segments, self.device_cfg.delta_segments)
                     if self.device_cfg.omega_delta_source == "trainable_plus_encoder" else None
                 ),
             ).to(dummy.device)
@@ -1525,7 +1591,8 @@ class QuantumVAENeutralAtom(AnsatzVAEBase):
             self.project_to_quantum = LatentToLocalField(
                 latent_dim,
                 self.device_cfg.n_atoms,
-                self.device_cfg.n_segments,
+                self.device_cfg.omega_segments,
+                self.device_cfg.delta_segments,
                 self.device_cfg.n_clusters,
                 omega_delta_source=self.device_cfg.omega_delta_source,
             ).to(dummy.device)

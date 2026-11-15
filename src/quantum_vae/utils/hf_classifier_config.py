@@ -46,7 +46,8 @@ class VAEBackboneConfig:
     r0_um: Optional[float] = None
     C6: Optional[float] = None
     evolution_time_us: Optional[float] = None
-    n_segments: Optional[int] = None
+    omega_segments: Optional[int] = None
+    delta_segments: Optional[int] = None
     measurement_kind: Optional[str] = None
     correlator_order: Optional[int] = None
     n_clusters: Optional[int] = None
@@ -146,7 +147,10 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
     r0_um = strategy_cfg.get("r0_um", vae_cfg.get("r0_um"))
     C6 = strategy_cfg.get("C6", vae_cfg.get("C6"))
     evolution_time_us = strategy_cfg.get("evolution_time_us", vae_cfg.get("evolution_time_us"))
-    n_segments = strategy_cfg.get("n_segments", vae_cfg.get("n_segments"))
+    if "n_segments" in strategy_cfg or "n_segments" in vae_cfg:
+        raise ValueError("n_segments was replaced by omega_segments and delta_segments.")
+    omega_segments = strategy_cfg.get("omega_segments", vae_cfg.get("omega_segments"))
+    delta_segments = strategy_cfg.get("delta_segments", vae_cfg.get("delta_segments"))
     measurement_kind = strategy_cfg.get("measurement_kind", vae_cfg.get("measurement_kind"))
     correlator_order = strategy_cfg.get("correlator_order", vae_cfg.get("correlator_order"))
     n_clusters = strategy_cfg.get("n_clusters", vae_cfg.get("n_clusters"))
@@ -174,7 +178,8 @@ def _parse_vae_backbone(config: Dict[str, Any]) -> VAEBackboneConfig:
         r0_um=float(r0_um) if r0_um is not None else None,
         C6=float(C6) if C6 is not None else None,
         evolution_time_us=float(evolution_time_us) if evolution_time_us is not None else None,
-        n_segments=int(n_segments) if n_segments is not None else None,
+        omega_segments=int(omega_segments) if omega_segments is not None else None,
+        delta_segments=int(delta_segments) if delta_segments is not None else None,
         measurement_kind=str(measurement_kind) if measurement_kind is not None else None,
         correlator_order=int(correlator_order) if correlator_order is not None else None,
         n_clusters=int(n_clusters) if n_clusters is not None else None,
@@ -291,7 +296,8 @@ def build_vae_backbone_instance(
             r0_um=backbone_cfg.r0_um,
             C6=backbone_cfg.C6,  # None: use the device profile's C6
             evolution_time_us=backbone_cfg.evolution_time_us or 4.0,
-            n_segments=backbone_cfg.n_segments or 6,
+            omega_segments=backbone_cfg.omega_segments or 6,
+            delta_segments=backbone_cfg.delta_segments or 6,
             measurement_kind=backbone_cfg.measurement_kind or "expectation",
             correlator_order=backbone_cfg.correlator_order or 1,
             n_clusters=backbone_cfg.n_clusters or 1,

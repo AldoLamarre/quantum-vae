@@ -138,7 +138,11 @@ class TrainerConfigParser:
             if "evolution_time_us" in cfg:
                 model_kwargs["evolution_time_us"] = float(cfg["evolution_time_us"])
             if "n_segments" in cfg:
-                model_kwargs["n_segments"] = int(cfg["n_segments"])
+                raise ValueError("n_segments was replaced by omega_segments and delta_segments.")
+            if "omega_segments" in cfg:
+                model_kwargs["omega_segments"] = int(cfg["omega_segments"])
+            if "delta_segments" in cfg:
+                model_kwargs["delta_segments"] = int(cfg["delta_segments"])
             if "measurement_kind" in cfg:
                 model_kwargs["measurement_kind"] = str(cfg["measurement_kind"])
             if "correlator_order" in cfg:
@@ -170,6 +174,8 @@ class TrainerConfigParser:
                 model_kwargs["graph_d_model"] = int(cfg["graph_d_model"])
             if "pulse_init_noise_std" in cfg:
                 model_kwargs["pulse_init_noise_std"] = float(cfg["pulse_init_noise_std"])
+            if "omega0_init_mhz" in cfg:
+                model_kwargs["omega0_init_mhz"] = float(cfg["omega0_init_mhz"])
             if "use_fourier_hyperedge_pos" in cfg:
                 model_kwargs["use_fourier_hyperedge_pos"] = bool(cfg["use_fourier_hyperedge_pos"])
             if "fourier_atom_dim" in cfg:
@@ -361,13 +367,13 @@ class TrainerConfigParser:
                 # flows through to AutoencoderKL as usual.
                 device_keys = (
                     "n_atoms", "register_geometry", "atom_spacing_um",
-                    "r0_um", "C6", "evolution_time_us", "n_segments",
+                    "r0_um", "C6", "evolution_time_us", "omega_segments", "delta_segments",
                     "measurement_kind", "correlator_order",
                     "n_clusters", "cluster_routing",
                     "omega_delta_source", "bound_pulse_params",
                     "ode_rtol", "ode_atol", "post_quantum_norm",
                     "skip_quantum_projection", "projection_kind", "graph_d_model",
-                    "pulse_init_noise_std", "use_fourier_hyperedge_pos",
+                    "pulse_init_noise_std", "omega0_init_mhz", "use_fourier_hyperedge_pos",
                     "fourier_atom_dim", "lam_offset", "lam_span",
                     "atom_token_mode", "graph_residual", "post_quantum_gate_init",
                     "pre_quantum_norm", "pre_quantum_gain", "evolution_backend",

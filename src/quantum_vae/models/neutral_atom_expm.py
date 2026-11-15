@@ -1,6 +1,6 @@
 """Matrix-exponential time evolution for the neutral-atom pulse layer.
 
-The pulse Hamiltonian is constant within each of the n_segments windows
+The pulse Hamiltonian is constant within each simulation step
 (piecewise-constant Omega0/Delta0, time-independent interaction and local
 field), so the evolution is exact:
 
@@ -49,7 +49,7 @@ class ExpmEvolver(nn.Module):
         self.device_cfg = device
         n = device.n_atoms
         dim = 2 ** n
-        self.n_segments = device.simulation_steps
+        self.n_steps = device.simulation_steps
         self.dt = device.evolution_time_us / device.simulation_steps
         self.bounded = device.bound_pulse_params
         self.profile = device.profile
@@ -90,7 +90,7 @@ class ExpmEvolver(nn.Module):
 
     def forward(self, x, lam, Omega0_MHz, Delta0_MHz) -> torch.Tensor:
         batch = x.shape[0]
-        S = self.n_segments
+        S = self.n_steps
         omega = Omega0_MHz.expand(batch, S) if Omega0_MHz.dim() == 1 else Omega0_MHz
         delta = Delta0_MHz.expand(batch, S) if Delta0_MHz.dim() == 1 else Delta0_MHz
 
@@ -101,7 +101,7 @@ class ExpmEvolver(nn.Module):
     def _evolve(self, static_diag, omega, delta) -> torch.Tensor:
         """Final states [B, dim] from |0...0>, one exact step per simulation step."""
         psi = None
-        for k in range(self.n_segments):
+        for k in range(self.n_steps):
             diag = static_diag - 2.0 * math.pi * delta[:, k : k + 1] * self.number_diag
             H = math.pi * omega[:, k, None, None] * self.sigma_x_sum + torch.diag_embed(diag)
             U = torch.linalg.matrix_exp((-1j * self.dt) * H.to(torch.complex64))

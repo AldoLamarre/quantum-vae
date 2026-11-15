@@ -378,20 +378,25 @@ def time_features(times: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class PulseQueryHead(nn.Module):
-    """Per-sample pulse corrections at n_points control points.
+    """Per-sample pulse corrections at the Omega and Delta control points.
 
-    One query per control point (fixed time features plus a learned offset)
-    cross-attends the atom tokens; a shared MLP maps each query to raw
-    (Omega, Delta) corrections. The last layer is zero-initialized, so the
-    corrections start at zero. Output [B, 2 * n_points]: Omega, then Delta.
+    One query per distinct control-point time (fixed time features plus a
+    learned offset) cross-attends the atom tokens; a shared MLP maps each
+    query to raw (Omega, Delta) corrections, read at the Omega and Delta
+    times respectively. The last layer is zero-initialized, so the
+    corrections start at zero. Output [B, n_omega + n_delta]: Omega, then Delta.
     """
 
-    def __init__(self, d_model: int, n_points: int):
+    def __init__(self, d_model: int, n_omega: int, n_delta: int):
         super().__init__()
         n_heads = 4 if d_model % 4 == 0 else 1
-        times = (torch.arange(n_points, dtype=torch.float32) + 0.5) / n_points
+        t_omega = (torch.arange(n_omega, dtype=torch.float32) + 0.5) / n_omega
+        t_delta = (torch.arange(n_delta, dtype=torch.float32) + 0.5) / n_delta
+        times, inverse = torch.unique(torch.cat([t_omega, t_delta]), return_inverse=True)
+        self.register_buffer("omega_index", inverse[:n_omega], persistent=False)
+        self.register_buffer("delta_index", inverse[n_omega:], persistent=False)
         self.register_buffer("time_embed", time_features(times, d_model), persistent=False)
-        self.query_offset = nn.Parameter(torch.zeros(n_points, d_model))
+        self.query_offset = nn.Parameter(torch.zeros(len(times), d_model))
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.mlp = nn.Sequential(nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 2))
         nn.init.zeros_(self.mlp[-1].weight)
@@ -401,8 +406,8 @@ class PulseQueryHead(nn.Module):
         B = atom_tokens.shape[0]
         q = (self.time_embed + self.query_offset).unsqueeze(0).expand(B, -1, -1)
         out, _ = self.attn(q, atom_tokens, atom_tokens)
-        a = self.mlp(out)  # [B, n_points, 2]
-        return torch.cat([a[..., 0], a[..., 1]], dim=-1)
+        a = self.mlp(out)  # [B, n_times, 2]
+        return torch.cat([a[:, self.omega_index, 0], a[:, self.delta_index, 1]], dim=-1)
 
 
 class GraphLatentToLocalField(nn.Module):
@@ -416,8 +421,8 @@ class GraphLatentToLocalField(nn.Module):
     pooled over the whole register. Multi-cluster requires
     atom_token_mode="spatial".
 
-    pulse_points (optional): adds a PulseQueryHead producing per-sample
-    pulse corrections at that many control points (see pack()).
+    pulse_points (optional): (n_omega, n_delta); adds a PulseQueryHead producing
+    per-sample pulse corrections at those control points (see pack()).
     """
 
     def __init__(self, n_atoms: int, correlator_order: int, latent_channels: int,
@@ -426,7 +431,7 @@ class GraphLatentToLocalField(nn.Module):
                  use_fourier_pos: bool = False, atom_token_mode: str = "attention",
                  residual: bool = False, pre_quantum_norm: Optional[str] = None,
                  pre_quantum_gain: float = 0.4, layout: Optional[RegisterLayout] = None,
-                 pulse_points: Optional[int] = None):
+                 pulse_points: Optional[Tuple[int, int]] = None):
         super().__init__()
         validate_measurement_kind(measurement_kind)
         if layout is None:
@@ -474,7 +479,7 @@ class GraphLatentToLocalField(nn.Module):
         self.lam_pool_query = nn.Parameter(torch.randn(1, d_model) * 0.02)
         self.lam_pool_attn = nn.MultiheadAttention(d_model, 1, batch_first=True)
         self.lam_layer = nn.Linear(d_model, 1)
-        self.pulse_head = PulseQueryHead(d_model, pulse_points) if pulse_points is not None else None
+        self.pulse_head = PulseQueryHead(d_model, *pulse_points) if pulse_points is not None else None
 
     @property
     def pre_quantum_gain(self) -> Optional[float]:

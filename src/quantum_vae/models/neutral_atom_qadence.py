@@ -66,7 +66,7 @@ class QadenceEvolver(nn.Module):
         self.measurement_kind = device.measurement_kind
         n = device.n_atoms
         self.n_atoms = n
-        self.n_segments = device.simulation_steps
+        self.n_steps = device.simulation_steps
         dt = device.evolution_time_us / device.simulation_steps
 
         pos = torch.tensor(device.register_um, dtype=torch.float64)
@@ -84,7 +84,7 @@ class QadenceEvolver(nn.Module):
                 - 2.0 * math.pi * FeatureParameter(f"delta{k}") * sum_n,
                 dt,
             )
-            for k in range(self.n_segments)
+            for k in range(self.n_steps)
         ]
         model = QuantumModel(
             QuantumCircuit(n, chain(*segments)),
@@ -115,7 +115,7 @@ class QadenceEvolver(nn.Module):
 
     def forward(self, x, lam, Omega0_MHz, Delta0_MHz) -> torch.Tensor:
         batch = x.shape[0]
-        S = self.n_segments
+        S = self.n_steps
         omega = Omega0_MHz.expand(batch, S) if Omega0_MHz.dim() == 1 else Omega0_MHz
         delta = Delta0_MHz.expand(batch, S) if Delta0_MHz.dim() == 1 else Delta0_MHz
         v = local_field_mhz(x, lam[:, None], self.V0, self.bounded, torch, self.profile)  # [B, n]
